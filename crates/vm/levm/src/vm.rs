@@ -1622,6 +1622,32 @@ impl<'a> VM<'a> {
             ));
         }
 
+        // Experimental native-UTXO dispatch boundary. The outer EIP-8141
+        // transaction and signatures have already been validated above. A
+        // VERIFY frame explicitly targeting UTXO_VAULT carries its own RLP
+        // payload in `frame.data`; decode it here rather than changing the
+        // EIP-8141 frame decoder.
+        //
+        // Do not let a recognized UTXO frame fall through to ordinary EVM or
+        // default-code execution while digest/proof/approval/settlement
+        // semantics are still absent. That could accept a no-op "spend".
+        for frame in &frame_tx.frames {
+            if frame.is_native_utxo() {
+                let _payload =
+                    ethrex_common::types::UtxoFramePayload::decode_frame_data(&frame.data)
+                        .map_err(|error| {
+                            VMError::TxValidation(
+                                crate::errors::TxValidationError::InvalidNativeUtxoFrame {
+                                    reason: error.to_string(),
+                                },
+                            )
+                        })?;
+                return Err(VMError::TxValidation(
+                    crate::errors::TxValidationError::NativeUtxoExecutionNotImplemented,
+                ));
+            }
+        }
+
         // Tx-level rollback accumulator: if the tx is later declared invalid
         // after frames committed, restore `db.current_accounts_state` so the
         // payload builder (which reuses the shared db across txs) sees no
