@@ -1515,6 +1515,131 @@ impl<'a> VM<'a> {
         Ok(report)
     }
 
+    /// Run the read-only portion of the experimental native-UTXO VERIFY
+    /// semantics. Outer signatures have already been cryptographically
+    /// validated by EIP-8141 when this method is called.
+    fn validate_native_utxo_frame(
+        &mut self,
+        payload: &ethrex_common::types::UtxoFramePayload,
+        frame_tx: &ethrex_common::types::FrameTransaction,
+    ) -> Result<(), VMError> {
+        use ethrex_common::types::{
+            MAX_BATCH_PROOF_DEPTH, NEXT_INDEX_SLOT, UTXO_RING_SIZE, UTXO_VAULT,
+            batch_root_storage_slot, openings_ring_storage_slot, spent_bitmap_storage_slot,
+            utxo_batch_root, utxo_openings_root,
+        };
+
+        let invalid = |reason: String| {
+            VMError::TxValidation(crate::errors::TxValidationError::InvalidNativeUtxoFrame {
+                reason,
+            })
+        };
+
+        payload
+            .validate_actor_signatures(frame_tx)
+            .map_err(&invalid)?;
+
+        let actor_addresses: FxHashSet<Address> = payload
+            .actors
+            .iter()
+            .map(|actor| actor.actor_address)
+            .collect();
+        let mut input_indices = FxHashSet::default();
+
+        // Load the vault account once before accessing its storage.
+        self.db.get_account(UTXO_VAULT)?;
+        let next_index =
+            self.get_storage_value(UTXO_VAULT, H256::from_low_u64_be(NEXT_INDEX_SLOT))?;
+
+        for input in &payload.inputs {
+            if !input_indices.insert(input.index) {
+                return Err(invalid(format!(
+                    "duplicate native UTXO input index {}",
+                    input.index
+                )));
+            }
+            if U256::from(input.index) >= next_index {
+                return Err(invalid(format!(
+                    "native UTXO input index {} has not been assigned",
+                    input.index
+                )));
+            }
+            if !actor_addresses.contains(&input.recipient) {
+                return Err(invalid(format!(
+                    "native UTXO input {} recipient is not an actor",
+                    input.index
+                )));
+            }
+
+            let spent_word =
+                self.get_storage_value(UTXO_VAULT, spent_bitmap_storage_slot(input.index))?;
+            if spent_word.bit((input.index & 0xff) as usize) {
+                return Err(invalid(format!(
+                    "native UTXO input {} is already spent",
+                    input.index
+                )));
+            }
+
+            if input.creation_block >= self.env.block_number {
+                return Err(invalid(format!(
+                    "native UTXO input {} must have been created in an earlier block",
+                    input.index
+                )));
+            }
+            let openings_root = utxo_openings_root(input).map_err(&invalid)?;
+            let age = self.env.block_number - input.creation_block;
+            if age < UTXO_RING_SIZE {
+                if !input.batch_siblings.is_empty() {
+                    return Err(invalid(format!(
+                        "recent native UTXO input {} must not include a batch proof",
+                        input.index
+                    )));
+                }
+                let committed_root = self.get_storage_value(
+                    UTXO_VAULT,
+                    openings_ring_storage_slot(input.creation_block),
+                )?;
+                if openings_root != H256::from_uint(&committed_root) {
+                    return Err(invalid(format!(
+                        "native UTXO input {} opening proof does not match the ring root",
+                        input.index
+                    )));
+                }
+            } else {
+                let expected_batch_number = input.creation_block / UTXO_RING_SIZE;
+                let expected_batch_position = input.creation_block % UTXO_RING_SIZE;
+                if input.batch_number != expected_batch_number
+                    || input.batch_position != expected_batch_position
+                {
+                    return Err(invalid(format!(
+                        "native UTXO input {} has inconsistent batch metadata",
+                        input.index
+                    )));
+                }
+                if input.batch_siblings.len() != MAX_BATCH_PROOF_DEPTH {
+                    return Err(invalid(format!(
+                        "old native UTXO input {} must include a {MAX_BATCH_PROOF_DEPTH}-level batch proof",
+                        input.index
+                    )));
+                }
+                let proven_batch_root = utxo_batch_root(input, openings_root).map_err(&invalid)?;
+                let committed_batch_root = self
+                    .get_storage_value(UTXO_VAULT, batch_root_storage_slot(input.batch_number))?;
+                if proven_batch_root != H256::from_uint(&committed_batch_root) {
+                    return Err(invalid(format!(
+                        "native UTXO input {} batch proof does not match the sealed root",
+                        input.index
+                    )));
+                }
+            }
+        }
+
+        payload
+            .validate_outputs_and_conservation(frame_tx)
+            .map_err(invalid)?;
+        Ok(())
+    }
+
     /// Execute a frame transaction (EIP-8141).
     /// This bypasses the normal prepare/finalize hooks and orchestrates per-frame execution.
     fn execute_frame_tx(&mut self) -> Result<ExecutionReport, VMError> {
@@ -1628,12 +1753,12 @@ impl<'a> VM<'a> {
         // payload in `frame.data`; decode it here rather than changing the
         // EIP-8141 frame decoder.
         //
-        // Do not let a recognized UTXO frame fall through to ordinary EVM or
-        // default-code execution while digest/proof/approval/settlement
-        // semantics are still absent. That could accept a no-op "spend".
+        // Do not let a verified UTXO frame fall through to ordinary EVM or
+        // default-code execution while approval and settlement semantics are
+        // still absent. That could accept a no-op "spend".
         for frame in &frame_tx.frames {
             if frame.is_native_utxo() {
-                let _payload =
+                let payload =
                     ethrex_common::types::UtxoFramePayload::decode_frame_data(&frame.data)
                         .map_err(|error| {
                             VMError::TxValidation(
@@ -1642,6 +1767,7 @@ impl<'a> VM<'a> {
                                 },
                             )
                         })?;
+                self.validate_native_utxo_frame(&payload, &frame_tx)?;
                 return Err(VMError::TxValidation(
                     crate::errors::TxValidationError::NativeUtxoExecutionNotImplemented,
                 ));

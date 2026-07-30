@@ -5,7 +5,7 @@
 //! The constants and encoding are experimental until the research proposal is
 //! turned into a standards-track EIP.
 
-use std::sync::LazyLock;
+use std::{collections::HashSet, sync::LazyLock};
 
 use bytes::{BufMut, Bytes};
 use ethereum_types::{Address, H160, H256, U256};
@@ -16,7 +16,10 @@ use ethrex_rlp::{
     structs::{Decoder, Encoder},
 };
 
-use crate::utils::keccak;
+use crate::{
+    types::{FRAME_SIG_SCHEME_ARBITRARY, FrameTransaction},
+    utils::keccak,
+};
 
 /// Experimental reserved address for the native UTXO vault.
 ///
@@ -33,6 +36,12 @@ pub const UTXO_RING_SIZE: u64 = 8192;
 
 /// Vault storage slot containing the next globally assigned UTXO index.
 pub const NEXT_INDEX_SLOT: u64 = 0;
+/// Solidity-compatible mapping base slot for `spent_bits[word_index]`.
+pub const SPENT_BITMAP_MAPPING_SLOT: u64 = 1;
+/// Solidity-compatible mapping base slot for recent openings roots.
+pub const OPENINGS_RING_MAPPING_SLOT: u64 = 2;
+/// Solidity-compatible mapping base slot for sealed batch roots.
+pub const BATCH_ROOT_MAPPING_SLOT: u64 = 3;
 
 /// Canonical event signature used by ordinary vault deposits and settlement.
 pub const UTXO_CREATED_EVENT_SIGNATURE: &[u8] = b"UtxoCreated(address,address,uint64,uint256)";
@@ -40,7 +49,8 @@ pub const UTXO_CREATED_EVENT_SIGNATURE: &[u8] = b"UtxoCreated(address,address,ui
 pub static UTXO_CREATED_TOPIC: LazyLock<H256> =
     LazyLock::new(|| keccak(UTXO_CREATED_EVENT_SIGNATURE));
 
-/// Domain separators reserved for later signing and Merkle-tree work.
+/// Experimental domain separators for actor signing and the two Merkle trees.
+/// These values must be standardized before use on a persistent network.
 pub const UTXO_FRAME_DOMAIN: &[u8] = b"ethrex/native-utxo/frame/v0";
 pub const UTXO_LEAF_DOMAIN: &[u8] = b"ethrex/native-utxo/leaf/v0";
 pub const UTXO_NODE_DOMAIN: &[u8] = b"ethrex/native-utxo/node/v0";
@@ -56,6 +66,11 @@ pub const MAX_ACTORS: usize = 64;
 pub const MAX_OPENING_PROOF_DEPTH: usize = 32;
 pub const MAX_BATCH_PROOF_DEPTH: usize = 13;
 pub const MAX_UTXO_FRAME_DATA_SIZE: usize = 128 * 1024;
+
+/// `change_kind` value selecting `utxo_outputs`.
+pub const CHANGE_KIND_UTXO: u8 = 0;
+/// `change_kind` value selecting `account_outputs`.
+pub const CHANGE_KIND_ACCOUNT: u8 = 1;
 
 /// Actor authorized by one entry in the outer EIP-8141 signature list.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -171,6 +186,21 @@ pub struct UtxoFramePayload {
     pub signed_max_gas: u64,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct SignedUtxoInput {
+    index: u64,
+    creation_block: u64,
+}
+
+impl RLPEncode for SignedUtxoInput {
+    fn encode(&self, buf: &mut dyn BufMut) {
+        Encoder::new(buf)
+            .encode_field(&self.index)
+            .encode_field(&self.creation_block)
+            .finish();
+    }
+}
+
 impl UtxoFramePayload {
     /// Decode and apply the bounds that are safe to check without state access.
     pub fn decode_frame_data(data: &Bytes) -> Result<Self, RLPDecodeError> {
@@ -182,6 +212,309 @@ impl UtxoFramePayload {
 
         Self::decode(data.as_ref())
     }
+
+    /// Canonically encode the actor-authorized transition without replaceable
+    /// opening and batch witnesses.
+    pub fn signed_payload(&self, chain_id: u64) -> Vec<u8> {
+        let signed_inputs = self
+            .inputs
+            .iter()
+            .map(|input| SignedUtxoInput {
+                index: input.index,
+                creation_block: input.creation_block,
+            })
+            .collect::<Vec<_>>();
+
+        let mut encoded = Vec::new();
+        Encoder::new(&mut encoded)
+            .encode_field(&chain_id)
+            .encode_field(&self.actors)
+            .encode_field(&signed_inputs)
+            .encode_field(&self.utxo_outputs)
+            .encode_field(&self.account_outputs)
+            .encode_field(&self.change_kind)
+            .encode_field(&self.change_index)
+            .encode_field(&self.payer)
+            .encode_field(&self.signed_max_fee_per_gas)
+            .encode_field(&self.signed_max_priority_fee_per_gas)
+            .encode_field(&self.signed_max_gas)
+            .finish();
+        encoded
+    }
+
+    /// Digest placed in each actor signature's explicit EIP-8141 `msg`.
+    pub fn frame_digest(&self, chain_id: u64) -> H256 {
+        let signed_payload = self.signed_payload(chain_id);
+        let mut preimage = Vec::with_capacity(UTXO_FRAME_DOMAIN.len() + signed_payload.len());
+        preimage.extend_from_slice(UTXO_FRAME_DOMAIN);
+        preimage.extend_from_slice(&signed_payload);
+        keccak(&preimage)
+    }
+
+    /// Bind every unique actor to the explicitly indexed, already
+    /// cryptographically validated EIP-8141 signature entry.
+    pub fn validate_actor_signatures(&self, tx: &FrameTransaction) -> Result<H256, String> {
+        if self.actors.is_empty() {
+            return Err("native UTXO frame must contain at least one actor".into());
+        }
+
+        let digest = self.frame_digest(tx.chain_id);
+        let mut actor_addresses = HashSet::with_capacity(self.actors.len());
+        for actor in &self.actors {
+            if actor.actor_address == Address::zero() {
+                return Err("native UTXO actor must not be the zero address".into());
+            }
+            if !actor_addresses.insert(actor.actor_address) {
+                return Err(format!(
+                    "duplicate native UTXO actor {:#x}",
+                    actor.actor_address
+                ));
+            }
+
+            let signature_index = usize::try_from(actor.signature_index)
+                .map_err(|_| "native UTXO actor signature index does not fit usize")?;
+            let signature = tx.signatures.get(signature_index).ok_or_else(|| {
+                format!(
+                    "native UTXO actor signature index {} is out of bounds",
+                    actor.signature_index
+                )
+            })?;
+            if signature.scheme == FRAME_SIG_SCHEME_ARBITRARY {
+                return Err(format!(
+                    "native UTXO actor signature {} must use a protocol-validated scheme",
+                    actor.signature_index
+                ));
+            }
+            if signature.msg.as_ref() != digest.as_bytes() {
+                return Err(format!(
+                    "native UTXO actor signature {} does not sign the UTXO frame digest",
+                    actor.signature_index
+                ));
+            }
+            if signature.signer.unwrap_or(tx.sender) != actor.actor_address {
+                return Err(format!(
+                    "native UTXO actor signature {} resolves to the wrong signer",
+                    actor.signature_index
+                ));
+            }
+        }
+        Ok(digest)
+    }
+
+    /// Validate output shape, signed fee caps, payer repayment, and value
+    /// conservation after all input openings have been proven.
+    pub fn validate_outputs_and_conservation(&self, tx: &FrameTransaction) -> Result<U256, String> {
+        if self.inputs.is_empty() {
+            return Err("native UTXO frame must consume at least one input".into());
+        }
+        if !tx.blob_versioned_hashes.is_empty() {
+            return Err(
+                "native UTXO frames do not support blob fees in the current payload format".into(),
+            );
+        }
+        if U256::from(tx.max_fee_per_gas) > self.signed_max_fee_per_gas {
+            return Err("outer max_fee_per_gas exceeds the actor-signed cap".into());
+        }
+        if U256::from(tx.max_priority_fee_per_gas) > self.signed_max_priority_fee_per_gas {
+            return Err("outer max_priority_fee_per_gas exceeds the actor-signed cap".into());
+        }
+        let total_gas_limit = tx.total_gas_limit();
+        if total_gas_limit > self.signed_max_gas {
+            return Err("outer transaction gas exceeds the actor-signed cap".into());
+        }
+
+        for output in &self.utxo_outputs {
+            if output.recipient == Address::zero() {
+                return Err("native UTXO output recipient must not be zero".into());
+            }
+        }
+        for output in &self.account_outputs {
+            if output.recipient == Address::zero() {
+                return Err("native UTXO account output recipient must not be zero".into());
+            }
+        }
+
+        let change_index = usize::try_from(self.change_index)
+            .map_err(|_| "native UTXO change index does not fit usize")?;
+        match self.change_kind {
+            CHANGE_KIND_UTXO => {
+                let change = self
+                    .utxo_outputs
+                    .get(change_index)
+                    .ok_or("native UTXO change index is outside utxo_outputs")?;
+                if !change.value.is_zero() {
+                    return Err("native UTXO change output must have signed value zero".into());
+                }
+            }
+            CHANGE_KIND_ACCOUNT => {
+                let change = self
+                    .account_outputs
+                    .get(change_index)
+                    .ok_or("native UTXO change index is outside account_outputs")?;
+                if !change.value.is_zero() {
+                    return Err("native UTXO change output must have signed value zero".into());
+                }
+            }
+            _ => return Err("native UTXO change kind must select UTXO or account outputs".into()),
+        }
+
+        let input_total = checked_sum(self.inputs.iter().map(|input| input.value), "input")?;
+        let fixed_utxo_total = checked_sum(
+            self.utxo_outputs
+                .iter()
+                .enumerate()
+                .filter(|(index, _)| self.change_kind != CHANGE_KIND_UTXO || *index != change_index)
+                .map(|(_, output)| output.value),
+            "UTXO output",
+        )?;
+        let fixed_account_total = checked_sum(
+            self.account_outputs
+                .iter()
+                .enumerate()
+                .filter(|(index, _)| {
+                    self.change_kind != CHANGE_KIND_ACCOUNT || *index != change_index
+                })
+                .map(|(_, output)| output.value),
+            "account output",
+        )?;
+        let fixed_output_total = fixed_utxo_total
+            .checked_add(fixed_account_total)
+            .ok_or("native UTXO fixed output total overflow")?;
+        let maximum_fee = U256::from(tx.max_fee_per_gas)
+            .checked_mul(U256::from(total_gas_limit))
+            .ok_or("native UTXO maximum fee overflow")?;
+
+        let required_total = if self.payer == Address::zero() {
+            fixed_output_total
+                .checked_add(maximum_fee)
+                .ok_or("native UTXO self-funded required total overflow")?
+        } else {
+            // The protocol requires a fixed signed repayment output. The
+            // sponsor's preceding VERIFY frame decides whether its amount is
+            // sufficient for that sponsor's policy; native validation must not
+            // impose a separate repayment price.
+            let has_repayment_output = self
+                .utxo_outputs
+                .iter()
+                .enumerate()
+                .filter(|(index, _)| self.change_kind != CHANGE_KIND_UTXO || *index != change_index)
+                .map(|(_, output)| (output.recipient, output.value))
+                .chain(
+                    self.account_outputs
+                        .iter()
+                        .enumerate()
+                        .filter_map(|(index, output)| {
+                            (self.change_kind != CHANGE_KIND_ACCOUNT || index != change_index)
+                                .then_some((output.recipient, output.value))
+                        }),
+                )
+                .any(|(recipient, value)| recipient == self.payer && !value.is_zero());
+            if !has_repayment_output {
+                return Err(
+                    "sponsored native UTXO frame lacks a nonzero fixed payer output".into(),
+                );
+            }
+            fixed_output_total
+        };
+
+        if input_total < required_total {
+            return Err("native UTXO inputs do not cover outputs and required fee".into());
+        }
+        Ok(input_total - required_total)
+    }
+}
+
+fn checked_sum(values: impl IntoIterator<Item = U256>, description: &str) -> Result<U256, String> {
+    values.into_iter().try_fold(U256::zero(), |sum, value| {
+        sum.checked_add(value)
+            .ok_or_else(|| format!("native UTXO {description} total overflow"))
+    })
+}
+
+/// Solidity mapping slot `keccak256(uint256(key) || uint256(base_slot))`.
+pub fn utxo_mapping_storage_slot(key: U256, base_slot: u64) -> H256 {
+    let mut preimage = [0_u8; 64];
+    preimage[..32].copy_from_slice(&key.to_big_endian());
+    preimage[32..].copy_from_slice(&U256::from(base_slot).to_big_endian());
+    keccak(&preimage)
+}
+
+/// Storage word containing the spent flag for `index`.
+pub fn spent_bitmap_storage_slot(index: u64) -> H256 {
+    utxo_mapping_storage_slot(U256::from(index >> 8), SPENT_BITMAP_MAPPING_SLOT)
+}
+
+/// Ring storage slot containing the recent openings root for `block_number`.
+pub fn openings_ring_storage_slot(block_number: u64) -> H256 {
+    utxo_mapping_storage_slot(
+        U256::from(block_number % UTXO_RING_SIZE),
+        OPENINGS_RING_MAPPING_SLOT,
+    )
+}
+
+/// Storage slot containing the sealed root for `batch_number`.
+pub fn batch_root_storage_slot(batch_number: u64) -> H256 {
+    utxo_mapping_storage_slot(U256::from(batch_number), BATCH_ROOT_MAPPING_SLOT)
+}
+
+/// Hash the opening committed by one `UtxoCreated` leaf.
+pub fn utxo_opening_leaf(input: &UtxoInput) -> H256 {
+    let mut opening = Vec::new();
+    Encoder::new(&mut opening)
+        .encode_field(&input.index)
+        .encode_field(&input.source)
+        .encode_field(&input.recipient)
+        .encode_field(&input.value)
+        .finish();
+
+    let mut preimage = Vec::with_capacity(UTXO_LEAF_DOMAIN.len() + opening.len());
+    preimage.extend_from_slice(UTXO_LEAF_DOMAIN);
+    preimage.extend_from_slice(&opening);
+    keccak(&preimage)
+}
+
+/// Fold an opening proof into its per-block openings root.
+pub fn utxo_openings_root(input: &UtxoInput) -> Result<H256, String> {
+    fold_merkle_path(
+        utxo_opening_leaf(input),
+        input.opening_position,
+        &input.opening_siblings,
+        UTXO_NODE_DOMAIN,
+    )
+}
+
+/// Fold the creation block's openings root into its sealed batch root.
+pub fn utxo_batch_root(input: &UtxoInput, openings_root: H256) -> Result<H256, String> {
+    fold_merkle_path(
+        openings_root,
+        input.batch_position,
+        &input.batch_siblings,
+        UTXO_BATCH_DOMAIN,
+    )
+}
+
+fn fold_merkle_path(
+    mut node: H256,
+    position: u64,
+    siblings: &[H256],
+    domain: &[u8],
+) -> Result<H256, String> {
+    if siblings.len() < u64::BITS as usize && position >= (1_u64 << siblings.len()) {
+        return Err("native UTXO Merkle position exceeds proof depth".into());
+    }
+    for (depth, sibling) in siblings.iter().enumerate() {
+        let (left, right) = if (position >> depth) & 1 == 0 {
+            (node, *sibling)
+        } else {
+            (*sibling, node)
+        };
+        let mut preimage = Vec::with_capacity(domain.len() + 64);
+        preimage.extend_from_slice(domain);
+        preimage.extend_from_slice(left.as_bytes());
+        preimage.extend_from_slice(right.as_bytes());
+        node = keccak(&preimage);
+    }
+    Ok(node)
 }
 
 fn decode_bounded_list<T: RLPDecode>(
@@ -394,12 +727,14 @@ impl RLPDecode for UtxoFramePayload {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::types::{Frame, FrameMode, FrameTransaction};
+    use crate::types::{
+        FRAME_SIG_SCHEME_SECP256K1, Frame, FrameMode, FrameSignature, FrameTransaction,
+    };
 
     fn sample_payload() -> UtxoFramePayload {
         UtxoFramePayload {
             actors: vec![UtxoActor {
-                signature_index: 1,
+                signature_index: 0,
                 actor_address: Address::from_low_u64_be(0xa11ce),
             }],
             inputs: vec![UtxoInput {
@@ -408,27 +743,51 @@ mod tests {
                 source: Address::from_low_u64_be(0x5),
                 value: U256::from(1_000_000u64),
                 recipient: Address::from_low_u64_be(0xa11ce),
-                opening_position: 3,
+                opening_position: 1,
                 opening_siblings: vec![H256::from_low_u64_be(7)],
                 batch_number: 0,
                 batch_position: 0,
                 batch_siblings: Vec::new(),
             }],
-            utxo_outputs: vec![UtxoOutput {
-                recipient: Address::from_low_u64_be(0xb0b),
-                value: U256::from(500_000u64),
-            }],
+            utxo_outputs: vec![
+                UtxoOutput {
+                    recipient: Address::from_low_u64_be(0xb0b),
+                    value: U256::from(500_000u64),
+                },
+                UtxoOutput {
+                    recipient: Address::from_low_u64_be(0xa11ce),
+                    value: U256::zero(),
+                },
+            ],
             account_outputs: vec![UtxoAccountOutput {
                 recipient: Address::from_low_u64_be(0xca11),
                 value: U256::from(100_000u64),
             }],
             change_kind: 0,
-            change_index: 0,
+            change_index: 1,
             payer: Address::zero(),
             signed_max_fee_per_gas: U256::from(100u64),
             signed_max_priority_fee_per_gas: U256::from(2u64),
             signed_max_gas: 100_000,
         }
+    }
+
+    fn sample_transaction(payload: &UtxoFramePayload) -> FrameTransaction {
+        let mut tx = FrameTransaction {
+            chain_id: 1,
+            sender: Address::from_low_u64_be(0xa11ce),
+            max_fee_per_gas: 1,
+            max_priority_fee_per_gas: 1,
+            ..Default::default()
+        };
+        let digest = payload.frame_digest(tx.chain_id);
+        tx.signatures.push(FrameSignature {
+            scheme: FRAME_SIG_SCHEME_SECP256K1,
+            signer: Some(Address::from_low_u64_be(0xa11ce)),
+            msg: Bytes::copy_from_slice(digest.as_bytes()),
+            signature: Bytes::new(),
+        });
+        tx
     }
 
     #[test]
@@ -448,6 +807,80 @@ mod tests {
         let err = UtxoFramePayload::decode_frame_data(&Bytes::from(encoded))
             .expect_err("over-depth proof must be rejected");
         assert!(err.to_string().contains("opening_siblings"));
+    }
+
+    #[test]
+    fn actor_digest_excludes_replaceable_witnesses() {
+        let payload = sample_payload();
+        let expected = payload.frame_digest(1);
+
+        let mut refreshed = payload.clone();
+        refreshed.inputs[0].source = Address::from_low_u64_be(0x999);
+        refreshed.inputs[0].value = U256::from(999_999u64);
+        refreshed.inputs[0].recipient = Address::from_low_u64_be(0x888);
+        refreshed.inputs[0].opening_position = 0;
+        refreshed.inputs[0].opening_siblings = vec![H256::from_low_u64_be(123); 3];
+        refreshed.inputs[0].batch_number = 7;
+        refreshed.inputs[0].batch_position = 9;
+        refreshed.inputs[0].batch_siblings = vec![H256::from_low_u64_be(456); 2];
+
+        assert_eq!(refreshed.frame_digest(1), expected);
+
+        refreshed.inputs[0].index += 1;
+        assert_ne!(refreshed.frame_digest(1), expected);
+    }
+
+    #[test]
+    fn actor_signature_must_bind_signer_and_utxo_digest() {
+        let payload = sample_payload();
+        let mut tx = sample_transaction(&payload);
+        assert_eq!(
+            payload.validate_actor_signatures(&tx).unwrap(),
+            payload.frame_digest(tx.chain_id)
+        );
+
+        tx.signatures[0].msg = Bytes::from_static(&[1_u8; 32]);
+        assert!(
+            payload
+                .validate_actor_signatures(&tx)
+                .unwrap_err()
+                .contains("does not sign")
+        );
+    }
+
+    #[test]
+    fn validates_output_conservation_and_fee_caps() {
+        let payload = sample_payload();
+        let tx = sample_transaction(&payload);
+        let remaining = payload
+            .validate_outputs_and_conservation(&tx)
+            .expect("sample inputs cover fixed outputs and maximum fee");
+        assert!(remaining > U256::zero());
+
+        let mut insufficient = payload;
+        insufficient.inputs[0].value = U256::from(1u64);
+        assert!(
+            insufficient
+                .validate_outputs_and_conservation(&tx)
+                .unwrap_err()
+                .contains("do not cover")
+        );
+    }
+
+    #[test]
+    fn merkle_paths_use_position_bits_and_storage_domains_do_not_collide() {
+        let payload = sample_payload();
+        let input = &payload.inputs[0];
+        let leaf = utxo_opening_leaf(input);
+        let sibling = input.opening_siblings[0];
+
+        let mut left_preimage = Vec::from(UTXO_NODE_DOMAIN);
+        left_preimage.extend_from_slice(sibling.as_bytes());
+        left_preimage.extend_from_slice(leaf.as_bytes());
+        assert_eq!(utxo_openings_root(input).unwrap(), keccak(&left_preimage));
+
+        assert_ne!(spent_bitmap_storage_slot(0), openings_ring_storage_slot(0));
+        assert_ne!(openings_ring_storage_slot(0), batch_root_storage_slot(0));
     }
 
     #[test]
