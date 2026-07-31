@@ -18,6 +18,7 @@ mod receipt;
 pub mod requests;
 pub mod transaction;
 pub mod tx_fields;
+pub mod utxo;
 
 pub use account::*;
 pub use account_update::*;
@@ -32,3 +33,4 @@ pub use prover::*;
 pub use receipt::*;
 pub use transaction::*;
 pub use tx_fields::*;
+pub use utxo::*;

@@ -20,8 +20,8 @@ use ethrex_common::{Address, H256, U256, constants::EMPTY_TRIE_HASH};
 use ethrex_crypto::NativeCrypto;
 use ethrex_levm::db::gen_db::GeneralizedDatabase;
 use ethrex_levm::environment::{EVMConfig, Environment};
-use ethrex_levm::errors::TxResult;
 use ethrex_levm::errors::{ExecutionReport, VMError};
+use ethrex_levm::errors::{TxResult, TxValidationError};
 use ethrex_levm::tracing::LevmCallTracer;
 use ethrex_levm::vm::{VM, VMType};
 use ethrex_storage::Store;
@@ -3603,4 +3603,238 @@ fn storage_refund_from_a_later_frame_reduces_reported_gas() {
         applied <= pre_refund / 5,
         "the applied refund {applied} must respect the EIP-3529 one-fifth cap"
     );
+}
+
+// ==================== Native UTXO lifecycle ====================
+
+mod native_utxo_lifecycle_tests {
+    use super::*;
+    use ethrex_common::types::{
+        APPROVE_EXECUTION_AND_PAYMENT, CHANGE_KIND_UTXO, FRAME_SIG_SCHEME_SECP256K1,
+        FrameSignature, NEXT_INDEX_SLOT, UTXO_VAULT, UtxoActor, UtxoFramePayload, UtxoInput,
+        UtxoOutput, decode_utxo_created_log, openings_ring_storage_slot, spent_bitmap_storage_slot,
+        utxo_created_log, utxo_openings_root_from_logs,
+    };
+    use ethrex_rlp::encode::RLPEncode;
+    use k256::ecdsa::SigningKey;
+
+    const BOOTSTRAP_BLOCK: u64 = 10;
+    const CREATE_BLOCK: u64 = BOOTSTRAP_BLOCK + 1;
+    const SPEND_BLOCK: u64 = CREATE_BLOCK + 1;
+    const NATIVE_FRAME_GAS: u64 = 100_000;
+
+    fn key_and_address() -> (SigningKey, Address) {
+        let key = SigningKey::from_bytes(&[0x42; 32].into()).unwrap();
+        let uncompressed = key.verifying_key().to_encoded_point(false);
+        let public_key_hash = ethrex_crypto::keccak::keccak_hash(&uncompressed.as_bytes()[1..]);
+        (key, Address::from_slice(&public_key_hash[12..]))
+    }
+
+    fn sign_digest(key: &SigningKey, signer: Address, digest: H256) -> FrameSignature {
+        let (signature, recovery_id) = key.sign_prehash_recoverable(digest.as_bytes()).unwrap();
+        let signature = signature.to_bytes();
+        let mut bytes = vec![0_u8; 65];
+        bytes[0] = recovery_id.to_byte();
+        bytes[1..33].copy_from_slice(&signature[..32]);
+        bytes[33..].copy_from_slice(&signature[32..]);
+        FrameSignature {
+            scheme: FRAME_SIG_SCHEME_SECP256K1,
+            signer: Some(signer),
+            msg: Bytes::copy_from_slice(digest.as_bytes()),
+            signature: Bytes::from(bytes),
+        }
+    }
+
+    fn input_from_log(log: &ethrex_common::types::Log, creation_block: u64) -> UtxoInput {
+        let opening = decode_utxo_created_log(log)
+            .expect("creation log must be canonical")
+            .expect("log must be UtxoCreated");
+        UtxoInput {
+            index: opening.index,
+            creation_block,
+            source: opening.source,
+            value: opening.value,
+            recipient: opening.recipient,
+            opening_position: 0,
+            opening_siblings: Vec::new(),
+            batch_number: 0,
+            batch_position: 0,
+            batch_siblings: Vec::new(),
+        }
+    }
+
+    fn spend_payload(actor: Address, input: UtxoInput) -> UtxoFramePayload {
+        UtxoFramePayload {
+            actors: vec![UtxoActor {
+                signature_index: 0,
+                actor_address: actor,
+            }],
+            inputs: vec![input],
+            // A zero-valued designated output receives all value left after the
+            // actual fee, making the transaction create exactly one child UTXO.
+            utxo_outputs: vec![UtxoOutput {
+                recipient: actor,
+                value: U256::zero(),
+            }],
+            account_outputs: Vec::new(),
+            change_kind: CHANGE_KIND_UTXO,
+            change_index: 0,
+            payer: Address::zero(),
+            signed_max_fee_per_gas: U256::from(2_u64),
+            signed_max_priority_fee_per_gas: U256::from(1_u64),
+            signed_max_gas: u64::MAX,
+        }
+    }
+
+    fn native_tx(
+        key: &SigningKey,
+        actor: Address,
+        nonce: u64,
+        payload: &UtxoFramePayload,
+    ) -> FrameTransaction {
+        let digest = payload.frame_digest(HARNESS_CHAIN_ID);
+        FrameTransaction {
+            chain_id: HARNESS_CHAIN_ID,
+            nonce,
+            sender: actor,
+            frames: vec![Frame {
+                mode: u8::from(FrameMode::Verify),
+                flags: APPROVE_EXECUTION_AND_PAYMENT,
+                target: Some(UTXO_VAULT),
+                gas_limit: NATIVE_FRAME_GAS,
+                value: U256::zero(),
+                data: Bytes::from(payload.encode_to_vec()),
+            }],
+            signatures: vec![sign_digest(key, actor, digest)],
+            max_priority_fee_per_gas: 1,
+            max_fee_per_gas: 2,
+            max_fee_per_blob_gas: U256::zero(),
+            blob_versioned_hashes: Vec::new(),
+            inner_hash: Default::default(),
+            cached_canonical: Default::default(),
+        }
+    }
+
+    fn execute_on_db(
+        db: &mut GeneralizedDatabase,
+        tx: &FrameTransaction,
+        block_number: u64,
+    ) -> Result<ExecutionReport, VMError> {
+        let mut env = frame_tx_env(tx);
+        env.block_number = block_number;
+        let transaction = Transaction::FrameTransaction(tx.clone());
+        let mut vm = VM::new(
+            env,
+            db,
+            &transaction,
+            LevmCallTracer::disabled(),
+            VMType::L1,
+            &NativeCrypto,
+        )
+        .expect("VM construction must succeed");
+        vm.execute()
+    }
+
+    fn set_vault_storage(db: &mut GeneralizedDatabase, slot: H256, value: U256) {
+        db.current_accounts_state
+            .get_mut(&UTXO_VAULT)
+            .expect("vault must be seeded")
+            .storage
+            .insert(slot, value);
+        db.initial_accounts_state
+            .get_mut(&UTXO_VAULT)
+            .expect("initial vault must be seeded")
+            .storage
+            .insert(slot, value);
+    }
+
+    #[test]
+    fn create_spend_settle_and_reject_replay() {
+        let (key, actor) = key_and_address();
+        let bootstrap_value = U256::from(10_u64).pow(U256::from(18_u64));
+        let bootstrap_log = utxo_created_log(actor, actor, 0, bootstrap_value);
+        let bootstrap_root = utxo_openings_root_from_logs([&bootstrap_log]).unwrap();
+        let bootstrap_input = input_from_log(&bootstrap_log, BOOTSTRAP_BLOCK);
+
+        let mut db = seeded_db(&[
+            (actor, U256::zero(), 0, Bytes::new()),
+            (UTXO_VAULT, bootstrap_value, 0, Bytes::new()),
+        ]);
+        set_vault_storage(&mut db, H256::from_low_u64_be(NEXT_INDEX_SLOT), U256::one());
+        set_vault_storage(
+            &mut db,
+            openings_ring_storage_slot(BOOTSTRAP_BLOCK),
+            U256::from_big_endian(bootstrap_root.as_bytes()),
+        );
+
+        // Spend the bootstrap fixture through the real native path. Settlement
+        // assigns index 1 and emits the discovery log that creates our test UTXO.
+        let create_payload = spend_payload(actor, bootstrap_input);
+        let create_tx = native_tx(&key, actor, 0, &create_payload);
+        let create_report = execute_on_db(&mut db, &create_tx, CREATE_BLOCK)
+            .expect("bootstrap spend must create a UTXO");
+        assert!(matches!(create_report.result, TxResult::Success));
+        assert_eq!(create_report.logs.len(), 1);
+        let created_opening = decode_utxo_created_log(&create_report.logs[0])
+            .unwrap()
+            .unwrap();
+        assert_eq!(created_opening.index, 1);
+        assert!(!created_opening.value.is_zero());
+
+        // Finalize the creation block's one-leaf openings tree, then construct
+        // the empty Merkle path that proves the newly settled output.
+        let creation_root = utxo_openings_root_from_logs(create_report.logs.iter()).unwrap();
+        set_vault_storage(
+            &mut db,
+            openings_ring_storage_slot(CREATE_BLOCK),
+            U256::from_big_endian(creation_root.as_bytes()),
+        );
+        let created_input = input_from_log(&create_report.logs[0], CREATE_BLOCK);
+
+        let spend_payload = spend_payload(actor, created_input);
+        let spend_tx = native_tx(&key, actor, 1, &spend_payload);
+        let spend_report = execute_on_db(&mut db, &spend_tx, SPEND_BLOCK)
+            .expect("created UTXO must be spendable with its opening proof");
+        assert!(matches!(spend_report.result, TxResult::Success));
+        assert_eq!(
+            spend_report.logs.len(),
+            1,
+            "settlement must create its child output"
+        );
+        let settled_child = decode_utxo_created_log(&spend_report.logs[0])
+            .unwrap()
+            .unwrap();
+        assert_eq!(settled_child.index, 2);
+        assert_eq!(settled_child.recipient, actor);
+        assert!(!settled_child.value.is_zero());
+
+        let spent_slot = spent_bitmap_storage_slot(created_opening.index);
+        let spent_word = db.current_accounts_state[&UTXO_VAULT].storage[&spent_slot];
+        assert!(spent_word.bit(1), "spending index 1 must set bitmap bit 1");
+        assert_eq!(
+            db.current_accounts_state[&UTXO_VAULT].storage[&H256::from_low_u64_be(NEXT_INDEX_SLOT)],
+            U256::from(3_u64),
+            "both settlements must assign one sequential output index"
+        );
+
+        // Advance only the envelope nonce so generic nonce validation passes;
+        // the actor-signed payload and UTXO input are unchanged. Rejection must
+        // therefore come from replay protection in the spent bitmap.
+        let replay_tx = native_tx(&key, actor, 2, &spend_payload);
+        assert_eq!(nonce_of(&db, actor), replay_tx.nonce);
+        let state_before_replay = db.current_accounts_state.clone();
+        let error = execute_on_db(&mut db, &replay_tx, SPEND_BLOCK + 1)
+            .expect_err("replaying the same UTXO spend must be rejected");
+        assert!(
+            matches!(
+                error,
+                VMError::TxValidation(TxValidationError::InvalidFrameTransaction)
+            ),
+            "unexpected replay error: {error}"
+        );
+        assert_eq!(
+            db.current_accounts_state, state_before_replay,
+            "a rejected replay must not duplicate settlement or mutate state"
+        );
+    }
 }

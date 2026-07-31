@@ -160,6 +160,8 @@ pub enum TxValidationError {
     TxMaxGasLimitExceeded { tx_hash: H256, tx_gas_limit: u64 },
     #[error("Invalid frame transaction: VERIFY frame did not call APPROVE or payer not approved")]
     InvalidFrameTransaction,
+    #[error("Invalid native UTXO frame payload: {reason}")]
+    InvalidNativeUtxoFrame { reason: String },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error, Serialize, Deserialize)]

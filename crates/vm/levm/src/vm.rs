@@ -1515,6 +1515,334 @@ impl<'a> VM<'a> {
         Ok(report)
     }
 
+    /// Run the read-only portion of the experimental native-UTXO VERIFY
+    /// semantics. Outer signatures have already been cryptographically
+    /// validated by EIP-8141 when this method is called.
+    fn validate_native_utxo_frame(
+        &mut self,
+        payload: &ethrex_common::types::UtxoFramePayload,
+        frame_tx: &ethrex_common::types::FrameTransaction,
+    ) -> Result<(), VMError> {
+        use ethrex_common::types::{
+            MAX_BATCH_PROOF_DEPTH, NEXT_INDEX_SLOT, UTXO_RING_SIZE, UTXO_VAULT,
+            batch_root_storage_slot, openings_ring_storage_slot, spent_bitmap_storage_slot,
+            utxo_batch_root, utxo_openings_root,
+        };
+
+        let invalid = |reason: String| {
+            VMError::TxValidation(crate::errors::TxValidationError::InvalidNativeUtxoFrame {
+                reason,
+            })
+        };
+
+        payload
+            .validate_actor_signatures(frame_tx)
+            .map_err(&invalid)?;
+
+        let actor_addresses: FxHashSet<Address> = payload
+            .actors
+            .iter()
+            .map(|actor| actor.actor_address)
+            .collect();
+        let mut input_indices = FxHashSet::default();
+
+        // Load the vault account once before accessing its storage.
+        self.db.get_account(UTXO_VAULT)?;
+        let next_index =
+            self.get_storage_value(UTXO_VAULT, H256::from_low_u64_be(NEXT_INDEX_SLOT))?;
+        let updated_next_index = next_index
+            .checked_add(U256::from(payload.utxo_outputs.len()))
+            .ok_or_else(|| invalid("native UTXO next index overflow".into()))?;
+        if updated_next_index > U256::from(u64::MAX) {
+            return Err(invalid(
+                "native UTXO outputs exceed the uint64 index space".into(),
+            ));
+        }
+
+        for input in &payload.inputs {
+            if !input_indices.insert(input.index) {
+                return Err(invalid(format!(
+                    "duplicate native UTXO input index {}",
+                    input.index
+                )));
+            }
+            if U256::from(input.index) >= next_index {
+                return Err(invalid(format!(
+                    "native UTXO input index {} has not been assigned",
+                    input.index
+                )));
+            }
+            if !actor_addresses.contains(&input.recipient) {
+                return Err(invalid(format!(
+                    "native UTXO input {} recipient is not an actor",
+                    input.index
+                )));
+            }
+
+            let spent_word =
+                self.get_storage_value(UTXO_VAULT, spent_bitmap_storage_slot(input.index))?;
+            let spent_bit = u8::try_from(input.index & 0xff)
+                .map(usize::from)
+                .map_err(|_| VMError::Internal(InternalError::TypeConversion))?;
+            if spent_word.bit(spent_bit) {
+                return Err(invalid(format!(
+                    "native UTXO input {} is already spent",
+                    input.index
+                )));
+            }
+
+            if input.creation_block >= self.env.block_number {
+                return Err(invalid(format!(
+                    "native UTXO input {} must have been created in an earlier block",
+                    input.index
+                )));
+            }
+            let openings_root = utxo_openings_root(input).map_err(&invalid)?;
+            let age = self
+                .env
+                .block_number
+                .checked_sub(input.creation_block)
+                .ok_or(VMError::Internal(InternalError::Underflow))?;
+            if age < UTXO_RING_SIZE {
+                if !input.batch_siblings.is_empty() {
+                    return Err(invalid(format!(
+                        "recent native UTXO input {} must not include a batch proof",
+                        input.index
+                    )));
+                }
+                let committed_root = self.get_storage_value(
+                    UTXO_VAULT,
+                    openings_ring_storage_slot(input.creation_block),
+                )?;
+                if openings_root != H256::from_uint(&committed_root) {
+                    return Err(invalid(format!(
+                        "native UTXO input {} opening proof does not match the ring root",
+                        input.index
+                    )));
+                }
+            } else {
+                let expected_batch_number = input.creation_block / UTXO_RING_SIZE;
+                let expected_batch_position = input.creation_block % UTXO_RING_SIZE;
+                if input.batch_number != expected_batch_number
+                    || input.batch_position != expected_batch_position
+                {
+                    return Err(invalid(format!(
+                        "native UTXO input {} has inconsistent batch metadata",
+                        input.index
+                    )));
+                }
+                if input.batch_siblings.len() != MAX_BATCH_PROOF_DEPTH {
+                    return Err(invalid(format!(
+                        "old native UTXO input {} must include a {MAX_BATCH_PROOF_DEPTH}-level batch proof",
+                        input.index
+                    )));
+                }
+                let proven_batch_root = utxo_batch_root(input, openings_root).map_err(&invalid)?;
+                let committed_batch_root = self
+                    .get_storage_value(UTXO_VAULT, batch_root_storage_slot(input.batch_number))?;
+                if proven_batch_root != H256::from_uint(&committed_batch_root) {
+                    return Err(invalid(format!(
+                        "native UTXO input {} batch proof does not match the sealed root",
+                        input.index
+                    )));
+                }
+            }
+        }
+
+        payload
+            .validate_outputs_and_conservation(frame_tx)
+            .map_err(invalid)?;
+        Ok(())
+    }
+
+    /// Atomically consume all verified inputs and apply the UTXO frame's
+    /// EIP-8141 approval semantics.
+    ///
+    /// The writes use the current outer frame backup. Once this frame succeeds,
+    /// the normal frame-loop boundary absorbs and clears that backup, so a later
+    /// ordinary frame revert cannot restore these bits. Transaction-level
+    /// invalidity still restores the accumulated backup, as required for an
+    /// invalid block transaction to have no state effects.
+    fn approve_native_utxo_frame(
+        &mut self,
+        frame: &Frame,
+        payload: &ethrex_common::types::UtxoFramePayload,
+    ) -> Result<Address, VMError> {
+        use ethrex_common::types::{
+            APPROVE_EXECUTION, APPROVE_EXECUTION_AND_PAYMENT, UTXO_VAULT, check_and_set_spent_bit,
+            spent_bitmap_storage_slot,
+        };
+
+        let invalid = |reason: &str| {
+            VMError::TxValidation(crate::errors::TxValidationError::InvalidNativeUtxoFrame {
+                reason: reason.to_owned(),
+            })
+        };
+        let self_funded = payload.payer == Address::zero();
+        let expected_scope = if self_funded {
+            APPROVE_EXECUTION_AND_PAYMENT
+        } else {
+            APPROVE_EXECUTION
+        };
+        if frame.scope_restriction() != expected_scope {
+            return Err(invalid(if self_funded {
+                "self-funded native UTXO frame must allow execution-and-payment approval"
+            } else {
+                "sponsored native UTXO frame must allow execution approval"
+            }));
+        }
+
+        let ctx =
+            self.frame_tx_context
+                .as_ref()
+                .ok_or(VMError::Internal(InternalError::Custom(
+                    "missing frame tx context".to_string(),
+                )))?;
+        if ctx.sender_approved || ctx.payer_address.is_some() {
+            return Err(invalid(
+                "native UTXO frame must be the transaction's first approval",
+            ));
+        }
+
+        // Re-check and set each bit against the live state. This closes the
+        // gap between earlier proof validation and approval and makes duplicate
+        // or block-local conflicting spends fail atomically.
+        for input in &payload.inputs {
+            let storage_key = spent_bitmap_storage_slot(input.index);
+            let current_word = self.get_storage_value(UTXO_VAULT, storage_key)?;
+            let updated_word =
+                check_and_set_spent_bit(current_word, input.index).map_err(|reason| {
+                    VMError::TxValidation(
+                        crate::errors::TxValidationError::InvalidNativeUtxoFrame { reason },
+                    )
+                })?;
+            let slot_key = U256::from_big_endian(storage_key.as_bytes());
+            self.update_account_storage(
+                UTXO_VAULT,
+                storage_key,
+                slot_key,
+                updated_word,
+                current_word,
+            )?;
+        }
+
+        let resolved_payer =
+            if self_funded {
+                let ctx = self.frame_tx_context.as_ref().ok_or(VMError::Internal(
+                    InternalError::Custom("missing frame tx context".to_string()),
+                ))?;
+                let maximum_cost = crate::opcode_handlers::frame_tx::compute_tx_max_cost(ctx)?;
+                let sender = ctx.tx.sender;
+
+                // Match ordinary EIP-8141 payment approval: consume the sender
+                // nonce and escrow the maximum transaction cost. End-of-transaction
+                // fee finalization refunds the max-vs-actual difference to the vault.
+                self.increment_account_nonce(sender)?;
+                match self.decrease_account_balance(UTXO_VAULT, maximum_cost) {
+                    Ok(()) => {}
+                    Err(InternalError::Underflow) => {
+                        return Err(invalid(
+                            "UTXO vault balance cannot cover the transaction maximum cost",
+                        ));
+                    }
+                    Err(error) => return Err(VMError::Internal(error)),
+                }
+                UTXO_VAULT
+            } else {
+                payload.payer
+            };
+
+        let ctx =
+            self.frame_tx_context
+                .as_mut()
+                .ok_or(VMError::Internal(InternalError::Custom(
+                    "missing frame tx context".to_string(),
+                )))?;
+        ctx.sender_approved = true;
+        if self_funded {
+            ctx.payer_address = Some(UTXO_VAULT);
+        }
+        Ok(resolved_payer)
+    }
+
+    /// Apply the infallible value transition promised by native-UTXO VERIFY.
+    ///
+    /// UTXO outputs remain backed by the vault, so creating them changes only
+    /// `next_utxo_index` and emits discovery logs. Account outputs leave the
+    /// vault and are credited directly. The designated zero-valued change
+    /// entry is replaced with the remainder computed using the actual fee.
+    fn settle_native_utxo_frame(
+        &mut self,
+        payload: &ethrex_common::types::UtxoFramePayload,
+        actual_fee: U256,
+    ) -> Result<Vec<Log>, VMError> {
+        use ethrex_common::types::{
+            CHANGE_KIND_ACCOUNT, CHANGE_KIND_UTXO, NEXT_INDEX_SLOT, UTXO_VAULT, utxo_created_log,
+        };
+
+        let invalid = |reason: String| {
+            VMError::TxValidation(crate::errors::TxValidationError::InvalidNativeUtxoFrame {
+                reason,
+            })
+        };
+        let change = payload.settlement_change(actual_fee).map_err(&invalid)?;
+        let change_index = usize::try_from(payload.change_index)
+            .map_err(|_| invalid("native UTXO change index does not fit usize".into()))?;
+
+        // Reserve all output indices before moving value. `next_utxo_index` is
+        // represented as uint64 by the proposal, so it must remain in range
+        // after assigning this frame's outputs.
+        let next_index_key = H256::from_low_u64_be(NEXT_INDEX_SLOT);
+        let current_next_index = self.get_storage_value(UTXO_VAULT, next_index_key)?;
+        let output_count = U256::from(payload.utxo_outputs.len());
+        let updated_next_index = current_next_index
+            .checked_add(output_count)
+            .ok_or_else(|| invalid("native UTXO next index overflow".into()))?;
+        if updated_next_index > U256::from(u64::MAX) {
+            return Err(invalid(
+                "native UTXO next index exceeds the uint64 index space".into(),
+            ));
+        }
+
+        let source = if let [actor] = payload.actors.as_slice() {
+            actor.actor_address
+        } else {
+            UTXO_VAULT
+        };
+        let mut logs = Vec::with_capacity(payload.utxo_outputs.len());
+        for (offset, output) in payload.utxo_outputs.iter().enumerate() {
+            let index = current_next_index
+                .checked_add(U256::from(offset))
+                .and_then(|value| u64::try_from(value).ok())
+                .ok_or_else(|| invalid("native UTXO output index overflow".into()))?;
+            let value = if payload.change_kind == CHANGE_KIND_UTXO && offset == change_index {
+                change
+            } else {
+                output.value
+            };
+            logs.push(utxo_created_log(source, output.recipient, index, value));
+        }
+
+        self.update_account_storage(
+            UTXO_VAULT,
+            next_index_key,
+            U256::from(NEXT_INDEX_SLOT),
+            updated_next_index,
+            current_next_index,
+        )?;
+
+        for (index, output) in payload.account_outputs.iter().enumerate() {
+            let value = if payload.change_kind == CHANGE_KIND_ACCOUNT && index == change_index {
+                change
+            } else {
+                output.value
+            };
+            self.transfer(UTXO_VAULT, output.recipient, value)?;
+        }
+
+        Ok(logs)
+    }
+
     /// Execute a frame transaction (EIP-8141).
     /// This bypasses the normal prepare/finalize hooks and orchestrates per-frame execution.
     fn execute_frame_tx(&mut self) -> Result<ExecutionReport, VMError> {
@@ -1647,6 +1975,19 @@ impl<'a> VM<'a> {
         let intrinsic_gas = total_gas_limit.saturating_sub(sum_frame_gas_limits);
         let mut total_gas_used: u64 = intrinsic_gas;
         let mut tx_invalid = false;
+        // Resolved payer committed by the signed UTXO payload. A self-funded
+        // payload resolves zero to UTXO_VAULT; a sponsored payload is matched
+        // against the payer that approves in a later VERIFY frame.
+        let mut expected_native_utxo_payer: Option<Address> = None;
+        // Retain the approved transition until actual gas is known. The tuple
+        // also records its frame receipt and aggregate-log insertion positions,
+        // so settlement logs preserve frame order even though settlement runs
+        // after every frame has executed.
+        let mut approved_native_utxo: Option<(
+            usize,
+            usize,
+            ethrex_common::types::UtxoFramePayload,
+        )> = None;
 
         // Atomic batching state: track whether we're inside a batch and
         // which frames belong to it so we can revert them all on failure.
@@ -1770,6 +2111,8 @@ impl<'a> VM<'a> {
             // Set env.origin for this frame (ORIGIN opcode reads this)
             self.env.origin = caller;
 
+            let is_native_utxo = frame.is_native_utxo();
+
             // Resolve any EIP-7702 delegation at the resolved target. For a non-delegated
             // target this is equivalent to `db.get_account_code(target)`; for a delegated
             // target it follows the 0xef0100 || addr indicator and returns the delegatee's
@@ -1784,13 +2127,19 @@ impl<'a> VM<'a> {
             // default_hook.rs drops the same cost there. EIP-8141 §Execution is silent on
             // billing the 7702 access cost for `resolved_target`, so we keep frame-entry
             // behavior consistent with tx-entry behavior.
-            let (is_delegation_7702, _access_cost, code_address, bytecode) =
+            let (is_delegation_7702, _access_cost, code_address, bytecode) = if is_native_utxo {
+                // A UTXO VERIFY frame has protocol-defined behavior. Vault
+                // bytecode and delegation indicators are irrelevant to this
+                // path and must never execute.
+                (false, 0, target, Code::default())
+            } else {
                 crate::utils::eip7702_get_code(
                     self.db,
                     &mut self.substate,
                     target,
                     self.env.config.fork,
-                )?;
+                )?
+            };
 
             // Mirror default_hook::set_bytecode_and_code_address: when delegation was
             // followed, record the delegatee (code_address) as touched in BAL so EIP-7928
@@ -1856,6 +2205,58 @@ impl<'a> VM<'a> {
                 self.substate.revert_backup();
                 self.restore_cache_state()?;
                 (false, frame.gas_limit, Vec::new())
+            } else if is_native_utxo {
+                // Native UTXO VERIFY frames are decoded and executed directly
+                // by the protocol. Their cryptographic signatures were checked
+                // in the frame-transaction preamble; this branch binds those
+                // signatures to the witness-free digest, validates proofs and
+                // conservation, then atomically consumes the inputs.
+                let native_result = (|| {
+                    let payload =
+                        ethrex_common::types::UtxoFramePayload::decode_frame_data(&frame.data)
+                            .map_err(|error| {
+                                VMError::TxValidation(
+                                    crate::errors::TxValidationError::InvalidNativeUtxoFrame {
+                                        reason: error.to_string(),
+                                    },
+                                )
+                            })?;
+                    let native_gas = payload.native_execution_gas().map_err(|reason| {
+                        VMError::TxValidation(
+                            crate::errors::TxValidationError::InvalidNativeUtxoFrame { reason },
+                        )
+                    })?;
+                    if native_gas > frame.gas_limit {
+                        return Err(VMError::TxValidation(
+                            crate::errors::TxValidationError::InvalidNativeUtxoFrame {
+                                reason: format!(
+                                    "native UTXO execution requires {native_gas} gas but frame limit is {}",
+                                    frame.gas_limit
+                                ),
+                            },
+                        ));
+                    }
+                    self.validate_native_utxo_frame(&payload, &frame_tx)?;
+                    let expected_payer = self.approve_native_utxo_frame(frame, &payload)?;
+                    Ok((expected_payer, payload, native_gas))
+                })();
+
+                match native_result {
+                    Ok((expected_payer, payload, native_gas)) => {
+                        expected_native_utxo_payer = Some(expected_payer);
+                        approved_native_utxo = Some((frame_idx, all_logs.len(), payload));
+                        self.substate.commit_backup();
+                        (true, native_gas, Vec::new())
+                    }
+                    Err(error) => {
+                        self.substate.revert_backup();
+                        self.restore_cache_state()?;
+                        if matches!(error, VMError::Internal(_)) {
+                            return Err(error);
+                        }
+                        (false, frame.gas_limit, Vec::new())
+                    }
+                }
             } else if bytecode.is_empty() && !is_delegation_7702 {
                 // Default code runs only when the target has NEITHER code NOR a delegation
                 // indicator (EIP-8141 §Execution). After eip7702_get_code,
@@ -2121,6 +2522,9 @@ impl<'a> VM<'a> {
         if ctx.payer_address.is_none() {
             tx_invalid = true;
         }
+        if expected_native_utxo_payer.is_some() && ctx.payer_address != expected_native_utxo_payer {
+            tx_invalid = true;
+        }
 
         if tx_invalid {
             // TX is invalid — Err must leave `db.current_accounts_state`
@@ -2137,12 +2541,12 @@ impl<'a> VM<'a> {
         }
 
         // Take ownership of frame context
-        let ctx = self
-            .frame_tx_context
-            .take()
-            .ok_or(VMError::Internal(InternalError::Custom(
-                "missing frame tx context".to_string(),
-            )))?;
+        let mut ctx =
+            self.frame_tx_context
+                .take()
+                .ok_or(VMError::Internal(InternalError::Custom(
+                    "missing frame tx context".to_string(),
+                )))?;
         let payer = ctx.payer_address.unwrap_or(sender);
 
         // EIP-8141 gas finalization. EIP-3529 storage refunds accumulate into a
@@ -2179,15 +2583,40 @@ impl<'a> VM<'a> {
             &ctx.tx.blob_versioned_hashes,
             self.env.base_blob_fee_per_gas,
         )?;
-        let owed = effective_gas_price
+        let actual_fee = effective_gas_price
             .checked_mul(U256::from(total_gas_used))
             .and_then(|gas_owed| gas_owed.checked_add(blob_burn))
             .ok_or(VMError::Internal(InternalError::Overflow))?;
+
+        if let Some((frame_index, log_insert_index, payload)) = approved_native_utxo.as_ref() {
+            // VERIFY already established solvency and output shape. Keep a
+            // defensive rollback here for index exhaustion or an inconsistent
+            // state database, so a settlement error cannot leave spent bits or
+            // partially credited outputs behind.
+            let settlement_logs = match self.settle_native_utxo_frame(payload, actual_fee) {
+                Ok(logs) => logs,
+                Err(error) => {
+                    tx_level_backup.absorb(&self.current_call_frame.call_frame_backup);
+                    crate::utils::restore_cache_state(self.db, tx_level_backup)?;
+                    return Err(error);
+                }
+            };
+            let Some(frame_result) = ctx.frame_results.get_mut(*frame_index) else {
+                tx_level_backup.absorb(&self.current_call_frame.call_frame_backup);
+                crate::utils::restore_cache_state(self.db, tx_level_backup)?;
+                return Err(VMError::Internal(InternalError::Custom(
+                    "missing native UTXO frame receipt".into(),
+                )));
+            };
+            frame_result.2.extend(settlement_logs.clone());
+            all_logs.splice(*log_insert_index..*log_insert_index, settlement_logs);
+        }
+
         // charged >= owed always: effective <= max_fee (by construction of the
         // effective price), base_blob <= max_blob (blob-fee validity check), and
         // total_gas_used <= total_gas_limit (frames are bounded by their limits).
         let refund_amount = charged
-            .checked_sub(owed)
+            .checked_sub(actual_fee)
             .ok_or(VMError::Internal(InternalError::Underflow))?;
 
         self.increase_account_balance(payer, refund_amount)?;

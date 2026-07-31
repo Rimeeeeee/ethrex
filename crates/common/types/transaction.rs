@@ -1856,6 +1856,12 @@ impl Frame {
         self.execution_mode() == FrameMode::Verify
             && self.target == Some(frame_tx_expiry_verifier())
     }
+
+    /// A native UTXO frame is an EIP-8141 VERIFY frame whose explicit target is
+    /// the experimental `UTXO_VAULT` system address.
+    pub fn is_native_utxo(&self) -> bool {
+        self.mode == FrameMode::Verify as u8 && self.target == Some(super::UTXO_VAULT)
+    }
 }
 
 impl RLPEncode for Frame {
@@ -2230,6 +2236,7 @@ impl FrameTransaction {
         // bound below rejects tx-level totals that don't fit in signed i64.
         let mut total_frame_gas: u128 = 0;
         let mut expiry_frame_count: usize = 0;
+        let mut native_utxo_frame_count: usize = 0;
         for (i, frame) in self.frames.iter().enumerate() {
             // Reject reserved execution modes (3-255)
             if frame.mode >= 3 {
@@ -2259,6 +2266,17 @@ impl FrameTransaction {
                 if frame.data.len() != FRAME_TX_EXPIRY_DATA_LENGTH {
                     return Err(format!(
                         "Frame {i}: expiry verifier frame data must be {FRAME_TX_EXPIRY_DATA_LENGTH} bytes"
+                    ));
+                }
+            }
+            // The native-UTXO transition and its maximum fee are transaction
+            // scoped, so an EIP-8141 transaction can carry at most one UTXO
+            // VERIFY frame.
+            if frame.is_native_utxo() {
+                native_utxo_frame_count = native_utxo_frame_count.saturating_add(1);
+                if native_utxo_frame_count > 1 {
+                    return Err(format!(
+                        "Frame {i}: more than one native UTXO frame in transaction"
                     ));
                 }
             }
@@ -2297,6 +2315,7 @@ impl FrameTransaction {
             // frame's target is empty or `tx.sender`.
             if frame.flags & APPROVE_EXECUTION != 0
                 && frame.target.is_some_and(|target| target != self.sender)
+                && !frame.is_native_utxo()
             {
                 return Err(format!(
                     "Frame {i}: APPROVE_EXECUTION requires an empty target or tx.sender"
@@ -2320,6 +2339,18 @@ impl FrameTransaction {
                     Some(_) => {}
                 }
             }
+        }
+        // A native UTXO frame authorizes only its declared value transition.
+        // It does not authenticate the outer `tx.sender`, so allowing a SENDER
+        // frame in the same transaction would let an unauthenticated envelope
+        // execute as that address.
+        if native_utxo_frame_count != 0
+            && self
+                .frames
+                .iter()
+                .any(|frame| frame.mode == FrameMode::Sender as u8)
+        {
+            return Err("Native UTXO transactions must not contain SENDER frames".into());
         }
         // Per EIP-8141, the EIP-7623 calldata floor must be reserved independently
         // of execution: the derived `tx_gas_limit` has to cover the mandatory costs
