@@ -17,7 +17,7 @@ use ethrex_rlp::{
 };
 
 use crate::{
-    types::{FRAME_SIG_SCHEME_ARBITRARY, FrameTransaction},
+    types::{FRAME_SIG_SCHEME_ARBITRARY, FrameTransaction, Log},
     utils::keccak,
 };
 
@@ -422,6 +422,60 @@ impl UtxoFramePayload {
         }
         Ok(input_total - required_total)
     }
+
+    /// Resolve the designated change output using the transaction's actual fee.
+    ///
+    /// Self-funded spends deduct the actual protocol fee from the input value.
+    /// Sponsored spends do not: their signed fixed outputs already include the
+    /// payer repayment and the payer account covers the protocol fee.
+    pub fn settlement_change(&self, actual_fee: U256) -> Result<U256, String> {
+        let change_index = usize::try_from(self.change_index)
+            .map_err(|_| "native UTXO change index does not fit usize")?;
+        match self.change_kind {
+            CHANGE_KIND_UTXO if change_index < self.utxo_outputs.len() => {}
+            CHANGE_KIND_ACCOUNT if change_index < self.account_outputs.len() => {}
+            CHANGE_KIND_UTXO => {
+                return Err("native UTXO change index is outside utxo_outputs".into());
+            }
+            CHANGE_KIND_ACCOUNT => {
+                return Err("native UTXO change index is outside account_outputs".into());
+            }
+            _ => return Err("native UTXO change kind must select UTXO or account outputs".into()),
+        }
+
+        let input_total = checked_sum(self.inputs.iter().map(|input| input.value), "input")?;
+        let fixed_utxo_total = checked_sum(
+            self.utxo_outputs
+                .iter()
+                .enumerate()
+                .filter(|(index, _)| self.change_kind != CHANGE_KIND_UTXO || *index != change_index)
+                .map(|(_, output)| output.value),
+            "UTXO output",
+        )?;
+        let fixed_account_total = checked_sum(
+            self.account_outputs
+                .iter()
+                .enumerate()
+                .filter(|(index, _)| {
+                    self.change_kind != CHANGE_KIND_ACCOUNT || *index != change_index
+                })
+                .map(|(_, output)| output.value),
+            "account output",
+        )?;
+        let fixed_output_total = fixed_utxo_total
+            .checked_add(fixed_account_total)
+            .ok_or("native UTXO fixed output total overflow")?;
+        let fee = if self.payer == Address::zero() {
+            actual_fee
+        } else {
+            U256::zero()
+        };
+
+        input_total
+            .checked_sub(fixed_output_total)
+            .and_then(|remainder| remainder.checked_sub(fee))
+            .ok_or_else(|| "native UTXO settlement change underflow".into())
+    }
 }
 
 fn checked_sum(values: impl IntoIterator<Item = U256>, description: &str) -> Result<U256, String> {
@@ -453,6 +507,31 @@ pub fn check_and_set_spent_bit(current_word: U256, index: u64) -> Result<U256, S
         return Err(format!("native UTXO input {index} is already spent"));
     }
     Ok(current_word | bit_mask)
+}
+
+/// Build the canonical discovery log for a newly assigned UTXO.
+///
+/// `source` and `recipient` are indexed as topics 1 and 2. The non-indexed
+/// `uint64 index` and `uint256 value` occupy two 32-byte ABI words in `data`.
+pub fn utxo_created_log(source: Address, recipient: Address, index: u64, value: U256) -> Log {
+    fn address_topic(address: Address) -> H256 {
+        let mut topic = [0_u8; 32];
+        topic[12..].copy_from_slice(address.as_bytes());
+        H256(topic)
+    }
+
+    let mut data = [0_u8; 64];
+    data[..32].copy_from_slice(&U256::from(index).to_big_endian());
+    data[32..].copy_from_slice(&value.to_big_endian());
+    Log {
+        address: UTXO_VAULT,
+        topics: vec![
+            *UTXO_CREATED_TOPIC,
+            address_topic(source),
+            address_topic(recipient),
+        ],
+        data: Bytes::copy_from_slice(&data),
+    }
 }
 
 /// Ring storage slot containing the recent openings root for `block_number`.
@@ -904,6 +983,38 @@ mod tests {
                 .contains("already spent")
         );
         assert!(check_and_set_spent_bit(word, 258).unwrap().bit(2));
+    }
+
+    #[test]
+    fn settlement_change_uses_actual_fee_only_when_self_funded() {
+        let mut payload = sample_payload();
+        assert_eq!(
+            payload.settlement_change(U256::from(25_000u64)).unwrap(),
+            U256::from(375_000u64)
+        );
+
+        payload.payer = Address::from_low_u64_be(0xca11);
+        assert_eq!(
+            payload.settlement_change(U256::from(25_000u64)).unwrap(),
+            U256::from(400_000u64)
+        );
+    }
+
+    #[test]
+    fn utxo_created_log_has_canonical_topics_and_data() {
+        let source = Address::from_low_u64_be(0xa11ce);
+        let recipient = Address::from_low_u64_be(0xb0b);
+        let log = utxo_created_log(source, recipient, 42, U256::from(123_456u64));
+
+        assert_eq!(log.address, UTXO_VAULT);
+        assert_eq!(log.topics[0], *UTXO_CREATED_TOPIC);
+        assert_eq!(&log.topics[1].as_bytes()[12..], source.as_bytes());
+        assert_eq!(&log.topics[2].as_bytes()[12..], recipient.as_bytes());
+        assert_eq!(U256::from_big_endian(&log.data[..32]), U256::from(42u64));
+        assert_eq!(
+            U256::from_big_endian(&log.data[32..]),
+            U256::from(123_456u64)
+        );
     }
 
     #[test]
