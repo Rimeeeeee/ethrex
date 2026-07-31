@@ -466,10 +466,11 @@ impl UtxoFramePayload {
                 .checked_add(maximum_fee)
                 .ok_or("native UTXO self-funded required total overflow")?
         } else {
-            // The protocol requires a fixed signed repayment output. The
-            // sponsor's preceding VERIFY frame decides whether its amount is
-            // sufficient for that sponsor's policy; native validation must not
-            // impose a separate repayment price.
+            // Sponsorship must be safe independently of payer code: one fixed,
+            // actor-signed output repays at least the transaction's maximum gas
+            // charge. The later EIP-8141 payment frame still approves the exact
+            // signed payer, but it need not correctly reimplement this payload
+            // parser or minimum-repayment calculation.
             let has_repayment_output = self
                 .utxo_outputs
                 .iter()
@@ -485,10 +486,13 @@ impl UtxoFramePayload {
                                 .then_some((output.recipient, output.value))
                         }),
                 )
-                .any(|(recipient, value)| recipient == self.payer && !value.is_zero());
+                .any(|(recipient, value)| {
+                    recipient == self.payer && !value.is_zero() && value >= maximum_fee
+                });
             if !has_repayment_output {
                 return Err(
-                    "sponsored native UTXO frame lacks a nonzero fixed payer output".into(),
+                    "sponsored native UTXO frame lacks a fixed payer output covering the maximum transaction fee"
+                        .into(),
                 );
             }
             fixed_output_total
@@ -1142,6 +1146,30 @@ mod tests {
                 .unwrap_err()
                 .contains("do not cover")
         );
+    }
+
+    #[test]
+    fn sponsored_repayment_covers_the_maximum_transaction_fee() {
+        let mut payload = sample_payload();
+        payload.payer = payload.account_outputs[0].recipient;
+        let tx = sample_transaction(&payload);
+        let maximum_fee = U256::from(tx.max_fee_per_gas)
+            .checked_mul(U256::from(tx.total_gas_limit()))
+            .unwrap();
+        assert!(maximum_fee > U256::zero());
+
+        payload.account_outputs[0].value = maximum_fee - U256::one();
+        assert!(
+            payload
+                .validate_outputs_and_conservation(&tx)
+                .unwrap_err()
+                .contains("covering the maximum transaction fee")
+        );
+
+        payload.account_outputs[0].value = maximum_fee;
+        payload
+            .validate_outputs_and_conservation(&tx)
+            .expect("a fixed payer output covering max cost must be accepted");
     }
 
     #[test]
