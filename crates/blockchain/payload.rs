@@ -1021,6 +1021,10 @@ impl Blockchain {
     }
 
     pub fn finalize_payload(&self, context: &mut PayloadBuildContext) -> Result<(), ChainError> {
+        context
+            .vm
+            .finalize_native_utxo_block(&context.payload.header, &context.receipts)?;
+
         // Take BAL from VM before getting state transitions (which clears state)
         let block_access_list = context.vm.take_bal();
 

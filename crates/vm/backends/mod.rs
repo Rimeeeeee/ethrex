@@ -227,6 +227,16 @@ impl Evm {
         LEVM::process_withdrawals(&mut self.db, withdrawals)
     }
 
+    /// Commits native-UTXO openings and completed batch roots before state
+    /// transitions are extracted for the block state root.
+    pub fn finalize_native_utxo_block(
+        &mut self,
+        block_header: &BlockHeader,
+        receipts: &[Receipt],
+    ) -> Result<(), EvmError> {
+        LEVM::finalize_native_utxo_block(block_header, receipts, &mut self.db)
+    }
+
     pub fn extract_requests(
         &mut self,
         receipts: &[Receipt],

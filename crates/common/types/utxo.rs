@@ -155,6 +155,15 @@ pub struct UtxoAccountOutput {
     pub value: U256,
 }
 
+/// Opening reconstructed from a canonical `UtxoCreated` discovery log.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct UtxoOpening {
+    pub index: u64,
+    pub source: Address,
+    pub recipient: Address,
+    pub value: U256,
+}
+
 /// Decoded native-UTXO payload carried by `Frame::data`.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct UtxoFramePayload {
@@ -534,6 +543,45 @@ pub fn utxo_created_log(source: Address, recipient: Address, index: u64, value: 
     }
 }
 
+/// Decode a canonical creation log, ignoring unrelated logs.
+///
+/// A log under the vault with the creation signature is considered canonical
+/// input to the openings tree, so malformed topics or data are rejected rather
+/// than silently skipped.
+pub fn decode_utxo_created_log(log: &Log) -> Result<Option<UtxoOpening>, String> {
+    if log.address != UTXO_VAULT || log.topics.first() != Some(&*UTXO_CREATED_TOPIC) {
+        return Ok(None);
+    }
+    if log.topics.len() != 3 {
+        return Err("native UTXO creation log must contain exactly three topics".into());
+    }
+    if log.data.len() != 64 {
+        return Err("native UTXO creation log data must contain two ABI words".into());
+    }
+
+    let decode_address_topic = |topic: &H256| -> Result<Address, String> {
+        if topic.as_bytes()[..12] != [0_u8; 12] {
+            return Err("native UTXO address topic is not canonically padded".into());
+        }
+        Ok(Address::from_slice(&topic.as_bytes()[12..]))
+    };
+    let source = decode_address_topic(&log.topics[1])?;
+    let recipient = decode_address_topic(&log.topics[2])?;
+    if source == Address::zero() || recipient == Address::zero() {
+        return Err("native UTXO creation log addresses must not be zero".into());
+    }
+
+    let index = u64::try_from(U256::from_big_endian(&log.data[..32]))
+        .map_err(|_| "native UTXO creation log index exceeds uint64")?;
+    let value = U256::from_big_endian(&log.data[32..]);
+    Ok(Some(UtxoOpening {
+        index,
+        source,
+        recipient,
+        value,
+    }))
+}
+
 /// Ring storage slot containing the recent openings root for `block_number`.
 pub fn openings_ring_storage_slot(block_number: u64) -> H256 {
     utxo_mapping_storage_slot(
@@ -549,18 +597,89 @@ pub fn batch_root_storage_slot(batch_number: u64) -> H256 {
 
 /// Hash the opening committed by one `UtxoCreated` leaf.
 pub fn utxo_opening_leaf(input: &UtxoInput) -> H256 {
+    utxo_opening_leaf_fields(input.index, input.source, input.recipient, input.value)
+}
+
+/// Hash one reconstructed opening into its per-block tree leaf.
+pub fn utxo_opening_leaf_fields(
+    index: u64,
+    source: Address,
+    recipient: Address,
+    value: U256,
+) -> H256 {
     let mut opening = Vec::new();
     Encoder::new(&mut opening)
-        .encode_field(&input.index)
-        .encode_field(&input.source)
-        .encode_field(&input.recipient)
-        .encode_field(&input.value)
+        .encode_field(&index)
+        .encode_field(&source)
+        .encode_field(&recipient)
+        .encode_field(&value)
         .finish();
 
     let mut preimage = Vec::with_capacity(UTXO_LEAF_DOMAIN.len() + opening.len());
     preimage.extend_from_slice(UTXO_LEAF_DOMAIN);
     preimage.extend_from_slice(&opening);
     keccak(&preimage)
+}
+
+/// Build the per-block openings root from receipt logs in consensus order.
+///
+/// Empty blocks commit zero. Non-empty trees are padded on the right with zero
+/// hashes to the next power of two and use `UTXO_NODE_DOMAIN` at every branch.
+/// The research post does not fix a padding rule, so this is an experimental
+/// consensus choice that must be standardized before persistent deployment.
+pub fn utxo_openings_root_from_logs<'a>(
+    logs: impl IntoIterator<Item = &'a Log>,
+) -> Result<H256, String> {
+    let mut leaves = Vec::new();
+    for log in logs {
+        if let Some(opening) = decode_utxo_created_log(log)? {
+            leaves.push(utxo_opening_leaf_fields(
+                opening.index,
+                opening.source,
+                opening.recipient,
+                opening.value,
+            ));
+        }
+    }
+    padded_merkle_root(leaves, UTXO_NODE_DOMAIN)
+}
+
+/// Seal exactly one 8192-block era into its permanent batch root.
+pub fn utxo_batch_root_from_openings_roots(roots: Vec<H256>) -> Result<H256, String> {
+    let expected =
+        usize::try_from(UTXO_RING_SIZE).map_err(|_| "native UTXO ring size does not fit usize")?;
+    if roots.len() != expected {
+        return Err(format!(
+            "native UTXO batch requires {expected} openings roots"
+        ));
+    }
+    padded_merkle_root(roots, UTXO_BATCH_DOMAIN)
+}
+
+fn padded_merkle_root(mut nodes: Vec<H256>, domain: &[u8]) -> Result<H256, String> {
+    if nodes.is_empty() {
+        return Ok(H256::zero());
+    }
+    let padded_len = nodes
+        .len()
+        .checked_next_power_of_two()
+        .ok_or("native UTXO Merkle tree size overflow")?;
+    nodes.resize(padded_len, H256::zero());
+
+    while nodes.len() > 1 {
+        let mut parents = Vec::with_capacity(nodes.len() / 2);
+        for pair in nodes.chunks_exact(2) {
+            let mut preimage = Vec::with_capacity(domain.len() + 64);
+            preimage.extend_from_slice(domain);
+            preimage.extend_from_slice(pair[0].as_bytes());
+            preimage.extend_from_slice(pair[1].as_bytes());
+            parents.push(keccak(&preimage));
+        }
+        nodes = parents;
+    }
+    nodes
+        .pop()
+        .ok_or_else(|| "native UTXO Merkle tree unexpectedly empty".into())
 }
 
 /// Fold an opening proof into its per-block openings root.
@@ -1015,6 +1134,72 @@ mod tests {
             U256::from_big_endian(&log.data[32..]),
             U256::from(123_456u64)
         );
+    }
+
+    #[test]
+    fn creation_logs_build_the_openings_root_in_log_order() {
+        let first = utxo_created_log(
+            Address::from_low_u64_be(1),
+            Address::from_low_u64_be(2),
+            7,
+            U256::from(11u64),
+        );
+        let second = utxo_created_log(
+            Address::from_low_u64_be(3),
+            Address::from_low_u64_be(4),
+            8,
+            U256::from(13u64),
+        );
+        let unrelated = Log {
+            address: Address::from_low_u64_be(9),
+            topics: Vec::new(),
+            data: Bytes::new(),
+        };
+
+        let first_opening = decode_utxo_created_log(&first).unwrap().unwrap();
+        assert_eq!(first_opening.index, 7);
+        let left = utxo_opening_leaf_fields(
+            first_opening.index,
+            first_opening.source,
+            first_opening.recipient,
+            first_opening.value,
+        );
+        let right = utxo_opening_leaf_fields(
+            8,
+            Address::from_low_u64_be(3),
+            Address::from_low_u64_be(4),
+            U256::from(13u64),
+        );
+        let mut preimage = Vec::from(UTXO_NODE_DOMAIN);
+        preimage.extend_from_slice(left.as_bytes());
+        preimage.extend_from_slice(right.as_bytes());
+
+        assert_eq!(
+            utxo_openings_root_from_logs([&unrelated, &first, &second]).unwrap(),
+            keccak(preimage)
+        );
+        assert_eq!(
+            utxo_openings_root_from_logs(std::iter::empty()).unwrap(),
+            H256::zero()
+        );
+    }
+
+    #[test]
+    fn completed_ring_seals_with_thirteen_batch_levels() {
+        let ring_len = usize::try_from(UTXO_RING_SIZE).unwrap();
+        let roots = vec![H256::zero(); ring_len];
+        let mut expected = H256::zero();
+        for _ in 0..MAX_BATCH_PROOF_DEPTH {
+            let mut preimage = Vec::from(UTXO_BATCH_DOMAIN);
+            preimage.extend_from_slice(expected.as_bytes());
+            preimage.extend_from_slice(expected.as_bytes());
+            expected = keccak(preimage);
+        }
+        assert_eq!(
+            utxo_batch_root_from_openings_roots(roots).unwrap(),
+            expected
+        );
+        assert!(utxo_batch_root_from_openings_roots(Vec::new()).is_err());
     }
 
     #[test]

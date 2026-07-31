@@ -102,6 +102,87 @@ fn frame_receipts_from(
     })
 }
 
+fn load_protocol_storage(
+    db: &mut GeneralizedDatabase,
+    address: Address,
+    key: H256,
+) -> Result<U256, EvmError> {
+    db.get_account(address).map_err(|error| {
+        EvmError::Custom(format!("protocol storage account load failed: {error}"))
+    })?;
+
+    if let Some(value) = db
+        .current_accounts_state
+        .get(&address)
+        .and_then(|account| account.storage.get(&key))
+        .copied()
+    {
+        return Ok(value);
+    }
+    if let Some(value) = db
+        .initial_accounts_state
+        .get(&address)
+        .and_then(|account| account.storage.get(&key))
+        .copied()
+    {
+        let account = db.current_accounts_state.get_mut(&address).ok_or_else(|| {
+            EvmError::Custom("protocol storage current account is missing".into())
+        })?;
+        account.storage.insert(key, value);
+        return Ok(value);
+    }
+
+    let value = db.store.get_storage_value(address, key)?;
+    let initial = db
+        .initial_accounts_state
+        .get_mut(&address)
+        .ok_or_else(|| EvmError::Custom("protocol storage initial account is missing".into()))?;
+    initial.storage.insert(key, value);
+    let current = db
+        .current_accounts_state
+        .get_mut(&address)
+        .ok_or_else(|| EvmError::Custom("protocol storage current account is missing".into()))?;
+    current.storage.insert(key, value);
+    Ok(value)
+}
+
+fn read_protocol_storage(
+    db: &mut GeneralizedDatabase,
+    address: Address,
+    key: H256,
+) -> Result<U256, EvmError> {
+    let value = load_protocol_storage(db, address, key)?;
+    if let Some(recorder) = db.bal_recorder_mut() {
+        recorder.record_storage_read(address, U256::from_big_endian(key.as_bytes()));
+    }
+    Ok(value)
+}
+
+fn write_protocol_storage(
+    db: &mut GeneralizedDatabase,
+    address: Address,
+    key: H256,
+    value: U256,
+) -> Result<(), EvmError> {
+    let current = load_protocol_storage(db, address, key)?;
+    let slot = U256::from_big_endian(key.as_bytes());
+    if let Some(recorder) = db.bal_recorder_mut() {
+        if value == current {
+            recorder.record_storage_read(address, slot);
+        } else {
+            recorder.capture_pre_storage(address, slot, current);
+            recorder.record_storage_write(address, slot, value);
+        }
+    }
+    db.get_account_mut(address)
+        .map_err(|error| {
+            EvmError::Custom(format!("protocol storage account update failed: {error}"))
+        })?
+        .storage
+        .insert(key, value);
+    Ok(())
+}
+
 /// Checks that adding `tx_gas_limit` to `block_gas_used` doesn't exceed `block_gas_limit`.
 fn check_gas_limit(
     block_gas_used: u64,
@@ -392,6 +473,7 @@ impl LEVM {
         if let Some(withdrawals) = &block.body.withdrawals {
             Self::process_withdrawals(db, withdrawals)?;
         }
+        Self::finalize_native_utxo_block(&block.header, &receipts, db)?;
 
         // Extract BAL if recording was enabled
         let bal = db.take_bal();
@@ -552,6 +634,7 @@ impl LEVM {
             if let Some(withdrawals) = &block.body.withdrawals {
                 Self::process_withdrawals(db, withdrawals)?;
             }
+            Self::finalize_native_utxo_block(&block.header, &receipts, db)?;
             // State transitions for merkleizer come from bal_to_account_updates,
             // not from db — no need to call send_state_transitions_tx here.
 
@@ -827,6 +910,7 @@ impl LEVM {
         if let Some(withdrawals) = &block.body.withdrawals {
             Self::process_withdrawals(db, withdrawals)?;
         }
+        Self::finalize_native_utxo_block(&block.header, &receipts, db)?;
         LEVM::send_state_transitions_tx(&merkleizer, db, queue_length)?;
 
         // Extract BAL if recording was enabled
@@ -3242,6 +3326,63 @@ impl LEVM {
         Ok(())
     }
 
+    /// Commit the block's native-UTXO openings root and seal a completed ring.
+    ///
+    /// This must run after transaction receipts are final and before state
+    /// transitions are extracted. Receipt logs therefore determine the
+    /// openings tree, while these direct protocol storage writes flow through
+    /// the ordinary account-update/state-root and EIP-7928 BAL machinery.
+    pub fn finalize_native_utxo_block(
+        block_header: &BlockHeader,
+        receipts: &[Receipt],
+        db: &mut GeneralizedDatabase,
+    ) -> Result<(), EvmError> {
+        use ethrex_common::types::{
+            UTXO_RING_SIZE, UTXO_VAULT, batch_root_storage_slot, openings_ring_storage_slot,
+            utxo_batch_root_from_openings_roots, utxo_openings_root_from_logs,
+        };
+
+        let chain_config = db.store.get_chain_config()?;
+        if chain_config.fork(block_header.timestamp) < Fork::Hegota {
+            return Ok(());
+        }
+
+        let openings_root =
+            utxo_openings_root_from_logs(receipts.iter().flat_map(|receipt| receipt.logs.iter()))
+                .map_err(EvmError::Custom)?;
+        let ring_slot = openings_ring_storage_slot(block_header.number);
+        write_protocol_storage(
+            db,
+            UTXO_VAULT,
+            ring_slot,
+            U256::from_big_endian(openings_root.as_bytes()),
+        )?;
+
+        // Seal an era immediately after writing its final ring entry, before
+        // the next block can overwrite position zero. The post leaves the
+        // sealing schedule open; this boundary matches batch_number =
+        // creation_block / UTXO_RING_SIZE used by input verification.
+        if block_header.number % UTXO_RING_SIZE != UTXO_RING_SIZE - 1 {
+            return Ok(());
+        }
+
+        let ring_len = usize::try_from(UTXO_RING_SIZE)
+            .map_err(|_| EvmError::Custom("native UTXO ring size does not fit usize".into()))?;
+        let mut roots = Vec::with_capacity(ring_len);
+        for position in 0..UTXO_RING_SIZE {
+            let value =
+                read_protocol_storage(db, UTXO_VAULT, openings_ring_storage_slot(position))?;
+            roots.push(H256::from_slice(&value.to_big_endian()));
+        }
+        let batch_root = utxo_batch_root_from_openings_roots(roots).map_err(EvmError::Custom)?;
+        write_protocol_storage(
+            db,
+            UTXO_VAULT,
+            batch_root_storage_slot(block_header.number / UTXO_RING_SIZE),
+            U256::from_big_endian(batch_root.as_bytes()),
+        )
+    }
+
     // SYSTEM CONTRACTS
     pub fn beacon_root_contract_call(
         block_header: &BlockHeader,
@@ -4289,5 +4430,121 @@ mod system_call_coinbase_tests {
     #[test]
     fn history_address_coinbase_preserves_history_storage_write() {
         assert_history_write_emitted(HISTORY_STORAGE_ADDRESS.address);
+    }
+}
+
+#[cfg(test)]
+mod native_utxo_block_tests {
+    use super::*;
+    use ethrex_common::types::{
+        AccountState, ChainConfig, Code, CodeMetadata, TxType, UTXO_RING_SIZE, UTXO_VAULT,
+        batch_root_storage_slot, compute_receipts_root, openings_ring_storage_slot,
+        utxo_batch_root_from_openings_roots, utxo_created_log, utxo_openings_root_from_logs,
+    };
+    use ethrex_crypto::NativeCrypto;
+    use ethrex_levm::db::Database;
+    use ethrex_levm::errors::DatabaseError;
+    use std::sync::Arc;
+
+    struct Store;
+
+    impl Database for Store {
+        fn get_account_state(&self, address: Address) -> Result<AccountState, DatabaseError> {
+            Ok(AccountState {
+                balance: (address == UTXO_VAULT)
+                    .then_some(U256::one())
+                    .unwrap_or_default(),
+                ..Default::default()
+            })
+        }
+
+        fn get_storage_value(&self, _: Address, _: H256) -> Result<U256, DatabaseError> {
+            Ok(U256::zero())
+        }
+
+        fn get_block_hash(&self, _: u64) -> Result<H256, DatabaseError> {
+            Ok(H256::zero())
+        }
+
+        fn get_chain_config(&self) -> Result<ChainConfig, DatabaseError> {
+            Ok(ChainConfig {
+                hegota_time: Some(0),
+                ..Default::default()
+            })
+        }
+
+        fn get_account_code(&self, _: H256) -> Result<Code, DatabaseError> {
+            Ok(Code::default())
+        }
+
+        fn get_code_metadata(&self, _: H256) -> Result<CodeMetadata, DatabaseError> {
+            Ok(CodeMetadata { length: 0 })
+        }
+    }
+
+    fn db() -> GeneralizedDatabase {
+        GeneralizedDatabase::new(Arc::new(Store))
+    }
+
+    #[test]
+    fn end_of_block_openings_write_flows_into_receipts_and_state_roots() {
+        let log = utxo_created_log(
+            Address::from_low_u64_be(1),
+            Address::from_low_u64_be(2),
+            7,
+            U256::from(11u64),
+        );
+        let receipts = vec![Receipt::new(
+            TxType::Legacy,
+            true,
+            21_000,
+            vec![log.clone()],
+        )];
+        let empty_log_receipts = vec![Receipt::new(TxType::Legacy, true, 21_000, Vec::new())];
+        assert_ne!(
+            compute_receipts_root(&receipts, &NativeCrypto),
+            compute_receipts_root(&empty_log_receipts, &NativeCrypto),
+            "UtxoCreated must be committed by the ordinary receipt trie"
+        );
+
+        let header = BlockHeader {
+            number: 42,
+            timestamp: 1,
+            ..Default::default()
+        };
+        let expected_root = utxo_openings_root_from_logs([&log]).unwrap();
+        let ring_slot = openings_ring_storage_slot(header.number);
+        let mut db = db();
+        LEVM::finalize_native_utxo_block(&header, &receipts, &mut db).unwrap();
+
+        assert_eq!(
+            db.current_accounts_state[&UTXO_VAULT].storage[&ring_slot],
+            U256::from_big_endian(expected_root.as_bytes())
+        );
+        let updates = LEVM::get_state_transitions(&mut db).unwrap();
+        assert!(updates.iter().any(|update| {
+            update.address == UTXO_VAULT
+                && update.added_storage.get(&ring_slot)
+                    == Some(&U256::from_big_endian(expected_root.as_bytes()))
+        }));
+    }
+
+    #[test]
+    fn last_block_in_ring_seals_batch_before_overwrite() {
+        let header = BlockHeader {
+            number: UTXO_RING_SIZE - 1,
+            timestamp: 1,
+            ..Default::default()
+        };
+        let mut db = db();
+        LEVM::finalize_native_utxo_block(&header, &[], &mut db).unwrap();
+
+        let roots = vec![H256::zero(); usize::try_from(UTXO_RING_SIZE).unwrap()];
+        let expected = utxo_batch_root_from_openings_roots(roots).unwrap();
+        let batch_slot = batch_root_storage_slot(0);
+        assert_eq!(
+            db.current_accounts_state[&UTXO_VAULT].storage[&batch_slot],
+            U256::from_big_endian(expected.as_bytes())
+        );
     }
 }
