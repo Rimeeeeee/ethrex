@@ -162,8 +162,8 @@ pub enum TxValidationError {
     InvalidFrameTransaction,
     #[error("Invalid native UTXO frame payload: {reason}")]
     InvalidNativeUtxoFrame { reason: String },
-    #[error("Native UTXO frame approval and settlement are not implemented")]
-    NativeUtxoExecutionNotImplemented,
+    #[error("Native UTXO settlement is not implemented")]
+    NativeUtxoSettlementNotImplemented,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error, Serialize, Deserialize)]

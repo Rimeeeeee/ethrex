@@ -436,12 +436,23 @@ pub fn utxo_mapping_storage_slot(key: U256, base_slot: u64) -> H256 {
     let mut preimage = [0_u8; 64];
     preimage[..32].copy_from_slice(&key.to_big_endian());
     preimage[32..].copy_from_slice(&U256::from(base_slot).to_big_endian());
-    keccak(&preimage)
+    keccak(preimage)
 }
 
 /// Storage word containing the spent flag for `index`.
 pub fn spent_bitmap_storage_slot(index: u64) -> H256 {
     utxo_mapping_storage_slot(U256::from(index >> 8), SPENT_BITMAP_MAPPING_SLOT)
+}
+
+/// Check and set `index` inside its already-loaded 256-bit spent word.
+pub fn check_and_set_spent_bit(current_word: U256, index: u64) -> Result<U256, String> {
+    // The low byte is the bit position within this index's 256-bit word.
+    let bit_position = usize::from((index & 0xff) as u8);
+    let bit_mask = U256::one() << bit_position;
+    if !(current_word & bit_mask).is_zero() {
+        return Err(format!("native UTXO input {index} is already spent"));
+    }
+    Ok(current_word | bit_mask)
 }
 
 /// Ring storage slot containing the recent openings root for `block_number`.
@@ -884,6 +895,18 @@ mod tests {
     }
 
     #[test]
+    fn spent_bitmap_check_and_set_is_atomic_per_word() {
+        let word = check_and_set_spent_bit(U256::zero(), 257).unwrap();
+        assert!(word.bit(1));
+        assert!(
+            check_and_set_spent_bit(word, 257)
+                .unwrap_err()
+                .contains("already spent")
+        );
+        assert!(check_and_set_spent_bit(word, 258).unwrap().bit(2));
+    }
+
+    #[test]
     fn recognizes_only_verify_frames_targeting_utxo_vault() {
         let frame = Frame {
             mode: FrameMode::Verify as u8,
@@ -918,5 +941,29 @@ mod tests {
             .validate_static_constraints()
             .expect_err("multiple UTXO frames must be rejected");
         assert!(error.contains("more than one native UTXO frame"));
+    }
+
+    #[test]
+    fn rejects_sender_frames_in_native_utxo_transactions() {
+        let tx = FrameTransaction {
+            sender: Address::from_low_u64_be(1),
+            frames: vec![
+                Frame {
+                    mode: FrameMode::Verify as u8,
+                    target: Some(UTXO_VAULT),
+                    ..Default::default()
+                },
+                Frame {
+                    mode: FrameMode::Sender as u8,
+                    ..Default::default()
+                },
+            ],
+            ..Default::default()
+        };
+
+        let error = tx
+            .validate_static_constraints()
+            .expect_err("UTXO authorization must not enable SENDER frames");
+        assert!(error.contains("must not contain SENDER frames"));
     }
 }
