@@ -67,6 +67,24 @@ pub const MAX_OPENING_PROOF_DEPTH: usize = 32;
 pub const MAX_BATCH_PROOF_DEPTH: usize = 13;
 pub const MAX_UTXO_FRAME_DATA_SIZE: usize = 128 * 1024;
 
+// Experimental native-execution gas schedule. These are consensus constants:
+// changing any value requires a fork. Calldata and outer signature validation
+// remain charged by EIP-8141; this schedule prices the additional protocol work.
+/// Fixed decoding, digest, validation, approval, and settlement overhead.
+pub const UTXO_GAS_BASE: u64 = 5_000;
+/// Actor binding against an already-validated outer signature.
+pub const UTXO_GAS_PER_ACTOR: u64 = 500;
+/// Opening-leaf hashing, root/spent reads, and a worst-case spent-word update.
+pub const UTXO_GAS_PER_INPUT: u64 = 25_000;
+/// One domain-separated Merkle parent hash and path-position step.
+pub const UTXO_GAS_PER_PROOF_NODE: u64 = 60;
+/// Global-index assignment, discovery log, and openings-tree contribution.
+pub const UTXO_GAS_PER_UTXO_OUTPUT: u64 = 3_000;
+/// Vault debit plus a conservative possible new-account balance credit.
+pub const UTXO_GAS_PER_ACCOUNT_OUTPUT: u64 = 35_000;
+/// Cold read and worst-case zero-to-nonzero update of `next_utxo_index`.
+pub const UTXO_GAS_NEXT_INDEX_WRITE: u64 = 22_100;
+
 /// `change_kind` value selecting `utxo_outputs`.
 pub const CHANGE_KIND_UTXO: u8 = 0;
 /// `change_kind` value selecting `account_outputs`.
@@ -258,6 +276,56 @@ impl UtxoFramePayload {
         preimage.extend_from_slice(UTXO_FRAME_DOMAIN);
         preimage.extend_from_slice(&signed_payload);
         keccak(&preimage)
+    }
+
+    /// Consensus gas charged by the protocol-defined native frame execution.
+    ///
+    /// The formula is deliberately state-independent and conservative: each
+    /// input pays for a cold root read and worst-case fresh spent-word write,
+    /// even when accesses share a word or are already warm. This keeps mempool
+    /// and block validation deterministic without consulting mutable account
+    /// state solely to quote gas.
+    pub fn native_execution_gas(&self) -> Result<u64, String> {
+        fn component(count: usize, per_item: u64, name: &str) -> Result<u64, String> {
+            u64::try_from(count)
+                .ok()
+                .and_then(|count| count.checked_mul(per_item))
+                .ok_or_else(|| format!("native UTXO {name} gas overflow"))
+        }
+
+        let proof_nodes = self.inputs.iter().try_fold(0_usize, |total, input| {
+            total
+                .checked_add(input.opening_siblings.len())
+                .and_then(|total| total.checked_add(input.batch_siblings.len()))
+                .ok_or("native UTXO proof-node count overflow")
+        })?;
+
+        let mut gas = UTXO_GAS_BASE;
+        for (count, per_item, name) in [
+            (self.actors.len(), UTXO_GAS_PER_ACTOR, "actor"),
+            (self.inputs.len(), UTXO_GAS_PER_INPUT, "input"),
+            (proof_nodes, UTXO_GAS_PER_PROOF_NODE, "proof"),
+            (
+                self.utxo_outputs.len(),
+                UTXO_GAS_PER_UTXO_OUTPUT,
+                "UTXO output",
+            ),
+            (
+                self.account_outputs.len(),
+                UTXO_GAS_PER_ACCOUNT_OUTPUT,
+                "account output",
+            ),
+        ] {
+            gas = gas
+                .checked_add(component(count, per_item, name)?)
+                .ok_or_else(|| format!("native UTXO {name} gas total overflow"))?;
+        }
+        if !self.utxo_outputs.is_empty() {
+            gas = gas
+                .checked_add(UTXO_GAS_NEXT_INDEX_WRITE)
+                .ok_or("native UTXO next-index gas overflow")?;
+        }
+        Ok(gas)
     }
 
     /// Bind every unique actor to the explicitly indexed, already
@@ -1074,6 +1142,23 @@ mod tests {
                 .unwrap_err()
                 .contains("do not cover")
         );
+    }
+
+    #[test]
+    fn native_execution_gas_prices_every_bounded_work_item() {
+        let mut payload = sample_payload();
+        assert_eq!(payload.native_execution_gas().unwrap(), 93_660);
+
+        payload.inputs[0]
+            .opening_siblings
+            .push(H256::from_low_u64_be(8));
+        assert_eq!(payload.native_execution_gas().unwrap(), 93_720);
+
+        payload.utxo_outputs.push(UtxoOutput {
+            recipient: Address::from_low_u64_be(0xd00d),
+            value: U256::from(1u64),
+        });
+        assert_eq!(payload.native_execution_gas().unwrap(), 96_720);
     }
 
     #[test]

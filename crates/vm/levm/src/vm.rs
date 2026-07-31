@@ -2221,22 +2221,32 @@ impl<'a> VM<'a> {
                                     },
                                 )
                             })?;
+                    let native_gas = payload.native_execution_gas().map_err(|reason| {
+                        VMError::TxValidation(
+                            crate::errors::TxValidationError::InvalidNativeUtxoFrame { reason },
+                        )
+                    })?;
+                    if native_gas > frame.gas_limit {
+                        return Err(VMError::TxValidation(
+                            crate::errors::TxValidationError::InvalidNativeUtxoFrame {
+                                reason: format!(
+                                    "native UTXO execution requires {native_gas} gas but frame limit is {}",
+                                    frame.gas_limit
+                                ),
+                            },
+                        ));
+                    }
                     self.validate_native_utxo_frame(&payload, &frame_tx)?;
                     let expected_payer = self.approve_native_utxo_frame(frame, &payload)?;
-                    Ok((expected_payer, payload))
+                    Ok((expected_payer, payload, native_gas))
                 })();
 
                 match native_result {
-                    Ok((expected_payer, payload)) => {
+                    Ok((expected_payer, payload, native_gas)) => {
                         expected_native_utxo_payer = Some(expected_payer);
                         approved_native_utxo = Some((frame_idx, all_logs.len(), payload));
                         self.substate.commit_backup();
-                        // A consensus gas schedule for native proof checking and
-                        // spent-bit writes is not specified yet. The transaction
-                        // still pays EIP-8141 intrinsic, per-frame, calldata, and
-                        // signature costs; native frame execution itself is
-                        // temporarily reported as zero gas.
-                        (true, 0, Vec::new())
+                        (true, native_gas, Vec::new())
                     }
                     Err(error) => {
                         self.substate.revert_backup();
