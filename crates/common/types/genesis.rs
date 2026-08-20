@@ -332,6 +332,14 @@ pub struct ChainConfig {
     #[serde(default)]
     pub utxo_frames_time: Option<u64>,
 
+    /// EIP-8304 trustless log and transaction index activation timestamp.
+    ///
+    /// The EIP is still a draft without a finalized fork assignment or index
+    /// contract address, so it is independently scheduled rather than tied to
+    /// the current latest fork. `None` keeps EIP-8304 disabled.
+    #[serde(default)]
+    pub eip8304_time: Option<u64>,
+
     /// Amount of total difficulty reached by the network that triggers the consensus upgrade.
     #[serde(default, with = "crate::serde_utils::u128::hex_str_opt")]
     pub terminal_total_difficulty: Option<u128>,
@@ -430,6 +438,12 @@ impl From<Fork> for &str {
 }
 
 impl ChainConfig {
+    /// Whether EIP-8304 index-table processing is active at `block_timestamp`.
+    pub fn is_eip8304_activated(&self, block_timestamp: u64) -> bool {
+        self.eip8304_time
+            .is_some_and(|time| time <= block_timestamp)
+    }
+
     pub fn is_hegota_activated(&self, block_timestamp: u64) -> bool {
         self.hegota_time.is_some_and(|time| time <= block_timestamp)
     }
