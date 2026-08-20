@@ -1,17 +1,25 @@
-//! Core data types and canonical entry encoding for EIP-8304 index tables.
+//! Construction, hashing, merging, and scheduling for EIP-8304 index tables.
 //!
-//! Table construction from blocks/receipts, SSZ root calculation, multi-block
-//! merging, and the index-contract system call are intentionally separate
-//! follow-up steps. This module establishes the consensus-facing constants and
-//! byte encodings they will share.
+//! The actual index-contract system call is intentionally kept outside this
+//! module: the EIP has not finalized [`INDEX_CONTRACT_ADDRESS`] yet. Callers use
+//! [`tables_due_for_commitment`] after block execution to determine which table
+//! roots must be sent once that address and system-call integration exist.
 
-use crate::{Address, H256};
+use crate::{
+    Address, H256,
+    types::{Block, Receipt},
+};
+use ethrex_crypto::Crypto;
+use libssz_merkle::{Sha2Hasher, Sha256Hasher, merkleize, mix_in_length};
 
 /// Number of blocks covered by the index tables at each protocol level.
 pub const TABLE_SIZES: [u64; 5] = [1, 4, 16, 64, 256];
 
 /// Number of table roots retained in each level's system-contract ring buffer.
 pub const TABLES_PER_LEVEL: u64 = 1024;
+
+/// Maximum number of indexed topics in a valid EVM log (`LOG0` through `LOG4`).
+pub const MAX_TOPICS_PER_LOG: usize = 4;
 
 /// System caller used for EIP-8304 index-contract updates.
 pub use crate::constants::SYSTEM_ADDRESS;
@@ -225,6 +233,45 @@ pub enum IndexTableError {
     MisalignedFirstBlock { first_block: u64, table_size: u64 },
     #[error("index entry count {0} does not fit in u64")]
     EntryCountOverflow(usize),
+    #[error("block contains {transactions} transactions but {receipts} receipts")]
+    TransactionReceiptCountMismatch {
+        transactions: usize,
+        receipts: usize,
+    },
+    #[error("transaction index {0} does not fit in u32")]
+    TransactionIndexOverflow(usize),
+    #[error("log index {0} does not fit in u32")]
+    LogIndexOverflow(usize),
+    #[error("cumulative log count does not fit in u32")]
+    CumulativeLogCountOverflow,
+    #[error(
+        "transaction {transaction_index} log {log_index} has {topic_count} topics; at most {MAX_TOPICS_PER_LOG} are supported"
+    )]
+    TooManyLogTopics {
+        transaction_index: u32,
+        log_index: u32,
+        topic_count: usize,
+    },
+    #[error(
+        "lower table {table_index} has size {actual}; expected all lower tables to have size {expected}"
+    )]
+    LowerTableSizeMismatch {
+        table_index: usize,
+        expected: u64,
+        actual: u64,
+    },
+    #[error(
+        "lower table {table_index} starts at block {actual}; expected adjacent table starting at {expected}"
+    )]
+    NonAdjacentLowerTable {
+        table_index: usize,
+        expected: u64,
+        actual: u64,
+    },
+    #[error("table block range overflowed u64")]
+    TableRangeOverflow,
+    #[error("merged index entry count overflowed usize")]
+    MergedEntryCountOverflow,
 }
 
 /// An EIP-8304 index table with canonical, lexicographically sorted entries.
@@ -238,30 +285,204 @@ pub struct IndexTable {
 }
 
 impl IndexTable {
-    /// Construct a table and canonicalize its entry ordering.
+    /// Generate the level-0 table after all transactions and receipts for a
+    /// block have been produced.
     ///
-    /// `table_root` is supplied by the caller for now. SSZ root calculation is
-    /// deliberately left for the next implementation stage.
+    /// The parent block entry is omitted for genesis. Each transaction records
+    /// the cumulative number of logs preceding it, while each address/topic
+    /// entry uses a log index relative to that transaction.
+    pub fn from_block(
+        block: &Block,
+        receipts: &[Receipt],
+        crypto: &dyn Crypto,
+    ) -> Result<Self, IndexTableError> {
+        let transactions = &block.body.transactions;
+        if transactions.len() != receipts.len() {
+            return Err(IndexTableError::TransactionReceiptCountMismatch {
+                transactions: transactions.len(),
+                receipts: receipts.len(),
+            });
+        }
+
+        let mut entries = Vec::new();
+        let block_number = block.header.number;
+
+        if block_number > 0 {
+            entries.push(IndexEntry::Block {
+                block_hash: block.header.parent_hash,
+                block_number: block_number - 1,
+            });
+        }
+
+        let mut cumulative_log_count = 0u32;
+        for (transaction_index, (transaction, receipt)) in
+            transactions.iter().zip(receipts).enumerate()
+        {
+            let transaction_index = u32::try_from(transaction_index)
+                .map_err(|_| IndexTableError::TransactionIndexOverflow(transaction_index))?;
+
+            entries.push(IndexEntry::Transaction {
+                transaction_hash: transaction.hash(crypto),
+                block_number,
+                transaction_index,
+                cumulative_log_count,
+            });
+
+            for (log_index, log) in receipt.logs.iter().enumerate() {
+                let log_index = u32::try_from(log_index)
+                    .map_err(|_| IndexTableError::LogIndexOverflow(log_index))?;
+                if log.topics.len() > MAX_TOPICS_PER_LOG {
+                    return Err(IndexTableError::TooManyLogTopics {
+                        transaction_index,
+                        log_index,
+                        topic_count: log.topics.len(),
+                    });
+                }
+
+                entries.push(IndexEntry::LogAddress {
+                    address: log.address,
+                    block_number,
+                    transaction_index,
+                    log_index,
+                });
+                for (topic_index, topic) in log.topics.iter().copied().enumerate() {
+                    let topic_entry = match topic_index {
+                        0 => IndexEntry::LogTopic0 {
+                            topic,
+                            block_number,
+                            transaction_index,
+                            log_index,
+                        },
+                        1 => IndexEntry::LogTopic1 {
+                            topic,
+                            block_number,
+                            transaction_index,
+                            log_index,
+                        },
+                        2 => IndexEntry::LogTopic2 {
+                            topic,
+                            block_number,
+                            transaction_index,
+                            log_index,
+                        },
+                        3 => IndexEntry::LogTopic3 {
+                            topic,
+                            block_number,
+                            transaction_index,
+                            log_index,
+                        },
+                        _ => unreachable!("topic count was checked above"),
+                    };
+                    entries.push(topic_entry);
+                }
+            }
+
+            let receipt_log_count = u32::try_from(receipt.logs.len())
+                .map_err(|_| IndexTableError::CumulativeLogCountOverflow)?;
+            cumulative_log_count = cumulative_log_count
+                .checked_add(receipt_log_count)
+                .ok_or(IndexTableError::CumulativeLogCountOverflow)?;
+        }
+
+        Self::new(block_number, TABLE_SIZES[0], entries)
+    }
+
+    /// Construct a table, canonicalize its entry ordering, and calculate its
+    /// EIP-8304 SSZ table root.
     pub fn new(
         first_block: u64,
         table_size: u64,
         entries: Vec<IndexEntry>,
-        table_root: H256,
     ) -> Result<Self, IndexTableError> {
+        let mut encoded_entries: Vec<_> = entries.iter().map(IndexEntry::encode).collect();
+        encoded_entries.sort_unstable();
+
+        Self::from_sorted_entries(first_block, table_size, encoded_entries)
+    }
+
+    /// Merge four adjacent lower-level tables without reading or rebuilding
+    /// their source blocks.
+    ///
+    /// The inputs must have the same size, cover consecutive ranges, and begin
+    /// on the next level's boundary. Their already-sorted encoded entries are
+    /// combined with a four-way merge and hashed into the new table root.
+    pub fn merge(lower_tables: [&Self; 4]) -> Result<Self, IndexTableError> {
+        let lower_size = lower_tables[0].table_size;
+        let table_size = lower_size
+            .checked_mul(4)
+            .ok_or(IndexTableError::TableRangeOverflow)?;
         if !TABLE_SIZES.contains(&table_size) {
             return Err(IndexTableError::UnsupportedTableSize(table_size));
         }
-        if !first_block.is_multiple_of(table_size) {
-            return Err(IndexTableError::MisalignedFirstBlock {
-                first_block,
-                table_size,
-            });
+
+        let first_block = lower_tables[0].first_block;
+        validate_table_identity(first_block, table_size)?;
+
+        let mut merged_len = 0usize;
+        for (table_index, table) in lower_tables.iter().enumerate() {
+            if table.table_size != lower_size {
+                return Err(IndexTableError::LowerTableSizeMismatch {
+                    table_index,
+                    expected: lower_size,
+                    actual: table.table_size,
+                });
+            }
+            let expected = first_block
+                .checked_add(
+                    lower_size
+                        .checked_mul(table_index as u64)
+                        .ok_or(IndexTableError::TableRangeOverflow)?,
+                )
+                .ok_or(IndexTableError::TableRangeOverflow)?;
+            if table.first_block != expected {
+                return Err(IndexTableError::NonAdjacentLowerTable {
+                    table_index,
+                    expected,
+                    actual: table.first_block,
+                });
+            }
+            merged_len = merged_len
+                .checked_add(table.encoded_entries.len())
+                .ok_or(IndexTableError::MergedEntryCountOverflow)?;
         }
 
-        let entry_count = u64::try_from(entries.len())
-            .map_err(|_| IndexTableError::EntryCountOverflow(entries.len()))?;
-        let mut encoded_entries: Vec<_> = entries.iter().map(IndexEntry::encode).collect();
-        encoded_entries.sort_unstable();
+        let mut cursors = [0usize; 4];
+        let mut encoded_entries = Vec::with_capacity(merged_len);
+        while encoded_entries.len() < merged_len {
+            let mut selected_table: Option<usize> = None;
+            for table_index in 0..lower_tables.len() {
+                if cursors[table_index] == lower_tables[table_index].encoded_entries.len() {
+                    continue;
+                }
+                match selected_table {
+                    Some(selected)
+                        if lower_tables[selected].encoded_entries[cursors[selected]]
+                            <= lower_tables[table_index].encoded_entries[cursors[table_index]] => {}
+                    _ => selected_table = Some(table_index),
+                }
+            }
+
+            let selected_table = selected_table.expect("merged length guarantees an entry");
+            encoded_entries.push(
+                lower_tables[selected_table].encoded_entries[cursors[selected_table]].clone(),
+            );
+            cursors[selected_table] += 1;
+        }
+
+        Self::from_sorted_entries(first_block, table_size, encoded_entries)
+    }
+
+    fn from_sorted_entries(
+        first_block: u64,
+        table_size: u64,
+        encoded_entries: Vec<EncodedIndexEntry>,
+    ) -> Result<Self, IndexTableError> {
+        validate_table_identity(first_block, table_size)?;
+        debug_assert!(encoded_entries.windows(2).all(|pair| pair[0] <= pair[1]));
+
+        let entry_count = u64::try_from(encoded_entries.len())
+            .map_err(|_| IndexTableError::EntryCountOverflow(encoded_entries.len()))?;
+        let table_root = calculate_table_root(&encoded_entries);
 
         Ok(Self {
             first_block,
@@ -293,12 +514,140 @@ impl IndexTable {
     }
 }
 
+fn validate_table_identity(first_block: u64, table_size: u64) -> Result<(), IndexTableError> {
+    if !TABLE_SIZES.contains(&table_size) {
+        return Err(IndexTableError::UnsupportedTableSize(table_size));
+    }
+    if !first_block.is_multiple_of(table_size) {
+        return Err(IndexTableError::MisalignedFirstBlock {
+            first_block,
+            table_size,
+        });
+    }
+    Ok(())
+}
+
+/// Calculate the EIP-8304 table root from canonical encoded entries.
+///
+/// Each entry is first SHA-256 hashed. Those hashes are treated as the leaves
+/// of `List[Hash32, entry_count]`: they are SSZ-merkleized with a limit equal to
+/// the entry count, then the count is mixed into the root using SSZ's
+/// little-endian length node.
+pub fn calculate_table_root(entries: &[EncodedIndexEntry]) -> H256 {
+    let entry_hashes: Vec<_> = entries
+        .iter()
+        .map(|entry| Sha2Hasher.hash(entry.as_bytes()))
+        .collect();
+    let merkle_root = merkleize(&Sha2Hasher, &entry_hashes, Some(entry_hashes.len()));
+    H256(mix_in_length(&Sha2Hasher, &merkle_root, entry_hashes.len()))
+}
+
+/// A table whose root is due to be committed while processing `commit_block`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct ScheduledIndexTable {
+    level: usize,
+    first_block: u64,
+    table_size: u64,
+    commit_block: u64,
+}
+
+impl ScheduledIndexTable {
+    pub const fn level(&self) -> usize {
+        self.level
+    }
+
+    pub const fn first_block(&self) -> u64 {
+        self.first_block
+    }
+
+    pub const fn table_size(&self) -> u64 {
+        self.table_size
+    }
+
+    pub const fn commit_block(&self) -> u64 {
+        self.commit_block
+    }
+}
+
+/// Return all index tables due for commitment at the end of `block_number`.
+///
+/// Level 0 is due immediately. A higher-level table covering
+/// `first_block..first_block + table_size - 1` is due after an additional
+/// `table_size / 4` blocks. `is_active_at_first_block` must evaluate EIP-8304
+/// activation using the timestamp of the supplied block number; candidates for
+/// which it returns `false` are skipped.
+pub fn tables_due_for_commitment(
+    block_number: u64,
+    mut is_active_at_first_block: impl FnMut(u64) -> bool,
+) -> Vec<ScheduledIndexTable> {
+    TABLE_SIZES
+        .iter()
+        .copied()
+        .enumerate()
+        .filter_map(|(level, table_size)| {
+            let first_block = if level == 0 {
+                block_number
+            } else {
+                let commit_offset = table_size.checked_add(table_size / 4)?.checked_sub(1)?;
+                let first_block = block_number.checked_sub(commit_offset)?;
+                first_block
+                    .is_multiple_of(table_size)
+                    .then_some(first_block)?
+            };
+
+            is_active_at_first_block(first_block).then_some(ScheduledIndexTable {
+                level,
+                first_block,
+                table_size,
+                commit_block: block_number,
+            })
+        })
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::{
+        Bytes, NativeCrypto,
+        types::{BlockBody, BlockHeader, LegacyTransaction, Log, Transaction, TxType},
+    };
 
     fn repeated_hash(byte: u8) -> H256 {
         H256::repeat_byte(byte)
+    }
+
+    fn transaction(nonce: u64) -> Transaction {
+        Transaction::LegacyTransaction(LegacyTransaction {
+            nonce,
+            ..Default::default()
+        })
+    }
+
+    fn block(number: u64, transactions: Vec<Transaction>) -> Block {
+        Block {
+            header: BlockHeader {
+                number,
+                parent_hash: repeated_hash(0x99),
+                ..Default::default()
+            },
+            body: BlockBody {
+                transactions,
+                ..BlockBody::empty()
+            },
+        }
+    }
+
+    fn receipt(logs: Vec<Log>) -> Receipt {
+        Receipt::new(TxType::Legacy, true, 0, logs)
+    }
+
+    fn entry_type_id(entry: &EncodedIndexEntry) -> u16 {
+        u16::from_be_bytes(entry.as_bytes()[..2].try_into().unwrap())
+    }
+
+    fn encoded_u32(entry: &EncodedIndexEntry, start: usize) -> u32 {
+        u32::from_be_bytes(entry.as_bytes()[start..start + 4].try_into().unwrap())
     }
 
     #[test]
@@ -416,6 +765,284 @@ mod tests {
     }
 
     #[test]
+    fn single_block_generation_indexes_parent_transactions_and_actual_log_topics() {
+        let block = block(10, vec![transaction(0), transaction(1)]);
+        let receipts = vec![
+            receipt(vec![
+                Log {
+                    address: Address::repeat_byte(0xa0),
+                    topics: Vec::new(),
+                    data: Bytes::new(),
+                },
+                Log {
+                    address: Address::repeat_byte(0xa1),
+                    topics: vec![repeated_hash(0x10), repeated_hash(0x11)],
+                    data: Bytes::new(),
+                },
+            ]),
+            receipt(vec![Log {
+                address: Address::repeat_byte(0xb0),
+                topics: vec![
+                    repeated_hash(0x20),
+                    repeated_hash(0x21),
+                    repeated_hash(0x22),
+                    repeated_hash(0x23),
+                ],
+                data: Bytes::new(),
+            }]),
+        ];
+
+        let table = IndexTable::from_block(&block, &receipts, &NativeCrypto).unwrap();
+
+        assert_eq!(table.first_block(), 10);
+        assert_eq!(table.table_size(), 1);
+        assert_eq!(table.entry_count(), 12);
+        assert!(
+            table
+                .encoded_entries()
+                .windows(2)
+                .all(|pair| pair[0] <= pair[1])
+        );
+
+        let block_entry = table
+            .encoded_entries()
+            .iter()
+            .find(|entry| entry_type_id(entry) == IndexEntryType::Block as u16)
+            .unwrap();
+        assert_eq!(
+            &block_entry.as_bytes()[2..34],
+            block.header.parent_hash.as_bytes()
+        );
+        assert_eq!(&block_entry.as_bytes()[34..], &9u64.to_be_bytes());
+
+        let mut transaction_positions: Vec<_> = table
+            .encoded_entries()
+            .iter()
+            .filter(|entry| entry_type_id(entry) == IndexEntryType::Transaction as u16)
+            .map(|entry| (encoded_u32(entry, 42), encoded_u32(entry, 46)))
+            .collect();
+        transaction_positions.sort_unstable();
+        assert_eq!(transaction_positions, [(0, 0), (1, 2)]);
+
+        let mut log_positions: Vec<_> = table
+            .encoded_entries()
+            .iter()
+            .filter(|entry| entry_type_id(entry) == IndexEntryType::LogAddress as u16)
+            .map(|entry| (encoded_u32(entry, 30), encoded_u32(entry, 34)))
+            .collect();
+        log_positions.sort_unstable();
+        assert_eq!(log_positions, [(0, 0), (0, 1), (1, 0)]);
+
+        let topic_counts: Vec<_> = (IndexEntryType::LogTopic0 as u16
+            ..=IndexEntryType::LogTopic3 as u16)
+            .map(|topic_type| {
+                table
+                    .encoded_entries()
+                    .iter()
+                    .filter(|entry| entry_type_id(entry) == topic_type)
+                    .count()
+            })
+            .collect();
+        assert_eq!(topic_counts, [2, 2, 1, 1]);
+        assert_eq!(
+            table.table_root(),
+            calculate_table_root(table.encoded_entries())
+        );
+    }
+
+    #[test]
+    fn genesis_generation_omits_parent_entry() {
+        let block = block(0, Vec::new());
+        let table = IndexTable::from_block(&block, &[], &NativeCrypto).unwrap();
+
+        assert_eq!(table.entry_count(), 0);
+        assert!(table.encoded_entries().is_empty());
+    }
+
+    #[test]
+    fn single_block_generation_validates_receipts_and_topic_count() {
+        let block = block(1, vec![transaction(0)]);
+        assert_eq!(
+            IndexTable::from_block(&block, &[], &NativeCrypto),
+            Err(IndexTableError::TransactionReceiptCountMismatch {
+                transactions: 1,
+                receipts: 0,
+            })
+        );
+
+        let receipts = [receipt(vec![Log {
+            address: Address::zero(),
+            topics: vec![H256::zero(); MAX_TOPICS_PER_LOG + 1],
+            data: Bytes::new(),
+        }])];
+        assert_eq!(
+            IndexTable::from_block(&block, &receipts, &NativeCrypto),
+            Err(IndexTableError::TooManyLogTopics {
+                transaction_index: 0,
+                log_index: 0,
+                topic_count: 5,
+            })
+        );
+    }
+
+    #[test]
+    fn table_root_hashes_entries_and_mixes_in_count() {
+        assert_eq!(
+            calculate_table_root(&[]),
+            H256::from_slice(
+                &hex::decode("f5a5fd42d16a20302798ef6ed309979b43003d2320d9f0e8ea9831a92759fb4b")
+                    .unwrap()
+            )
+        );
+
+        let entry = IndexEntry::Block {
+            block_hash: repeated_hash(0xaa),
+            block_number: 7,
+        }
+        .encode();
+        let entry_hash = Sha2Hasher.hash(entry.as_bytes());
+        let mut length_node = [0u8; 32];
+        length_node[..8].copy_from_slice(&1u64.to_le_bytes());
+        let mut root_preimage = [0u8; 64];
+        root_preimage[..32].copy_from_slice(&entry_hash);
+        root_preimage[32..].copy_from_slice(&length_node);
+
+        assert_eq!(
+            calculate_table_root(std::slice::from_ref(&entry)),
+            H256(Sha2Hasher.hash(&root_preimage))
+        );
+    }
+
+    #[test]
+    fn merge_combines_four_sorted_lower_tables_without_blocks() {
+        let lower_tables = [
+            IndexTable::new(
+                0,
+                1,
+                vec![IndexEntry::Block {
+                    block_hash: repeated_hash(0xff),
+                    block_number: 0,
+                }],
+            )
+            .unwrap(),
+            IndexTable::new(
+                1,
+                1,
+                vec![IndexEntry::Block {
+                    block_hash: repeated_hash(0x00),
+                    block_number: 1,
+                }],
+            )
+            .unwrap(),
+            IndexTable::new(
+                2,
+                1,
+                vec![IndexEntry::Block {
+                    block_hash: repeated_hash(0x80),
+                    block_number: 2,
+                }],
+            )
+            .unwrap(),
+            IndexTable::new(
+                3,
+                1,
+                vec![IndexEntry::Block {
+                    block_hash: repeated_hash(0x40),
+                    block_number: 3,
+                }],
+            )
+            .unwrap(),
+        ];
+        let mut expected_entries: Vec<_> = lower_tables
+            .iter()
+            .flat_map(|table| table.encoded_entries().iter().cloned())
+            .collect();
+        expected_entries.sort_unstable();
+
+        let merged = IndexTable::merge([
+            &lower_tables[0],
+            &lower_tables[1],
+            &lower_tables[2],
+            &lower_tables[3],
+        ])
+        .unwrap();
+
+        assert_eq!(merged.first_block(), 0);
+        assert_eq!(merged.table_size(), 4);
+        assert_eq!(merged.entry_count(), 4);
+        assert_eq!(merged.encoded_entries(), expected_entries);
+        assert_eq!(merged.table_root(), calculate_table_root(&expected_entries));
+    }
+
+    #[test]
+    fn merge_rejects_non_adjacent_or_misaligned_lower_tables() {
+        let table = |first_block| IndexTable::new(first_block, 1, Vec::new()).unwrap();
+        let non_adjacent = [table(0), table(1), table(3), table(4)];
+        assert_eq!(
+            IndexTable::merge([
+                &non_adjacent[0],
+                &non_adjacent[1],
+                &non_adjacent[2],
+                &non_adjacent[3],
+            ]),
+            Err(IndexTableError::NonAdjacentLowerTable {
+                table_index: 2,
+                expected: 2,
+                actual: 3,
+            })
+        );
+
+        let misaligned = [table(1), table(2), table(3), table(4)];
+        assert_eq!(
+            IndexTable::merge([
+                &misaligned[0],
+                &misaligned[1],
+                &misaligned[2],
+                &misaligned[3],
+            ]),
+            Err(IndexTableError::MisalignedFirstBlock {
+                first_block: 1,
+                table_size: 4,
+            })
+        );
+    }
+
+    #[test]
+    fn scheduling_applies_level_delays_and_activation_at_first_block() {
+        let due_at_zero = tables_due_for_commitment(0, |_| true);
+        assert_eq!(due_at_zero.len(), 1);
+        assert_eq!(due_at_zero[0].level(), 0);
+        assert_eq!(due_at_zero[0].first_block(), 0);
+        assert_eq!(due_at_zero[0].commit_block(), 0);
+
+        let due_at_four = tables_due_for_commitment(4, |_| true);
+        assert_eq!(due_at_four.len(), 2);
+        assert_eq!(due_at_four[0].table_size(), 1);
+        assert_eq!(due_at_four[0].first_block(), 4);
+        assert_eq!(due_at_four[1].table_size(), 4);
+        assert_eq!(due_at_four[1].first_block(), 0);
+
+        for (commit_block, expected_level, expected_size) in
+            [(19, 2, 16), (79, 3, 64), (319, 4, 256)]
+        {
+            let due = tables_due_for_commitment(commit_block, |_| true);
+            assert!(due.iter().any(|schedule| {
+                schedule.level() == expected_level
+                    && schedule.table_size() == expected_size
+                    && schedule.first_block() == 0
+            }));
+        }
+
+        let activation_block = 4;
+        let due_at_four =
+            tables_due_for_commitment(4, |first_block| first_block >= activation_block);
+        assert_eq!(due_at_four.len(), 1);
+        assert_eq!(due_at_four[0].level(), 0);
+        assert_eq!(due_at_four[0].first_block(), activation_block);
+        assert!(tables_due_for_commitment(3, |_| false).is_empty());
+    }
+
+    #[test]
     fn table_constructor_sorts_encoded_entries_and_derives_count() {
         let entries = vec![
             IndexEntry::Transaction {
@@ -436,12 +1063,15 @@ mod tests {
             },
         ];
 
-        let table = IndexTable::new(4, 1, entries, repeated_hash(0x42)).unwrap();
+        let table = IndexTable::new(4, 1, entries).unwrap();
 
         assert_eq!(table.first_block(), 4);
         assert_eq!(table.table_size(), 1);
         assert_eq!(table.entry_count(), 3);
-        assert_eq!(table.table_root(), repeated_hash(0x42));
+        assert_eq!(
+            table.table_root(),
+            calculate_table_root(table.encoded_entries())
+        );
         assert!(
             table
                 .encoded_entries()
@@ -456,11 +1086,11 @@ mod tests {
     #[test]
     fn table_constructor_rejects_invalid_size_and_alignment() {
         assert_eq!(
-            IndexTable::new(0, 2, Vec::new(), H256::zero()),
+            IndexTable::new(0, 2, Vec::new()),
             Err(IndexTableError::UnsupportedTableSize(2))
         );
         assert_eq!(
-            IndexTable::new(3, 4, Vec::new(), H256::zero()),
+            IndexTable::new(3, 4, Vec::new()),
             Err(IndexTableError::MisalignedFirstBlock {
                 first_block: 3,
                 table_size: 4,
