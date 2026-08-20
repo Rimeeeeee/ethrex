@@ -201,6 +201,12 @@ impl Evm {
         let chain_config = self.db.store.get_chain_config()?;
         let fork = chain_config.fork(block_header.timestamp);
 
+        if matches!(self.vm_type, VMType::L1)
+            && chain_config.is_eip8304_activated(block_header.timestamp)
+        {
+            LEVM::install_index_contract_code(&mut self.db, self.crypto.as_ref())?;
+        }
+
         // EIP-8141: the expiry verifier predeploy must exist from Hegota
         // activation onward. Idempotent install for the
         // payload-build path; the block-import path is hooked in prepare_block.

@@ -1115,6 +1115,24 @@ mod tests {
             calculate_table_root(std::slice::from_ref(&entry)),
             H256(Sha2Hasher.hash(&root_preimage))
         );
+
+        let second_entry = IndexEntry::Block {
+            block_hash: repeated_hash(0xbb),
+            block_number: 8,
+        }
+        .encode();
+        let second_hash = Sha2Hasher.hash(second_entry.as_bytes());
+        let mut pair_preimage = [0u8; 64];
+        pair_preimage[..32].copy_from_slice(&entry_hash);
+        pair_preimage[32..].copy_from_slice(&second_hash);
+        let pair_root = Sha2Hasher.hash(&pair_preimage);
+        length_node[..8].copy_from_slice(&2u64.to_le_bytes());
+        root_preimage[..32].copy_from_slice(&pair_root);
+        root_preimage[32..].copy_from_slice(&length_node);
+        assert_eq!(
+            calculate_table_root(&[entry, second_entry]),
+            H256(Sha2Hasher.hash(&root_preimage))
+        );
     }
 
     #[test]
@@ -1244,6 +1262,31 @@ mod tests {
         assert_eq!(due_at_four[0].level(), 0);
         assert_eq!(due_at_four[0].first_block(), activation_block);
         assert!(tables_due_for_commitment(3, |_| false).is_empty());
+    }
+
+    #[test]
+    fn higher_level_schedules_only_at_the_exact_delay_boundary() {
+        for (level, table_size) in TABLE_SIZES.iter().copied().enumerate().skip(1) {
+            let commit_block = table_size - 1 + table_size / 4;
+            assert!(
+                !tables_due_for_commitment(commit_block - 1, |_| true)
+                    .iter()
+                    .any(|schedule| schedule.level() == level)
+            );
+            let due = tables_due_for_commitment(commit_block, |_| true);
+            let schedule = due
+                .iter()
+                .find(|schedule| schedule.level() == level)
+                .unwrap();
+            assert_eq!(schedule.first_block(), 0);
+            assert_eq!(schedule.table_size(), table_size);
+            assert_eq!(schedule.commit_block(), commit_block);
+            assert!(
+                !tables_due_for_commitment(commit_block + 1, |_| true)
+                    .iter()
+                    .any(|schedule| schedule.level() == level)
+            );
+        }
     }
 
     #[test]

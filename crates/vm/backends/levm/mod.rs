@@ -6,9 +6,9 @@ use crate::system_contracts::{
     AMSTERDAM_REQUEST_PREDEPLOYS, BEACON_ROOTS_ADDRESS, BUILDER_DEPOSIT_CONTRACT_ADDRESS,
     BUILDER_EXIT_CONTRACT_ADDRESS, CONSOLIDATION_REQUEST_PREDEPLOY_ADDRESS,
     EXPIRY_VERIFIER_PREDEPLOY, EXPIRY_VERIFIER_RUNTIME_BYTECODE, HISTORY_STORAGE_ADDRESS,
-    NONCE_MANAGER_PREDEPLOY, NONCE_MANAGER_RUNTIME_BYTECODE, PRAGUE_SYSTEM_CONTRACTS,
-    RECENT_ROOT_ADDRESS, SYSTEM_ADDRESS, UTXO_VAULT_PREDEPLOY, UTXO_VAULT_RUNTIME_BYTECODE,
-    WITHDRAWAL_REQUEST_PREDEPLOY_ADDRESS,
+    INDEX_CONTRACT_RUNTIME_BYTECODE, NONCE_MANAGER_PREDEPLOY, NONCE_MANAGER_RUNTIME_BYTECODE,
+    PRAGUE_SYSTEM_CONTRACTS, RECENT_ROOT_ADDRESS, SYSTEM_ADDRESS, UTXO_VAULT_PREDEPLOY,
+    UTXO_VAULT_RUNTIME_BYTECODE, WITHDRAWAL_REQUEST_PREDEPLOY_ADDRESS,
 };
 use crate::{EvmError, ExecutionResult};
 use bytes::Bytes;
@@ -3433,7 +3433,25 @@ impl LEVM {
         vm_type: VMType,
         crypto: &dyn Crypto,
     ) -> Result<(), EvmError> {
-        let Some(contract_address) = INDEX_CONTRACT_ADDRESS else {
+        Self::index_contract_call_at(
+            INDEX_CONTRACT_ADDRESS,
+            block_header,
+            table,
+            db,
+            vm_type,
+            crypto,
+        )
+    }
+
+    fn index_contract_call_at(
+        contract_address: Option<Address>,
+        block_header: &BlockHeader,
+        table: &IndexTable,
+        db: &mut GeneralizedDatabase,
+        vm_type: VMType,
+        crypto: &dyn Crypto,
+    ) -> Result<(), EvmError> {
+        let Some(contract_address) = contract_address else {
             return Ok(());
         };
         if db.get_account_code(contract_address)?.is_empty() {
@@ -3458,6 +3476,59 @@ impl LEVM {
                 "EIP-8304 index-contract call reverted: {error:?}"
             ))),
         }
+    }
+
+    /// Install the published EIP-8304 index-contract runtime with nonce 1.
+    ///
+    /// This hook is deliberately dormant while `INDEX_CONTRACT_ADDRESS` is
+    /// unresolved. Once the EIP assigns it, both importer and payload builder
+    /// already execute the same idempotent activation transition.
+    pub fn install_index_contract_code(
+        db: &mut GeneralizedDatabase,
+        crypto: &dyn Crypto,
+    ) -> Result<(), EvmError> {
+        Self::install_index_contract_code_at(INDEX_CONTRACT_ADDRESS, db, crypto)
+    }
+
+    fn install_index_contract_code_at(
+        contract_address: Option<Address>,
+        db: &mut GeneralizedDatabase,
+        crypto: &dyn Crypto,
+    ) -> Result<(), EvmError> {
+        const PREDEPLOY_NONCE: u64 = 1;
+
+        let Some(contract_address) = contract_address else {
+            return Ok(());
+        };
+        let code_matches = db.get_account_code(contract_address)?.code()
+            == INDEX_CONTRACT_RUNTIME_BYTECODE.as_slice();
+        let existing_nonce = db
+            .get_account(contract_address)
+            .map_err(EvmError::from)?
+            .info
+            .nonce;
+        if code_matches && existing_nonce == PREDEPLOY_NONCE {
+            return Ok(());
+        }
+
+        let code =
+            Code::from_bytecode(Bytes::from_static(&INDEX_CONTRACT_RUNTIME_BYTECODE), crypto);
+        let code_hash = code.hash;
+        if let Some(recorder) = db.bal_recorder_mut() {
+            if !code_matches {
+                recorder.record_code_change(contract_address, code.code_bytes());
+            }
+            if existing_nonce != PREDEPLOY_NONCE {
+                recorder.record_nonce_change(contract_address, PREDEPLOY_NONCE);
+            }
+        }
+        let account = db
+            .get_account_mut(contract_address)
+            .map_err(EvmError::from)?;
+        account.info.code_hash = code_hash;
+        account.info.nonce = PREDEPLOY_NONCE;
+        db.codes.entry(code_hash).or_insert(code);
+        Ok(())
     }
 
     pub fn beacon_root_contract_call(
@@ -3980,6 +4051,10 @@ impl LEVM {
         // TODO: I don't like deciding the behavior based on the VMType here.
         if let VMType::L2(_) = vm_type {
             return Ok(());
+        }
+
+        if chain_config.is_eip8304_activated(block_header.timestamp) {
+            Self::install_index_contract_code(db, crypto)?;
         }
 
         // EIP-8141: the expiry verifier predeploy must exist from Hegota
@@ -4647,6 +4722,179 @@ mod bal_tests {
         let u = &updates[0];
         assert_eq!(u.info.as_ref().unwrap().code_hash, expected_hash);
         assert_eq!(u.code.as_ref().unwrap().code(), &code[..]);
+    }
+}
+
+#[cfg(test)]
+mod eip8304_contract_tests {
+    use super::*;
+    use ethrex_common::types::{
+        AccountState, ChainConfig, CodeMetadata,
+        eip8304::{IndexEntry, TABLES_PER_LEVEL},
+    };
+    use ethrex_crypto::NativeCrypto;
+    use ethrex_levm::{db::Database, errors::DatabaseError};
+    use std::sync::Arc;
+
+    struct Store {
+        chain_config: ChainConfig,
+    }
+
+    impl Database for Store {
+        fn get_account_state(&self, _: Address) -> Result<AccountState, DatabaseError> {
+            Ok(AccountState::default())
+        }
+
+        fn get_storage_value(&self, _: Address, _: H256) -> Result<U256, DatabaseError> {
+            Ok(U256::zero())
+        }
+
+        fn get_block_hash(&self, _: u64) -> Result<H256, DatabaseError> {
+            Ok(H256::zero())
+        }
+
+        fn get_chain_config(&self) -> Result<ChainConfig, DatabaseError> {
+            Ok(self.chain_config)
+        }
+
+        fn get_account_code(&self, _: H256) -> Result<Code, DatabaseError> {
+            Ok(Code::default())
+        }
+
+        fn get_code_metadata(&self, _: H256) -> Result<CodeMetadata, DatabaseError> {
+            Ok(CodeMetadata { length: 0 })
+        }
+    }
+
+    fn active_db() -> GeneralizedDatabase {
+        GeneralizedDatabase::new(Arc::new(Store {
+            chain_config: ChainConfig {
+                shanghai_time: Some(0),
+                eip8304_time: Some(0),
+                ..Default::default()
+            },
+        }))
+    }
+
+    fn table(first_block: u64, marker: u8) -> IndexTable {
+        IndexTable::new(
+            first_block,
+            1,
+            vec![IndexEntry::Block {
+                block_hash: H256::repeat_byte(marker),
+                block_number: first_block.saturating_sub(1),
+            }],
+        )
+        .unwrap()
+    }
+
+    fn storage_root_value(db: &mut GeneralizedDatabase, address: Address, slot: u64) -> U256 {
+        let key = H256::from_low_u64_be(slot);
+        db.get_account(address)
+            .unwrap()
+            .storage
+            .get(&key)
+            .copied()
+            .unwrap_or_default()
+    }
+
+    #[test]
+    fn dormant_deployment_sets_nonce_one_and_has_builder_importer_parity() {
+        let address = Address::from_low_u64_be(0x8304);
+        let mut builder_db = active_db();
+        let mut importer_db = active_db();
+        builder_db.get_account_mut(address).unwrap().info.nonce = 7;
+        importer_db.get_account_mut(address).unwrap().info.nonce = 7;
+
+        // Injecting a stand-in address exercises the finalized-address path
+        // without assigning a consensus address in production.
+        LEVM::install_index_contract_code_at(Some(address), &mut builder_db, &NativeCrypto)
+            .unwrap();
+        // A second call is idempotent.
+        LEVM::install_index_contract_code_at(Some(address), &mut builder_db, &NativeCrypto)
+            .unwrap();
+        LEVM::install_index_contract_code_at(Some(address), &mut importer_db, &NativeCrypto)
+            .unwrap();
+
+        let builder_updates = LEVM::get_state_transitions(&mut builder_db).unwrap();
+        let importer_updates = LEVM::get_state_transitions(&mut importer_db).unwrap();
+        assert_eq!(builder_updates, importer_updates);
+        assert_eq!(builder_updates.len(), 1);
+        let update = &builder_updates[0];
+        assert_eq!(update.address, address);
+        assert_eq!(update.info.as_ref().unwrap().nonce, 1);
+        assert_eq!(
+            update.code.as_ref().unwrap().code(),
+            INDEX_CONTRACT_RUNTIME_BYTECODE.as_slice()
+        );
+    }
+
+    #[test]
+    fn system_calls_overwrite_the_same_ring_buffer_slot() {
+        let address = Address::from_low_u64_be(0x8304);
+        let mut db = active_db();
+        LEVM::install_index_contract_code_at(Some(address), &mut db, &NativeCrypto).unwrap();
+
+        let first = table(0, 0x11);
+        let replacement = table(TABLES_PER_LEVEL, 0x22);
+        let mut header = BlockHeader {
+            number: 0,
+            timestamp: 1,
+            gas_limit: INDEX_CONTRACT_GAS_LIMIT,
+            ..Default::default()
+        };
+        LEVM::index_contract_call_at(
+            Some(address),
+            &header,
+            &first,
+            &mut db,
+            VMType::L1,
+            &NativeCrypto,
+        )
+        .unwrap();
+
+        let slot = TABLES_PER_LEVEL;
+        assert_eq!(
+            storage_root_value(&mut db, address, slot),
+            U256::from_big_endian(first.table_root().as_bytes())
+        );
+
+        header.number = TABLES_PER_LEVEL;
+        LEVM::index_contract_call_at(
+            Some(address),
+            &header,
+            &replacement,
+            &mut db,
+            VMType::L1,
+            &NativeCrypto,
+        )
+        .unwrap();
+        assert_eq!(
+            storage_root_value(&mut db, address, slot),
+            U256::from_big_endian(replacement.table_root().as_bytes())
+        );
+    }
+
+    #[test]
+    fn missing_index_contract_code_succeeds_silently() {
+        let address = Address::from_low_u64_be(0x8304);
+        let mut db = active_db();
+        let header = BlockHeader {
+            timestamp: 1,
+            gas_limit: INDEX_CONTRACT_GAS_LIMIT,
+            ..Default::default()
+        };
+
+        LEVM::index_contract_call_at(
+            Some(address),
+            &header,
+            &table(0, 0x33),
+            &mut db,
+            VMType::L1,
+            &NativeCrypto,
+        )
+        .unwrap();
+        assert!(db.get_account(address).unwrap().storage.is_empty());
     }
 }
 

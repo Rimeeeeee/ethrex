@@ -6890,6 +6890,105 @@ mod index_table_tests {
             );
         }
     }
+
+    #[tokio::test]
+    async fn reorg_reconstruction_retains_both_fork_tables() {
+        let mut store = test_store();
+        let config = ChainConfig {
+            eip8304_time: Some(0),
+            ..Default::default()
+        };
+        store.set_chain_config(&config).await.unwrap();
+
+        let genesis = Block::new(
+            BlockHeader {
+                number: 0,
+                timestamp: 0,
+                ..Default::default()
+            },
+            BlockBody::empty(),
+        );
+        let mut all_blocks = vec![genesis.clone()];
+        let mut fork_ends = Vec::new();
+        for marker in [0xaa, 0xbb] {
+            let mut parent_hash = genesis.hash();
+            for number in 1..4 {
+                let block = Block::new(
+                    BlockHeader {
+                        number,
+                        timestamp: number,
+                        parent_hash,
+                        coinbase: Address::repeat_byte(marker),
+                        ..Default::default()
+                    },
+                    BlockBody::empty(),
+                );
+                parent_hash = block.hash();
+                all_blocks.push(block);
+            }
+            fork_ends.push(parent_hash);
+        }
+        store.add_blocks(all_blocks.clone()).await.unwrap();
+        for block in &all_blocks {
+            store.add_receipts(block.hash(), Vec::new()).await.unwrap();
+        }
+
+        let fork_a = store
+            .get_or_reconstruct_index_table(1, 3, fork_ends[0])
+            .unwrap()
+            .unwrap();
+        let fork_b = store
+            .get_or_reconstruct_index_table(1, 3, fork_ends[1])
+            .unwrap()
+            .unwrap();
+        assert_ne!(fork_a.table_root(), fork_b.table_root());
+        assert_eq!(
+            store.get_index_table(1, 3, fork_ends[0]).unwrap(),
+            Some(fork_a)
+        );
+        assert_eq!(
+            store.get_index_table(1, 3, fork_ends[1]).unwrap(),
+            Some(fork_b)
+        );
+    }
+
+    #[tokio::test]
+    async fn persisted_table_survives_store_restart() {
+        let backend: Arc<dyn StorageBackend> = Arc::new(InMemoryBackend::open().unwrap());
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::from_backend(
+            backend.clone(),
+            dir.path().to_path_buf(),
+            IN_MEMORY_COMMIT_THRESHOLD,
+            DEFAULT_PERSIST_CHANNEL_CAPACITY,
+        )
+        .unwrap();
+        let end_hash = H256::repeat_byte(0xcc);
+        let table = IndexTable::new(
+            12,
+            1,
+            vec![IndexEntry::Block {
+                block_hash: H256::repeat_byte(0x12),
+                block_number: 11,
+            }],
+        )
+        .unwrap();
+        store.store_index_table(end_hash, &table).unwrap();
+        store.shutdown().await.unwrap();
+        drop(store);
+
+        let reopened = Store::from_backend(
+            backend,
+            dir.path().to_path_buf(),
+            IN_MEMORY_COMMIT_THRESHOLD,
+            DEFAULT_PERSIST_CHANNEL_CAPACITY,
+        )
+        .unwrap();
+        assert_eq!(
+            reopened.get_index_table(0, 12, end_hash).unwrap(),
+            Some(table)
+        );
+    }
 }
 
 #[cfg(test)]

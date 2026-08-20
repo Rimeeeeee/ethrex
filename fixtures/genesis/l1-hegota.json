@@ -48,7 +48,8 @@
     },
     "mergeNetsplitBlock": 0,
     "amsterdamTime": 0,
-    "hegotaTime": 0
+    "hegotaTime": 0,
+    "eip8304Time": 0
   },
   "nonce": "0x1234",
   "timestamp": "1718040081",
