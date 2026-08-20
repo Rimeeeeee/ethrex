@@ -34,7 +34,12 @@ use ethrex_common::{
     types::{
         AccessList, AccountUpdate, Block, BlockHeader, EIP1559Transaction, Fork, FrameReceipt,
         GWEI_TO_WEI, GenericTransaction, INITIAL_BASE_FEE, Log, Receipt, Transaction, TxKind,
-        Withdrawal, requests::Requests,
+        Withdrawal,
+        eip8304::{
+            INDEX_CONTRACT_ADDRESS, INDEX_CONTRACT_GAS_LIMIT, IndexTable, index_contract_calldata,
+            tables_due_for_commitment,
+        },
+        requests::Requests,
     },
 };
 #[cfg(all(feature = "rayon", not(feature = "eip-8025")))]
@@ -414,6 +419,10 @@ impl LEVM {
             }
         }
 
+        // EIP-8304 runs after all transaction receipts are available and before
+        // the remaining post-block system operations.
+        let index_tables = Self::process_eip8304_tables(block, &receipts, db, vm_type, crypto)?;
+
         // TODO: I don't like deciding the behavior based on the VMType here.
         // TODO2: Revise this, apparently extract_all_requests_levm is not called
         // in L2 execution, but its implementation behaves differently based on this.
@@ -441,6 +450,7 @@ impl LEVM {
                 receipts,
                 requests,
                 block_gas_used,
+                index_tables,
                 // cumulative_gas_used is accumulated as += report.gas_spent (post-refund).
                 burned_fees: is_lstar
                     .then(|| lstar_burned_fees(&chain_config, &block.header, cumulative_gas_used)),
@@ -587,6 +597,10 @@ impl LEVM {
                 &validation_index.accounts_by_min_index,
             )?;
 
+            // EIP-8304 is part of the post-transaction state transition and must
+            // precede request extraction and withdrawals on the BAL path too.
+            let index_tables = Self::process_eip8304_tables(block, &receipts, db, vm_type, crypto)?;
+
             // Order must match geth: requests (system calls) BEFORE withdrawals.
             let requests = match vm_type {
                 VMType::L1 => {
@@ -684,6 +698,7 @@ impl LEVM {
                     receipts,
                     requests,
                     block_gas_used,
+                    index_tables,
                     burned_fees: burned_fees_par,
                     tx_gas_breakdowns,
                 },
@@ -881,6 +896,9 @@ impl LEVM {
             }
         }
 
+        // EIP-8304 runs at the same point as the non-streaming and BAL paths.
+        let index_tables = Self::process_eip8304_tables(block, &receipts, db, vm_type, crypto)?;
+
         // TODO: I don't like deciding the behavior based on the VMType here.
         // TODO2: Revise this, apparently extract_all_requests_levm is not called
         // in L2 execution, but its implementation behaves differently based on this.
@@ -909,6 +927,7 @@ impl LEVM {
                 receipts,
                 requests,
                 block_gas_used,
+                index_tables,
                 // cumulative_gas_used is accumulated as += report.gas_spent (post-refund).
                 burned_fees: is_lstar
                     .then(|| lstar_burned_fees(&chain_config, &block.header, cumulative_gas_used)),
@@ -3351,6 +3370,96 @@ impl LEVM {
     }
 
     // SYSTEM CONTRACTS
+    /// Build every EIP-8304 table due at this block and apply its index-contract
+    /// system call before the remaining post-block operations.
+    pub fn process_eip8304_tables(
+        block: &Block,
+        receipts: &[Receipt],
+        db: &mut GeneralizedDatabase,
+        vm_type: VMType,
+        crypto: &dyn Crypto,
+    ) -> Result<Vec<IndexTable>, EvmError> {
+        if matches!(vm_type, VMType::L2(_)) {
+            return Ok(Vec::new());
+        }
+        let chain_config = db.store.get_chain_config()?;
+        if !chain_config.is_eip8304_activated(block.header.timestamp) {
+            return Ok(Vec::new());
+        }
+
+        let current_table = IndexTable::from_block(block, receipts, crypto)
+            .map_err(|error| EvmError::Custom(error.to_string()))?;
+        let schedules = tables_due_for_commitment(block.header.number, |_| true);
+        let mut tables = Vec::with_capacity(schedules.len());
+
+        for schedule in schedules {
+            let table = if schedule.level() == 0 {
+                current_table.clone()
+            } else {
+                let end_block_number = schedule
+                    .first_block()
+                    .checked_add(schedule.table_size() - 1)
+                    .ok_or_else(|| EvmError::Custom("EIP-8304 table range overflow".to_string()))?;
+                let end_block_hash = db.store.get_block_hash(end_block_number)?;
+                let Some(table) = db.store.get_or_reconstruct_index_table(
+                    schedule.level(),
+                    end_block_number,
+                    end_block_hash,
+                )?
+                else {
+                    // The EIP was inactive at this higher-level table's first
+                    // block, so the commitment is intentionally skipped.
+                    continue;
+                };
+                table
+            };
+
+            Self::index_contract_call(&block.header, &table, db, vm_type, crypto)?;
+            tables.push(table);
+        }
+
+        Ok(tables)
+    }
+
+    /// Apply one EIP-8304 `set(first_block, table_size, table_root)` call.
+    ///
+    /// Until the EIP finalizes `INDEX_CONTRACT_ADDRESS`, this is a deliberate
+    /// no-op. Once set, an address with no code also succeeds silently as
+    /// required by the EIP.
+    pub fn index_contract_call(
+        block_header: &BlockHeader,
+        table: &IndexTable,
+        db: &mut GeneralizedDatabase,
+        vm_type: VMType,
+        crypto: &dyn Crypto,
+    ) -> Result<(), EvmError> {
+        let Some(contract_address) = INDEX_CONTRACT_ADDRESS else {
+            return Ok(());
+        };
+        if db.get_account_code(contract_address)?.is_empty() {
+            return Ok(());
+        }
+        debug_assert_eq!(INDEX_CONTRACT_GAS_LIMIT, SYS_CALL_GAS_LIMIT);
+
+        let calldata =
+            index_contract_calldata(table.first_block(), table.table_size(), table.table_root());
+        let report = generic_system_contract_levm(
+            block_header,
+            Bytes::copy_from_slice(&calldata),
+            db,
+            contract_address,
+            SYSTEM_ADDRESS,
+            vm_type,
+            crypto,
+        )?;
+        match report.result {
+            TxResult::Success => Ok(()),
+            TxResult::Revert(error) => Err(EvmError::SystemContractCallFailed(format!(
+                "EIP-8304 index-contract call reverted: {error:?}"
+            ))),
+        }
+    }
+
     pub fn beacon_root_contract_call(
         block_header: &BlockHeader,
         db: &mut GeneralizedDatabase,

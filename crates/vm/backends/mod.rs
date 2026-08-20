@@ -242,6 +242,23 @@ impl Evm {
         Ok(())
     }
 
+    /// Runs the EIP-8304 post-transaction table generation and index-contract
+    /// calls. Payload construction uses this wrapper to share the exact import
+    /// implementation and ordering.
+    pub fn process_eip8304_tables(
+        &mut self,
+        block: &Block,
+        receipts: &[Receipt],
+    ) -> Result<Vec<ethrex_common::types::eip8304::IndexTable>, EvmError> {
+        LEVM::process_eip8304_tables(
+            block,
+            receipts,
+            &mut self.db,
+            self.vm_type,
+            self.crypto.as_ref(),
+        )
+    }
+
     /// Wraps the [LEVM::get_state_transitions] which gathers the information from a [CacheDB].
     /// The output is `Vec<AccountUpdate>`.
     pub fn get_state_transitions(&mut self) -> Result<Vec<AccountUpdate>, EvmError> {
@@ -431,6 +448,9 @@ pub struct FrameValidationOutcome {
 pub struct BlockExecutionResult {
     pub receipts: Vec<Receipt>,
     pub requests: Vec<Requests>,
+    /// EIP-8304 tables generated or loaded for commitment in this block.
+    /// Persisted only after the block has passed validation.
+    pub index_tables: Vec<ethrex_common::types::eip8304::IndexTable>,
     /// Block gas used (PRE-REFUND for Amsterdam+ per EIP-7778).
     /// This differs from receipt cumulative_gas_used which is POST-REFUND.
     pub block_gas_used: u64,

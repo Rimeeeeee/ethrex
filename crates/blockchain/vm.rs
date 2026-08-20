@@ -342,6 +342,17 @@ impl VmDatabase for StoreVmDatabase {
         Ok(self.store.get_chain_config())
     }
 
+    fn get_or_reconstruct_index_table(
+        &self,
+        level: usize,
+        end_block_number: u64,
+        end_block_hash: H256,
+    ) -> Result<Option<ethrex_common::types::eip8304::IndexTable>, EvmError> {
+        self.store
+            .get_or_reconstruct_index_table(level, end_block_number, end_block_hash)
+            .map_err(|error| EvmError::DB(error.to_string()))
+    }
+
     #[instrument(
         level = "trace",
         name = "Account code read",

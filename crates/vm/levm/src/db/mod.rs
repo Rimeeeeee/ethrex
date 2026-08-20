@@ -1,7 +1,7 @@
 use crate::{errors::DatabaseError, precompiles::PrecompileCache};
 use ethrex_common::{
     Address, H256, U256,
-    types::{AccountState, ChainConfig, Code, CodeMetadata},
+    types::{AccountState, ChainConfig, Code, CodeMetadata, eip8304::IndexTable},
 };
 use rustc_hash::FxHashMap;
 use std::sync::{Arc, OnceLock, PoisonError, RwLock, RwLockReadGuard, RwLockWriteGuard};
@@ -35,6 +35,17 @@ pub trait Database: Send + Sync {
     fn get_chain_config(&self) -> Result<ChainConfig, DatabaseError>;
     fn get_account_code(&self, code_hash: H256) -> Result<Code, DatabaseError>;
     fn get_code_metadata(&self, code_hash: H256) -> Result<CodeMetadata, DatabaseError>;
+    /// Load or reconstruct a fork-specific EIP-8304 table.
+    fn get_or_reconstruct_index_table(
+        &self,
+        _level: usize,
+        _end_block_number: u64,
+        _end_block_hash: H256,
+    ) -> Result<Option<IndexTable>, DatabaseError> {
+        Err(DatabaseError::Custom(
+            "EIP-8304 table access is unavailable for this database".to_string(),
+        ))
+    }
     /// Access the precompile cache, if available at this database layer.
     fn precompile_cache(&self) -> Option<&PrecompileCache> {
         None
@@ -309,6 +320,16 @@ impl Database for CachingDatabase {
         // The underlying Store already has its own code_metadata_cache,
         // so we don't need to duplicate caching here.
         self.inner.get_code_metadata(code_hash)
+    }
+
+    fn get_or_reconstruct_index_table(
+        &self,
+        level: usize,
+        end_block_number: u64,
+        end_block_hash: H256,
+    ) -> Result<Option<IndexTable>, DatabaseError> {
+        self.inner
+            .get_or_reconstruct_index_table(level, end_block_number, end_block_hash)
     }
 
     fn precompile_cache(&self) -> Option<&PrecompileCache> {

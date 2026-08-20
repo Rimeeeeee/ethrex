@@ -7,8 +7,8 @@ use crate::{
         tables::{
             ACCOUNT_CODE_METADATA, ACCOUNT_CODES, ACCOUNT_FLATKEYVALUE, ACCOUNT_TRIE_NODES,
             BAD_BLOCKS, BLOCK_ACCESS_LISTS, BLOCK_NUMBERS, BODIES, CANONICAL_BLOCK_HASHES,
-            CHAIN_DATA, EXECUTION_WITNESSES, FULLSYNC_HEADERS, HEADERS, INVALID_CHAINS,
-            MISC_VALUES, PENDING_BLOCKS, RECEIPTS_V2, SNAP_STATE, STATE_HISTORY,
+            CHAIN_DATA, EXECUTION_WITNESSES, FULLSYNC_HEADERS, HEADERS, INDEX_TABLES,
+            INVALID_CHAINS, MISC_VALUES, PENDING_BLOCKS, RECEIPTS_V2, SNAP_STATE, STATE_HISTORY,
             STORAGE_FLATKEYVALUE, STORAGE_TRIE_NODES, TRANSACTION_LOCATIONS,
         },
     },
@@ -31,6 +31,7 @@ use ethrex_common::{
         Receipt, Transaction,
         block_access_list::BlockAccessList,
         block_execution_witness::{ExecutionWitness, RpcExecutionWitness},
+        eip8304::{IndexTable, TABLE_SIZES},
     },
     utils::keccak,
 };
@@ -2662,6 +2663,251 @@ impl Store {
         }
     }
 
+    /// Persist an EIP-8304 table under its level, covered end block, and that
+    /// block's hash. The hash component preserves tables for competing forks.
+    pub fn store_index_table(
+        &self,
+        end_block_hash: BlockHash,
+        table: &IndexTable,
+    ) -> Result<(), StoreError> {
+        let end_block_number = table
+            .end_block()
+            .map_err(|error| StoreError::Custom(error.to_string()))?;
+        let key = index_table_key(table.level(), end_block_number, end_block_hash)?;
+        self.write(INDEX_TABLES, key, table.encode_storage())
+    }
+
+    /// Persist every EIP-8304 table committed by `block`, resolving each
+    /// table's end hash on this block's own ancestry. This keeps equivalent
+    /// ranges on competing forks under distinct keys.
+    pub fn store_index_tables_for_block(
+        &self,
+        block: &Block,
+        tables: &[IndexTable],
+    ) -> Result<(), StoreError> {
+        for table in tables {
+            let end_block_number = table
+                .end_block()
+                .map_err(|error| StoreError::Custom(error.to_string()))?;
+            let end_block_hash = if end_block_number == block.header.number {
+                block.hash()
+            } else {
+                self.block_hash_on_branch(block.header.parent_hash, end_block_number)?
+                    .ok_or_else(|| {
+                        StoreError::Custom(format!(
+                            "Missing EIP-8304 table end block {end_block_number} on branch ending {:#x}",
+                            block.hash()
+                        ))
+                    })?
+            };
+            self.store_index_table(end_block_hash, table)?;
+        }
+        Ok(())
+    }
+
+    /// Load an exact EIP-8304 table for one fork.
+    pub fn get_index_table(
+        &self,
+        level: usize,
+        end_block_number: BlockNumber,
+        end_block_hash: BlockHash,
+    ) -> Result<Option<IndexTable>, StoreError> {
+        let key = index_table_key(level, end_block_number, end_block_hash)?;
+        let Some(encoded) = self.read(INDEX_TABLES, key)? else {
+            return Ok(None);
+        };
+        let table = IndexTable::decode_storage(&encoded)
+            .map_err(|error| StoreError::Custom(error.to_string()))?;
+        if table.level() != level || table.end_block().ok() != Some(end_block_number) {
+            return Err(StoreError::Custom(
+                "Persisted EIP-8304 table metadata does not match its key".to_string(),
+            ));
+        }
+        Ok(Some(table))
+    }
+
+    /// Load a fork-specific EIP-8304 table or reconstruct it recursively from
+    /// recent blocks and receipts.
+    ///
+    /// `None` means EIP-8304 was not active at the table's first block. Missing
+    /// recent chain data is an error because an active scheduled commitment
+    /// cannot be safely skipped.
+    pub fn get_or_reconstruct_index_table(
+        &self,
+        level: usize,
+        end_block_number: BlockNumber,
+        end_block_hash: BlockHash,
+    ) -> Result<Option<IndexTable>, StoreError> {
+        if level >= TABLE_SIZES.len() {
+            return Err(StoreError::Custom(format!(
+                "Invalid EIP-8304 table level {level}"
+            )));
+        }
+        if let Some(table) = self.get_index_table(level, end_block_number, end_block_hash)? {
+            return Ok(Some(table));
+        }
+
+        let table_size = TABLE_SIZES[level];
+        let first_block = end_block_number
+            .checked_add(1)
+            .and_then(|end_exclusive| end_exclusive.checked_sub(table_size))
+            .ok_or_else(|| StoreError::Custom("Invalid EIP-8304 table range".to_string()))?;
+        if !first_block.is_multiple_of(table_size) {
+            return Err(StoreError::Custom(format!(
+                "EIP-8304 table ending at {end_block_number} is not aligned for size {table_size}"
+            )));
+        }
+
+        let end_header = self
+            .get_block_header_by_hash(end_block_hash)?
+            .ok_or_else(|| {
+                StoreError::Custom(format!(
+                    "Missing EIP-8304 end block header {end_block_hash:#x}"
+                ))
+            })?;
+        if end_header.number != end_block_number {
+            return Err(StoreError::Custom(format!(
+                "EIP-8304 end hash belongs to block {}, expected {end_block_number}",
+                end_header.number
+            )));
+        }
+
+        let first_block_hash = self
+            .block_hash_on_branch(end_block_hash, first_block)?
+            .ok_or_else(|| {
+                StoreError::Custom(format!(
+                    "Missing EIP-8304 first block {first_block} on branch ending {end_block_hash:#x}"
+                ))
+            })?;
+        let first_header = self
+            .get_block_header_by_hash(first_block_hash)?
+            .ok_or_else(|| {
+                StoreError::Custom(format!(
+                    "Missing EIP-8304 first block header {first_block_hash:#x}"
+                ))
+            })?;
+        if !self
+            .chain_config
+            .is_eip8304_activated(first_header.timestamp)
+        {
+            return Ok(None);
+        }
+
+        let table = if level == 0 {
+            let block = self
+                .get_block_by_hash_sync_for_index(end_block_hash)?
+                .ok_or_else(|| {
+                    StoreError::Custom(format!(
+                        "Missing block {end_block_hash:#x} needed to reconstruct EIP-8304 table"
+                    ))
+                })?;
+            let receipts = self.get_receipts_for_block_sync_for_index(end_block_hash)?;
+            IndexTable::from_block(&block, &receipts, &NativeCrypto)
+                .map_err(|error| StoreError::Custom(error.to_string()))?
+        } else {
+            let lower_level = level - 1;
+            let lower_size = TABLE_SIZES[lower_level];
+            let mut lower_tables = Vec::with_capacity(4);
+            for table_index in 0..4u64 {
+                let lower_end = first_block
+                    .checked_add(lower_size.checked_mul(table_index + 1).ok_or_else(|| {
+                        StoreError::Custom("EIP-8304 lower table range overflow".to_string())
+                    })?)
+                    .and_then(|end_exclusive| end_exclusive.checked_sub(1))
+                    .ok_or_else(|| {
+                        StoreError::Custom("EIP-8304 lower table range overflow".to_string())
+                    })?;
+                let lower_end_hash = self
+                    .block_hash_on_branch(end_block_hash, lower_end)?
+                    .ok_or_else(|| {
+                        StoreError::Custom(format!(
+                            "Missing EIP-8304 lower-table end block {lower_end} on branch ending {end_block_hash:#x}"
+                        ))
+                    })?;
+                let lower = self
+                    .get_or_reconstruct_index_table(
+                        lower_level,
+                        lower_end,
+                        lower_end_hash,
+                    )?
+                    .ok_or_else(|| {
+                        StoreError::Custom(format!(
+                            "EIP-8304 lower table at level {lower_level}, end block {lower_end} was inactive while its parent table was active"
+                        ))
+                    })?;
+                lower_tables.push(lower);
+            }
+            IndexTable::merge([
+                &lower_tables[0],
+                &lower_tables[1],
+                &lower_tables[2],
+                &lower_tables[3],
+            ])
+            .map_err(|error| StoreError::Custom(error.to_string()))?
+        };
+
+        self.store_index_table(end_block_hash, &table)?;
+        Ok(Some(table))
+    }
+
+    fn block_hash_on_branch(
+        &self,
+        end_block_hash: BlockHash,
+        target_block_number: BlockNumber,
+    ) -> Result<Option<BlockHash>, StoreError> {
+        for ancestor in self.ancestors(end_block_hash) {
+            let (hash, header) = ancestor?;
+            if header.number == target_block_number {
+                return Ok(Some(hash));
+            }
+            if header.number < target_block_number {
+                return Ok(None);
+            }
+        }
+        Ok(None)
+    }
+
+    fn get_block_by_hash_sync_for_index(
+        &self,
+        block_hash: BlockHash,
+    ) -> Result<Option<Block>, StoreError> {
+        let Some(header) = self.get_block_header_by_hash(block_hash)? else {
+            return Ok(None);
+        };
+        let body = if let Some(body) = self.buffer()?.get_body(&block_hash) {
+            body
+        } else {
+            let Some(encoded) = self.read(BODIES, block_hash.encode_to_vec())? else {
+                return Ok(None);
+            };
+            BlockBodyRLP::from_bytes(encoded).to()?
+        };
+        Ok(Some(Block { header, body }))
+    }
+
+    fn get_receipts_for_block_sync_for_index(
+        &self,
+        block_hash: BlockHash,
+    ) -> Result<Vec<Receipt>, StoreError> {
+        if let Some(receipts) = self.buffer()?.get_receipts(&block_hash) {
+            return Ok(receipts);
+        }
+
+        let read = self.backend.begin_read()?;
+        let prefix = block_hash.as_bytes();
+        let mut receipts = Vec::new();
+        for result in read.prefix_iterator(RECEIPTS_V2, prefix)? {
+            let (key, value) = result?;
+            if !key.starts_with(prefix) {
+                break;
+            }
+            if key.len() == 40 {
+                receipts.push(Receipt::decode_storage(value.as_ref())?);
+            }
+        }
+        Ok(receipts)
+    }
+
     pub async fn add_initial_state(&mut self, genesis: Genesis) -> Result<(), StoreError> {
         self.add_initial_state_inner(genesis, false).await
     }
@@ -5269,6 +5515,20 @@ pub fn receipt_key(block_hash: &BlockHash, index: u64) -> Vec<u8> {
     key
 }
 
+fn index_table_key(
+    level: usize,
+    end_block_number: BlockNumber,
+    end_block_hash: BlockHash,
+) -> Result<Vec<u8>, StoreError> {
+    let level = u8::try_from(level)
+        .map_err(|_| StoreError::Custom("EIP-8304 table level exceeds u8".to_string()))?;
+    let mut key = Vec::with_capacity(41);
+    key.push(level);
+    key.extend_from_slice(&end_block_number.to_be_bytes());
+    key.extend_from_slice(end_block_hash.as_bytes());
+    Ok(key)
+}
+
 fn encode_code(code: &Code) -> Vec<u8> {
     let mut buf =
         Vec::with_capacity(6 + code.len() + std::mem::size_of_val::<[u32]>(&code.jump_targets));
@@ -6527,6 +6787,108 @@ mod state_history_tests {
             );
         }
         assert!(journal_entry_exists(&backend, 5));
+    }
+}
+
+#[cfg(test)]
+mod index_table_tests {
+    use super::*;
+    use ethrex_common::types::eip8304::IndexEntry;
+
+    fn test_store() -> Store {
+        let dir = tempfile::tempdir().unwrap();
+        // The in-memory backend does not retain the path; keep creation local.
+        Store::new(dir.path(), EngineType::InMemory).unwrap()
+    }
+
+    #[test]
+    fn tables_for_competing_forks_have_distinct_keys() {
+        let store = test_store();
+        let fork_a_hash = H256::repeat_byte(0xaa);
+        let fork_b_hash = H256::repeat_byte(0xbb);
+        let fork_a_table = IndexTable::new(
+            8,
+            1,
+            vec![IndexEntry::Block {
+                block_hash: H256::repeat_byte(1),
+                block_number: 7,
+            }],
+        )
+        .unwrap();
+        let fork_b_table = IndexTable::new(
+            8,
+            1,
+            vec![IndexEntry::Block {
+                block_hash: H256::repeat_byte(2),
+                block_number: 7,
+            }],
+        )
+        .unwrap();
+
+        store.store_index_table(fork_a_hash, &fork_a_table).unwrap();
+        store.store_index_table(fork_b_hash, &fork_b_table).unwrap();
+
+        assert_eq!(
+            store.get_index_table(0, 8, fork_a_hash).unwrap(),
+            Some(fork_a_table)
+        );
+        assert_eq!(
+            store.get_index_table(0, 8, fork_b_hash).unwrap(),
+            Some(fork_b_table)
+        );
+    }
+
+    #[tokio::test]
+    async fn reconstructs_missing_merged_table_from_recent_blocks_and_receipts() {
+        let mut store = test_store();
+        let config = ChainConfig {
+            eip8304_time: Some(0),
+            ..Default::default()
+        };
+        store.set_chain_config(&config).await.unwrap();
+
+        let mut blocks = Vec::new();
+        let mut parent_hash = H256::zero();
+        for number in 0..4 {
+            let block = Block::new(
+                BlockHeader {
+                    number,
+                    timestamp: number,
+                    parent_hash,
+                    ..Default::default()
+                },
+                BlockBody::empty(),
+            );
+            parent_hash = block.hash();
+            blocks.push(block);
+        }
+        let end_hash = blocks[3].hash();
+        store.add_blocks(blocks.clone()).await.unwrap();
+        for block in &blocks {
+            store.add_receipts(block.hash(), Vec::new()).await.unwrap();
+        }
+
+        assert!(store.get_index_table(1, 3, end_hash).unwrap().is_none());
+        let reconstructed = store
+            .get_or_reconstruct_index_table(1, 3, end_hash)
+            .unwrap()
+            .unwrap();
+
+        assert_eq!(reconstructed.first_block(), 0);
+        assert_eq!(reconstructed.table_size(), 4);
+        assert_eq!(reconstructed.entry_count(), 3);
+        assert_eq!(
+            store.get_index_table(1, 3, end_hash).unwrap(),
+            Some(reconstructed)
+        );
+        for block in blocks {
+            assert!(
+                store
+                    .get_index_table(0, block.header.number, block.hash())
+                    .unwrap()
+                    .is_some()
+            );
+        }
     }
 }
 

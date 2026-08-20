@@ -936,6 +936,7 @@ impl L1Committer {
                     BlockExecutionResult {
                         receipts,
                         requests: vec![],
+                        index_tables: Vec::new(),
                         // Use the block header's gas_used
                         block_gas_used: potential_batch_block.header.gas_used,
                         burned_fees: None,

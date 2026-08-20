@@ -569,6 +569,7 @@ impl Blockchain {
                 recorder.extend_touched_addresses(withdrawals.iter().map(|w| w.address));
             }
         }
+        self.process_eip8304_tables(&mut context)?;
         self.extract_requests(&mut context)?;
         self.apply_withdrawals(&mut context)?;
         self.write_openings_roots(&mut context)?;
@@ -636,6 +637,19 @@ impl Blockchain {
         context: &mut PayloadBuildContext,
     ) -> Result<(), EvmError> {
         context.vm.apply_system_calls(&context.payload.header)
+    }
+
+    /// EIP-8304 post-transaction processing. Generated tables are persisted
+    /// when the completed block is later accepted by block import; payload
+    /// building only needs to apply the resulting system calls to candidate state.
+    pub fn process_eip8304_tables(
+        &self,
+        context: &mut PayloadBuildContext,
+    ) -> Result<(), EvmError> {
+        context
+            .vm
+            .process_eip8304_tables(&context.payload, &context.receipts)?;
+        Ok(())
     }
 
     /// Fetches suitable transactions from the mempool

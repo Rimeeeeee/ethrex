@@ -212,6 +212,7 @@ impl NativeBlockProducer {
         let execution_result = BlockExecutionResult {
             receipts: context.receipts,
             requests: Vec::new(),
+            index_tables: Vec::new(),
             block_gas_used: block.header.gas_used,
             burned_fees: None,
             tx_gas_breakdowns: Vec::new(),

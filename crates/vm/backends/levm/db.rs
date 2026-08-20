@@ -1,6 +1,6 @@
 use ethrex_common::U256 as CoreU256;
 use ethrex_common::constants::EMPTY_KECCAK_HASH;
-use ethrex_common::types::{AccountState, Code, CodeMetadata};
+use ethrex_common::types::{AccountState, Code, CodeMetadata, eip8304::IndexTable};
 use ethrex_common::{Address as CoreAddress, H256 as CoreH256};
 use ethrex_levm::db::Database as LevmDatabase;
 
@@ -82,6 +82,16 @@ impl LevmDatabase for DatabaseLogger {
     fn get_code_metadata(&self, code_hash: CoreH256) -> Result<CodeMetadata, DatabaseError> {
         self.store.get_code_metadata(code_hash)
     }
+
+    fn get_or_reconstruct_index_table(
+        &self,
+        level: usize,
+        end_block_number: u64,
+        end_block_hash: CoreH256,
+    ) -> Result<Option<IndexTable>, DatabaseError> {
+        self.store
+            .get_or_reconstruct_index_table(level, end_block_number, end_block_hash)
+    }
 }
 
 impl LevmDatabase for DynVmDatabase {
@@ -147,5 +157,20 @@ impl LevmDatabase for DynVmDatabase {
     fn get_code_metadata(&self, code_hash: CoreH256) -> Result<CodeMetadata, DatabaseError> {
         <dyn VmDatabase>::get_code_metadata(self.as_ref(), code_hash)
             .map_err(|e| DatabaseError::Custom(e.to_string()))
+    }
+
+    fn get_or_reconstruct_index_table(
+        &self,
+        level: usize,
+        end_block_number: u64,
+        end_block_hash: CoreH256,
+    ) -> Result<Option<IndexTable>, DatabaseError> {
+        <dyn VmDatabase>::get_or_reconstruct_index_table(
+            self.as_ref(),
+            level,
+            end_block_number,
+            end_block_hash,
+        )
+        .map_err(|e| DatabaseError::Custom(e.to_string()))
     }
 }

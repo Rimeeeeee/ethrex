@@ -2341,6 +2341,12 @@ impl Blockchain {
         // Check state root matches the one in block header
         validate_state_root(&block.header, account_updates_list.state_trie_hash)?;
 
+        // Keep the accepted block available while the update batch takes
+        // ownership. EIP-8304 tables are written only after the block update has
+        // been staged successfully, so invalid blocks never populate the cache.
+        let index_tables = execution_result.index_tables;
+        let index_table_block = (!index_tables.is_empty()).then(|| block.clone());
+
         let update_batch = UpdateBatch {
             account_updates: account_updates_list.state_updates,
             storage_updates: account_updates_list.storage_updates,
@@ -2355,7 +2361,14 @@ impl Blockchain {
 
         self.storage
             .store_block_updates(update_batch)
-            .map_err(|e| e.into())
+            .map_err(ChainError::from)?;
+
+        if let Some(block) = index_table_block {
+            self.storage
+                .store_index_tables_for_block(&block, &index_tables)?;
+        }
+
+        Ok(())
     }
 
     pub fn add_block(&self, block: Block) -> Result<(), ChainError> {

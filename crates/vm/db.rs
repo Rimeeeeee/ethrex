@@ -2,7 +2,7 @@ use crate::EvmError;
 use dyn_clone::DynClone;
 use ethrex_common::{
     Address, H256, U256,
-    types::{AccountState, ChainConfig, Code, CodeMetadata},
+    types::{AccountState, ChainConfig, Code, CodeMetadata, eip8304::IndexTable},
 };
 
 pub trait VmDatabase: Send + Sync + DynClone {
@@ -12,6 +12,18 @@ pub trait VmDatabase: Send + Sync + DynClone {
     fn get_chain_config(&self) -> Result<ChainConfig, EvmError>;
     fn get_account_code(&self, code_hash: H256) -> Result<Code, EvmError>;
     fn get_code_metadata(&self, code_hash: H256) -> Result<CodeMetadata, EvmError>;
+
+    /// Load or reconstruct a fork-specific EIP-8304 table.
+    fn get_or_reconstruct_index_table(
+        &self,
+        _level: usize,
+        _end_block_number: u64,
+        _end_block_hash: H256,
+    ) -> Result<Option<IndexTable>, EvmError> {
+        Err(EvmError::DB(
+            "EIP-8304 table access is unavailable for this database".to_string(),
+        ))
+    }
 
     /// Batch account-state lookup. Default impl loops `get_account_state`.
     /// Backends that can amortize per-key cost (e.g. rocksdb `multi_get_cf` on

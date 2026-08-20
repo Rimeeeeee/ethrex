@@ -1,9 +1,8 @@
 //! Construction, hashing, merging, and scheduling for EIP-8304 index tables.
 //!
-//! The actual index-contract system call is intentionally kept outside this
-//! module: the EIP has not finalized [`INDEX_CONTRACT_ADDRESS`] yet. Callers use
-//! [`tables_due_for_commitment`] after block execution to determine which table
-//! roots must be sent once that address and system-call integration exist.
+//! The VM integration consumes the constants and calldata helper in this module.
+//! [`INDEX_CONTRACT_ADDRESS`] remains explicitly unset until the EIP assigns it,
+//! so the complete execution path stays dormant without a placeholder address.
 
 use crate::{
     Address, H256,
@@ -18,8 +17,14 @@ pub const TABLE_SIZES: [u64; 5] = [1, 4, 16, 64, 256];
 /// Number of table roots retained in each level's system-contract ring buffer.
 pub const TABLES_PER_LEVEL: u64 = 1024;
 
+/// Gas made available to each EIP-8304 index-contract system call.
+pub const INDEX_CONTRACT_GAS_LIMIT: u64 = 30_000_000;
+
 /// Maximum number of indexed topics in a valid EVM log (`LOG0` through `LOG4`).
 pub const MAX_TOPICS_PER_LOG: usize = 4;
+
+/// Local-storage encoding version for [`IndexTable`].
+const INDEX_TABLE_STORAGE_VERSION: u8 = 1;
 
 /// System caller used for EIP-8304 index-contract updates.
 pub use crate::constants::SYSTEM_ADDRESS;
@@ -31,6 +36,18 @@ pub use crate::constants::SYSTEM_ADDRESS;
 /// `Address` once the EIP finalizes `INDEX_CONTRACT_ADDRESS`.
 /// This is to be replaced with the actual address once it is finalized in the EIP-8304 specification.
 pub const INDEX_CONTRACT_ADDRESS: Option<Address> = None;
+
+/// Build the 96-byte calldata for the index contract's `set` operation.
+///
+/// `first_block` and `table_size` occupy full 32-byte big-endian words; the
+/// final word is the table root.
+pub fn index_contract_calldata(first_block: u64, table_size: u64, table_root: H256) -> [u8; 96] {
+    let mut calldata = [0u8; 96];
+    calldata[24..32].copy_from_slice(&first_block.to_be_bytes());
+    calldata[56..64].copy_from_slice(&table_size.to_be_bytes());
+    calldata[64..].copy_from_slice(table_root.as_bytes());
+    calldata
+}
 
 /// EIP-8304 index-entry type identifiers.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -272,6 +289,10 @@ pub enum IndexTableError {
     TableRangeOverflow,
     #[error("merged index entry count overflowed usize")]
     MergedEntryCountOverflow,
+    #[error("malformed persisted EIP-8304 table: {0}")]
+    MalformedStoredTable(&'static str),
+    #[error("persisted EIP-8304 table root does not match its entries")]
+    StoredTableRootMismatch,
 }
 
 /// An EIP-8304 index table with canonical, lexicographically sorted entries.
@@ -512,6 +533,172 @@ impl IndexTable {
     pub const fn table_root(&self) -> H256 {
         self.table_root
     }
+
+    /// Protocol level corresponding to this table's size.
+    pub fn level(&self) -> usize {
+        TABLE_SIZES
+            .iter()
+            .position(|size| *size == self.table_size)
+            .expect("IndexTable construction validates table_size")
+    }
+
+    /// Last block covered by this table.
+    pub fn end_block(&self) -> Result<u64, IndexTableError> {
+        self.first_block
+            .checked_add(self.table_size - 1)
+            .ok_or(IndexTableError::TableRangeOverflow)
+    }
+
+    /// Encode this table for local persistence.
+    ///
+    /// This is deliberately not a consensus encoding. The root is stored as an
+    /// integrity check and recomputed when loading.
+    pub fn encode_storage(&self) -> Vec<u8> {
+        let entries_len: usize = self
+            .encoded_entries
+            .iter()
+            .map(|entry| 2 + entry.as_bytes().len())
+            .sum();
+        let mut encoded = Vec::with_capacity(1 + 8 + 8 + 8 + 32 + entries_len);
+        encoded.push(INDEX_TABLE_STORAGE_VERSION);
+        encoded.extend_from_slice(&self.first_block.to_be_bytes());
+        encoded.extend_from_slice(&self.table_size.to_be_bytes());
+        encoded.extend_from_slice(&self.entry_count.to_be_bytes());
+        encoded.extend_from_slice(self.table_root.as_bytes());
+        for entry in &self.encoded_entries {
+            let entry_len = u16::try_from(entry.as_bytes().len())
+                .expect("EIP-8304 entries are at most 50 bytes");
+            encoded.extend_from_slice(&entry_len.to_be_bytes());
+            encoded.extend_from_slice(entry.as_bytes());
+        }
+        encoded
+    }
+
+    /// Decode and validate a locally persisted table.
+    pub fn decode_storage(encoded: &[u8]) -> Result<Self, IndexTableError> {
+        const HEADER_LEN: usize = 1 + 8 + 8 + 8 + 32;
+        if encoded.len() < HEADER_LEN {
+            return Err(IndexTableError::MalformedStoredTable("truncated header"));
+        }
+        if encoded[0] != INDEX_TABLE_STORAGE_VERSION {
+            return Err(IndexTableError::MalformedStoredTable(
+                "unsupported storage version",
+            ));
+        }
+
+        let first_block = u64::from_be_bytes(
+            encoded[1..9]
+                .try_into()
+                .map_err(|_| IndexTableError::MalformedStoredTable("invalid first block"))?,
+        );
+        let table_size = u64::from_be_bytes(
+            encoded[9..17]
+                .try_into()
+                .map_err(|_| IndexTableError::MalformedStoredTable("invalid table size"))?,
+        );
+        validate_table_identity(first_block, table_size)?;
+        let entry_count = u64::from_be_bytes(
+            encoded[17..25]
+                .try_into()
+                .map_err(|_| IndexTableError::MalformedStoredTable("invalid entry count"))?,
+        );
+        let stored_root = H256::from_slice(&encoded[25..57]);
+        let entry_capacity = usize::try_from(entry_count)
+            .map_err(|_| IndexTableError::MalformedStoredTable("entry count exceeds usize"))?;
+        // Every entry takes at least a two-byte length plus 38 payload bytes.
+        // Reject an impossible count before reserving attacker/corruption-sized
+        // memory based solely on local database metadata.
+        if entry_capacity > encoded.len().saturating_sub(HEADER_LEN) / 40 {
+            return Err(IndexTableError::MalformedStoredTable(
+                "entry count exceeds encoded payload",
+            ));
+        }
+        let mut entries = Vec::with_capacity(entry_capacity);
+        let mut offset = HEADER_LEN;
+        while offset < encoded.len() {
+            let length_end = offset
+                .checked_add(2)
+                .ok_or(IndexTableError::MalformedStoredTable(
+                    "entry offset overflow",
+                ))?;
+            let length_bytes =
+                encoded
+                    .get(offset..length_end)
+                    .ok_or(IndexTableError::MalformedStoredTable(
+                        "truncated entry length",
+                    ))?;
+            let entry_len = u16::from_be_bytes(
+                length_bytes
+                    .try_into()
+                    .map_err(|_| IndexTableError::MalformedStoredTable("invalid entry length"))?,
+            ) as usize;
+            offset = length_end;
+            let entry_end =
+                offset
+                    .checked_add(entry_len)
+                    .ok_or(IndexTableError::MalformedStoredTable(
+                        "entry offset overflow",
+                    ))?;
+            let entry = encoded
+                .get(offset..entry_end)
+                .ok_or(IndexTableError::MalformedStoredTable("truncated entry"))?;
+            validate_encoded_entry(entry)?;
+            entries.push(EncodedIndexEntry(entry.to_vec()));
+            offset = entry_end;
+        }
+
+        if entries.len() != entry_capacity {
+            return Err(IndexTableError::MalformedStoredTable(
+                "entry count does not match payload",
+            ));
+        }
+        if !entries.windows(2).all(|pair| pair[0] <= pair[1]) {
+            return Err(IndexTableError::MalformedStoredTable(
+                "entries are not sorted",
+            ));
+        }
+        let calculated_root = calculate_table_root(&entries);
+        if calculated_root != stored_root {
+            return Err(IndexTableError::StoredTableRootMismatch);
+        }
+
+        Ok(Self {
+            first_block,
+            table_size,
+            encoded_entries: entries,
+            entry_count,
+            table_root: calculated_root,
+        })
+    }
+}
+
+fn validate_encoded_entry(encoded: &[u8]) -> Result<(), IndexTableError> {
+    let type_bytes = encoded
+        .get(..2)
+        .ok_or(IndexTableError::MalformedStoredTable(
+            "entry has no type id",
+        ))?;
+    let type_id = u16::from_be_bytes(
+        type_bytes
+            .try_into()
+            .map_err(|_| IndexTableError::MalformedStoredTable("invalid type id"))?,
+    );
+    let expected_len = match type_id {
+        0 => 42,
+        1 | 3..=6 => 50,
+        2 => 38,
+        _ => {
+            return Err(IndexTableError::MalformedStoredTable(
+                "unknown entry type id",
+            ));
+        }
+    };
+    if encoded.len() != expected_len {
+        return Err(IndexTableError::MalformedStoredTable(
+            "entry has invalid encoded length",
+        ));
+    }
+    Ok(())
 }
 
 fn validate_table_identity(first_block: u64, table_size: u64) -> Result<(), IndexTableError> {
@@ -658,14 +845,31 @@ mod tests {
         expected_system_address[19] = 0xfe;
         assert_eq!(SYSTEM_ADDRESS, Address::from(expected_system_address));
         assert_eq!(INDEX_CONTRACT_ADDRESS, None);
+        assert_eq!(INDEX_CONTRACT_GAS_LIMIT, 30_000_000);
+    }
+
+    #[test]
+    fn index_contract_calldata_uses_three_big_endian_words() {
+        let root = repeated_hash(0xab);
+        let calldata = index_contract_calldata(0x0102_0304_0506_0708, 0x1112_1314_1516_1718, root);
+
+        assert_eq!(calldata.len(), 96);
+        assert_eq!(&calldata[..24], &[0; 24]);
+        assert_eq!(&calldata[24..32], &0x0102_0304_0506_0708u64.to_be_bytes());
+        assert_eq!(&calldata[32..56], &[0; 24]);
+        assert_eq!(&calldata[56..64], &0x1112_1314_1516_1718u64.to_be_bytes());
+        assert_eq!(&calldata[64..], root.as_bytes());
     }
 
     #[test]
     fn activation_uses_the_dedicated_timestamp() {
-        let mut config = crate::types::ChainConfig::default();
+        let config = crate::types::ChainConfig::default();
         assert!(!config.is_eip8304_activated(u64::MAX));
 
-        config.eip8304_time = Some(100);
+        let config = crate::types::ChainConfig {
+            eip8304_time: Some(100),
+            ..Default::default()
+        };
         assert!(!config.is_eip8304_activated(99));
         assert!(config.is_eip8304_activated(100));
         assert!(config.is_eip8304_activated(101));
@@ -1095,6 +1299,36 @@ mod tests {
                 first_block: 3,
                 table_size: 4,
             })
+        );
+    }
+
+    #[test]
+    fn persisted_table_round_trips_and_detects_corruption() {
+        let table = IndexTable::new(
+            4,
+            1,
+            vec![
+                IndexEntry::Block {
+                    block_hash: repeated_hash(0x42),
+                    block_number: 3,
+                },
+                IndexEntry::LogAddress {
+                    address: Address::repeat_byte(0x24),
+                    block_number: 4,
+                    transaction_index: 1,
+                    log_index: 2,
+                },
+            ],
+        )
+        .unwrap();
+        let encoded = table.encode_storage();
+        assert_eq!(IndexTable::decode_storage(&encoded).unwrap(), table);
+
+        let mut corrupt = encoded;
+        *corrupt.last_mut().unwrap() ^= 1;
+        assert_eq!(
+            IndexTable::decode_storage(&corrupt),
+            Err(IndexTableError::StoredTableRootMismatch)
         );
     }
 }
