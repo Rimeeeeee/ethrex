@@ -31,7 +31,7 @@ use ethrex_common::{
         Receipt, Transaction,
         block_access_list::BlockAccessList,
         block_execution_witness::{ExecutionWitness, RpcExecutionWitness},
-        eip8304::{IndexTable, TABLE_SIZES},
+        eip8304::{INDEX_CONTRACT_ADDRESS, IndexTable, TABLE_SIZES},
     },
     utils::keccak,
 };
@@ -2934,6 +2934,7 @@ impl Store {
         genesis: Genesis,
         skip_genesis_validation: bool,
     ) -> Result<(), StoreError> {
+        validate_eip8304_genesis_configuration(&genesis, INDEX_CONTRACT_ADDRESS)?;
         debug!("Storing initial state from genesis");
 
         // Obtain genesis block
@@ -4624,6 +4625,32 @@ impl Store {
         }
         Ok(())
     }
+}
+
+/// Reject EIP-8304 configurations that cannot produce the consensus transition
+/// promised by their fork schedule. The draft has no deployment address yet,
+/// and ethrex does not currently synthesize the block-zero table into genesis
+/// state, so both cases must fail explicitly rather than creating a partially
+/// indexed chain.
+fn validate_eip8304_genesis_configuration(
+    genesis: &Genesis,
+    contract_address: Option<Address>,
+) -> Result<(), StoreError> {
+    let Some(activation_time) = genesis.config.eip8304_time else {
+        return Ok(());
+    };
+    if contract_address.is_none() {
+        return Err(StoreError::Custom(
+            "EIP-8304 is scheduled but INDEX_CONTRACT_ADDRESS is unresolved".to_string(),
+        ));
+    }
+    if activation_time <= genesis.timestamp {
+        return Err(StoreError::Custom(
+            "EIP-8304 activation at genesis is unsupported until the block-zero table is initialized in genesis state"
+                .to_string(),
+        ));
+    }
+    Ok(())
 }
 
 /// Writes the `flushed_upto` block number into an open write batch.
@@ -6799,6 +6826,38 @@ mod index_table_tests {
         let dir = tempfile::tempdir().unwrap();
         // The in-memory backend does not retain the path; keep creation local.
         Store::new(dir.path(), EngineType::InMemory).unwrap()
+    }
+
+    #[test]
+    fn rejects_unresolved_and_genesis_active_eip8304_schedules() {
+        let future_activation = Genesis {
+            timestamp: 100,
+            config: ChainConfig {
+                eip8304_time: Some(101),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let error = validate_eip8304_genesis_configuration(&future_activation, None)
+            .expect_err("an unresolved consensus address must fail closed");
+        assert!(error.to_string().contains("INDEX_CONTRACT_ADDRESS"));
+
+        let genesis_activation = Genesis {
+            timestamp: 100,
+            config: ChainConfig {
+                eip8304_time: Some(100),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let stand_in_address = Address::from_low_u64_be(0x8304);
+        let error =
+            validate_eip8304_genesis_configuration(&genesis_activation, Some(stand_in_address))
+                .expect_err("block zero has no EIP-8304 initialization path yet");
+        assert!(error.to_string().contains("activation at genesis"));
+
+        validate_eip8304_genesis_configuration(&future_activation, Some(stand_in_address))
+            .expect("a finalized address and post-genesis activation are supported");
     }
 
     #[test]

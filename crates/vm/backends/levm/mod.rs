@@ -3379,13 +3379,41 @@ impl LEVM {
         vm_type: VMType,
         crypto: &dyn Crypto,
     ) -> Result<Vec<IndexTable>, EvmError> {
-        if matches!(vm_type, VMType::L2(_)) {
-            return Ok(Vec::new());
-        }
+        Self::process_eip8304_tables_at(
+            INDEX_CONTRACT_ADDRESS,
+            block,
+            receipts,
+            db,
+            vm_type,
+            crypto,
+        )
+    }
+
+    /// Testable EIP-8304 processing path with an explicitly supplied deployment
+    /// address. Production passes the consensus constant, which intentionally
+    /// fails closed while the draft EIP leaves that constant unresolved.
+    fn process_eip8304_tables_at(
+        contract_address: Option<Address>,
+        block: &Block,
+        receipts: &[Receipt],
+        db: &mut GeneralizedDatabase,
+        vm_type: VMType,
+        crypto: &dyn Crypto,
+    ) -> Result<Vec<IndexTable>, EvmError> {
         let chain_config = db.store.get_chain_config()?;
         if !chain_config.is_eip8304_activated(block.header.timestamp) {
             return Ok(Vec::new());
         }
+        if matches!(vm_type, VMType::L2(_)) {
+            return Err(EvmError::InvalidEVM(
+                "EIP-8304 is configured on an L2 execution environment".to_string(),
+            ));
+        }
+        let contract_address = contract_address.ok_or_else(|| {
+            EvmError::InvalidEVM(
+                "EIP-8304 is active but INDEX_CONTRACT_ADDRESS is unresolved".to_string(),
+            )
+        })?;
 
         let current_table = IndexTable::from_block(block, receipts, crypto)
             .map_err(|error| EvmError::Custom(error.to_string()))?;
@@ -3414,7 +3442,14 @@ impl LEVM {
                 table
             };
 
-            Self::index_contract_call(&block.header, &table, db, vm_type, crypto)?;
+            Self::index_contract_call_at(
+                Some(contract_address),
+                &block.header,
+                &table,
+                db,
+                vm_type,
+                crypto,
+            )?;
             tables.push(table);
         }
 
@@ -3423,9 +3458,10 @@ impl LEVM {
 
     /// Apply one EIP-8304 `set(first_block, table_size, table_root)` call.
     ///
-    /// Until the EIP finalizes `INDEX_CONTRACT_ADDRESS`, this is a deliberate
-    /// no-op. Once set, an address with no code also succeeds silently as
-    /// required by the EIP.
+    /// Until the EIP finalizes `INDEX_CONTRACT_ADDRESS`, activation fails closed
+    /// instead of silently producing blocks without the required commitment.
+    /// Once set, an address with no code still succeeds silently as required by
+    /// the EIP.
     pub fn index_contract_call(
         block_header: &BlockHeader,
         table: &IndexTable,
@@ -3433,8 +3469,13 @@ impl LEVM {
         vm_type: VMType,
         crypto: &dyn Crypto,
     ) -> Result<(), EvmError> {
+        let contract_address = INDEX_CONTRACT_ADDRESS.ok_or_else(|| {
+            EvmError::InvalidEVM(
+                "EIP-8304 is active but INDEX_CONTRACT_ADDRESS is unresolved".to_string(),
+            )
+        })?;
         Self::index_contract_call_at(
-            INDEX_CONTRACT_ADDRESS,
+            Some(contract_address),
             block_header,
             table,
             db,
@@ -3480,14 +3521,19 @@ impl LEVM {
 
     /// Install the published EIP-8304 index-contract runtime with nonce 1.
     ///
-    /// This hook is deliberately dormant while `INDEX_CONTRACT_ADDRESS` is
-    /// unresolved. Once the EIP assigns it, both importer and payload builder
-    /// already execute the same idempotent activation transition.
+    /// This hook fails closed while `INDEX_CONTRACT_ADDRESS` is unresolved.
+    /// Once the EIP assigns it, both importer and payload builder execute the
+    /// same idempotent activation transition.
     pub fn install_index_contract_code(
         db: &mut GeneralizedDatabase,
         crypto: &dyn Crypto,
     ) -> Result<(), EvmError> {
-        Self::install_index_contract_code_at(INDEX_CONTRACT_ADDRESS, db, crypto)
+        let contract_address = INDEX_CONTRACT_ADDRESS.ok_or_else(|| {
+            EvmError::InvalidEVM(
+                "EIP-8304 is active but INDEX_CONTRACT_ADDRESS is unresolved".to_string(),
+            )
+        })?;
+        Self::install_index_contract_code_at(Some(contract_address), db, crypto)
     }
 
     fn install_index_contract_code_at(
@@ -4729,8 +4775,8 @@ mod bal_tests {
 mod eip8304_contract_tests {
     use super::*;
     use ethrex_common::types::{
-        AccountState, ChainConfig, CodeMetadata,
-        eip8304::{IndexEntry, TABLES_PER_LEVEL},
+        AccountState, BlockBody, ChainConfig, CodeMetadata,
+        eip8304::{IndexEntry, TABLE_SIZES, TABLES_PER_LEVEL},
     };
     use ethrex_crypto::NativeCrypto;
     use ethrex_levm::{db::Database, errors::DatabaseError};
@@ -4777,9 +4823,13 @@ mod eip8304_contract_tests {
     }
 
     fn table(first_block: u64, marker: u8) -> IndexTable {
+        sized_table(first_block, 1, marker)
+    }
+
+    fn sized_table(first_block: u64, table_size: u64, marker: u8) -> IndexTable {
         IndexTable::new(
             first_block,
-            1,
+            table_size,
             vec![IndexEntry::Block {
                 block_hash: H256::repeat_byte(marker),
                 block_number: first_block.saturating_sub(1),
@@ -4798,8 +4848,39 @@ mod eip8304_contract_tests {
             .unwrap_or_default()
     }
 
+    fn get_calldata(first_block: u64, table_size: u64) -> Bytes {
+        let mut calldata = [0u8; 64];
+        calldata[24..32].copy_from_slice(&first_block.to_be_bytes());
+        calldata[56..64].copy_from_slice(&table_size.to_be_bytes());
+        Bytes::copy_from_slice(&calldata)
+    }
+
+    fn index_contract_get(
+        db: &mut GeneralizedDatabase,
+        address: Address,
+        block_number: u64,
+        calldata: Bytes,
+    ) -> ExecutionReport {
+        let header = BlockHeader {
+            number: block_number,
+            timestamp: block_number.saturating_add(1),
+            gas_limit: INDEX_CONTRACT_GAS_LIMIT,
+            ..Default::default()
+        };
+        generic_system_contract_levm(
+            &header,
+            calldata,
+            db,
+            address,
+            Address::zero(),
+            VMType::L1,
+            &NativeCrypto,
+        )
+        .unwrap()
+    }
+
     #[test]
-    fn dormant_deployment_sets_nonce_one_and_has_builder_importer_parity() {
+    fn injected_deployment_sets_nonce_one_and_has_builder_importer_parity() {
         let address = Address::from_low_u64_be(0x8304);
         let mut builder_db = active_db();
         let mut importer_db = active_db();
@@ -4876,6 +4957,53 @@ mod eip8304_contract_tests {
     }
 
     #[test]
+    fn system_calls_store_and_get_every_protocol_table_level() {
+        let address = Address::from_low_u64_be(0x8304);
+        let mut db = active_db();
+        LEVM::install_index_contract_code_at(Some(address), &mut db, &NativeCrypto).unwrap();
+
+        for (level, table_size) in TABLE_SIZES.iter().copied().enumerate() {
+            let first_block = table_size * 3;
+            let table = sized_table(first_block, table_size, level as u8 + 1);
+            let commit_block = if level == 0 {
+                first_block
+            } else {
+                first_block + table_size - 1 + table_size / 4
+            };
+            let header = BlockHeader {
+                number: commit_block,
+                timestamp: commit_block + 1,
+                gas_limit: INDEX_CONTRACT_GAS_LIMIT,
+                ..Default::default()
+            };
+            LEVM::index_contract_call_at(
+                Some(address),
+                &header,
+                &table,
+                &mut db,
+                VMType::L1,
+                &NativeCrypto,
+            )
+            .unwrap();
+
+            let slot =
+                table_size * TABLES_PER_LEVEL + (first_block / table_size) % TABLES_PER_LEVEL;
+            assert_eq!(
+                storage_root_value(&mut db, address, slot),
+                U256::from_big_endian(table.table_root().as_bytes())
+            );
+            let get = index_contract_get(
+                &mut db,
+                address,
+                commit_block + 1,
+                get_calldata(first_block, table_size),
+            );
+            assert!(matches!(get.result, TxResult::Success));
+            assert_eq!(get.output.as_ref(), table.table_root().as_bytes());
+        }
+    }
+
+    #[test]
     fn missing_index_contract_code_succeeds_silently() {
         let address = Address::from_low_u64_be(0x8304);
         let mut db = active_db();
@@ -4895,6 +5023,168 @@ mod eip8304_contract_tests {
         )
         .unwrap();
         assert!(db.get_account(address).unwrap().storage.is_empty());
+    }
+
+    #[test]
+    fn active_eip8304_fails_closed_without_a_consensus_address_or_on_l2() {
+        let block = Block {
+            header: BlockHeader {
+                number: 2,
+                timestamp: 1,
+                ..Default::default()
+            },
+            body: BlockBody::empty(),
+        };
+
+        let error =
+            LEVM::process_eip8304_tables(&block, &[], &mut active_db(), VMType::L1, &NativeCrypto)
+                .expect_err("the draft address must not degrade into a consensus no-op");
+        assert!(error.to_string().contains("INDEX_CONTRACT_ADDRESS"));
+
+        let error = LEVM::install_index_contract_code(&mut active_db(), &NativeCrypto)
+            .expect_err("deployment must also fail closed while its address is unresolved");
+        assert!(error.to_string().contains("INDEX_CONTRACT_ADDRESS"));
+
+        let error = LEVM::process_eip8304_tables_at(
+            Some(Address::from_low_u64_be(0x8304)),
+            &block,
+            &[],
+            &mut active_db(),
+            VMType::L2(Default::default()),
+            &NativeCrypto,
+        )
+        .expect_err("an L2 chain must not silently ignore an active L1 EIP");
+        assert!(error.to_string().contains("L2 execution environment"));
+    }
+
+    #[test]
+    fn injected_processing_builds_and_commits_the_current_block_table() {
+        let address = Address::from_low_u64_be(0x8304);
+        let block = Block {
+            header: BlockHeader {
+                number: 2,
+                timestamp: 1,
+                parent_hash: H256::repeat_byte(0x42),
+                gas_limit: INDEX_CONTRACT_GAS_LIMIT,
+                ..Default::default()
+            },
+            body: BlockBody::empty(),
+        };
+        let mut builder_db = active_db();
+        let mut importer_db = active_db();
+        LEVM::install_index_contract_code_at(Some(address), &mut builder_db, &NativeCrypto)
+            .unwrap();
+        LEVM::install_index_contract_code_at(Some(address), &mut importer_db, &NativeCrypto)
+            .unwrap();
+
+        let builder_tables = LEVM::process_eip8304_tables_at(
+            Some(address),
+            &block,
+            &[],
+            &mut builder_db,
+            VMType::L1,
+            &NativeCrypto,
+        )
+        .unwrap();
+        let importer_tables = LEVM::process_eip8304_tables_at(
+            Some(address),
+            &block,
+            &[],
+            &mut importer_db,
+            VMType::L1,
+            &NativeCrypto,
+        )
+        .unwrap();
+
+        assert_eq!(builder_tables, importer_tables);
+        assert_eq!(builder_tables.len(), 1);
+        let current = &builder_tables[0];
+        assert_eq!(current.first_block(), block.header.number);
+        assert_eq!(current.table_size(), 1);
+        assert_eq!(current.entry_count(), 1);
+        let slot = TABLES_PER_LEVEL + block.header.number;
+        let expected = U256::from_big_endian(current.table_root().as_bytes());
+        assert_eq!(storage_root_value(&mut builder_db, address, slot), expected);
+        assert_eq!(
+            storage_root_value(&mut importer_db, address, slot),
+            expected
+        );
+        assert_eq!(
+            LEVM::get_state_transitions(&mut builder_db).unwrap(),
+            LEVM::get_state_transitions(&mut importer_db).unwrap()
+        );
+    }
+
+    #[test]
+    fn index_contract_get_validates_shape_alignment_presence_and_retention() {
+        let address = Address::from_low_u64_be(0x8304);
+        let mut db = active_db();
+        LEVM::install_index_contract_code_at(Some(address), &mut db, &NativeCrypto).unwrap();
+
+        let first = table(0, 0x11);
+        let header = BlockHeader {
+            number: 0,
+            timestamp: 1,
+            gas_limit: INDEX_CONTRACT_GAS_LIMIT,
+            ..Default::default()
+        };
+        LEVM::index_contract_call_at(
+            Some(address),
+            &header,
+            &first,
+            &mut db,
+            VMType::L1,
+            &NativeCrypto,
+        )
+        .unwrap();
+
+        // The root is written after block 0 transactions, so its first possible
+        // `get` is during block 1 execution.
+        let valid = index_contract_get(&mut db, address, 1, get_calldata(0, 1));
+        assert!(matches!(valid.result, TxResult::Success));
+        assert_eq!(valid.output.as_ref(), first.table_root().as_bytes());
+
+        for invalid_calldata in [
+            Bytes::from(vec![0u8; 63]),
+            get_calldata(1, 4),
+            get_calldata(0, 2),
+            get_calldata(0, 4),
+        ] {
+            let report = index_contract_get(&mut db, address, 1, invalid_calldata);
+            assert!(matches!(report.result, TxResult::Revert(_)));
+        }
+
+        let expired =
+            index_contract_get(&mut db, address, TABLES_PER_LEVEL + 1, get_calldata(0, 1));
+        assert!(matches!(expired.result, TxResult::Revert(_)));
+
+        let replacement = table(TABLES_PER_LEVEL, 0x22);
+        let replacement_header = BlockHeader {
+            number: TABLES_PER_LEVEL,
+            timestamp: TABLES_PER_LEVEL + 1,
+            gas_limit: INDEX_CONTRACT_GAS_LIMIT,
+            ..Default::default()
+        };
+        LEVM::index_contract_call_at(
+            Some(address),
+            &replacement_header,
+            &replacement,
+            &mut db,
+            VMType::L1,
+            &NativeCrypto,
+        )
+        .unwrap();
+        let valid_replacement = index_contract_get(
+            &mut db,
+            address,
+            TABLES_PER_LEVEL + 1,
+            get_calldata(TABLES_PER_LEVEL, 1),
+        );
+        assert!(matches!(valid_replacement.result, TxResult::Success));
+        assert_eq!(
+            valid_replacement.output.as_ref(),
+            replacement.table_root().as_bytes()
+        );
     }
 }
 

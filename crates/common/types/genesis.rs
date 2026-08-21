@@ -336,7 +336,9 @@ pub struct ChainConfig {
     ///
     /// The EIP is still a draft without a finalized fork assignment or index
     /// contract address, so it is independently scheduled rather than tied to
-    /// the current latest fork. `None` keeps EIP-8304 disabled.
+    /// the current latest fork. `None` keeps EIP-8304 disabled; scheduling it
+    /// while the consensus contract address is unresolved is rejected when the
+    /// genesis configuration is installed.
     #[serde(default)]
     pub eip8304_time: Option<u64>,
 

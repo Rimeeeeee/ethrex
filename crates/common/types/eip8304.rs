@@ -1,8 +1,9 @@
 //! Construction, hashing, merging, and scheduling for EIP-8304 index tables.
 //!
 //! The VM integration consumes the constants and calldata helper in this module.
-//! [`INDEX_CONTRACT_ADDRESS`] remains explicitly unset until the EIP assigns it,
-//! so the complete execution path stays dormant without a placeholder address.
+//! [`INDEX_CONTRACT_ADDRESS`] remains explicitly unset until the EIP assigns it.
+//! Activation fails closed rather than accepting blocks without the required
+//! consensus-state commitment.
 
 use crate::{
     Address, H256,
@@ -1132,6 +1133,46 @@ mod tests {
         assert_eq!(
             calculate_table_root(&[entry, second_entry]),
             H256(Sha2Hasher.hash(&root_preimage))
+        );
+    }
+
+    #[test]
+    fn table_root_matches_independently_calculated_three_entry_vector() {
+        // Independently calculated from the three canonical byte encodings by:
+        // SHA-256 hashing each entry, padding the three-leaf tree with one zero
+        // Hash32, merkleizing, and SHA-256 mixing in the 32-byte LE length 3.
+        // Keeping the expected root opaque avoids testing the SSZ helper against
+        // another invocation of itself.
+        let table = IndexTable::new(
+            8,
+            1,
+            vec![
+                IndexEntry::Block {
+                    block_hash: repeated_hash(0x11),
+                    block_number: 7,
+                },
+                IndexEntry::Transaction {
+                    transaction_hash: repeated_hash(0x22),
+                    block_number: 8,
+                    transaction_index: 2,
+                    cumulative_log_count: 3,
+                },
+                IndexEntry::LogAddress {
+                    address: Address::repeat_byte(0x33),
+                    block_number: 8,
+                    transaction_index: 2,
+                    log_index: 1,
+                },
+            ],
+        )
+        .unwrap();
+
+        assert_eq!(
+            table.table_root(),
+            H256::from_slice(
+                &hex::decode("cf86077fe1856d18b8d2568bddc1ab6fb1c603b480e4e4469ebf4606b35f3c40")
+                    .unwrap()
+            )
         );
     }
 
