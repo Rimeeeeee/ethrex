@@ -105,8 +105,9 @@ pub const AMSTERDAM_REQUEST_PREDEPLOYS: [SystemContract; 2] = [
 ];
 
 /// EIP-8304 index-contract runtime assembled verbatim from the EIP's published
-/// `get`/`set` EVM assembly. The deployment address remains intentionally
-/// separate and unset until the EIP replaces `INDEX_CONTRACT_ADDRESS = <TBD>`.
+/// `get`/`set` EVM assembly. The deployment address remains a separate constant;
+/// the combined devnet assigns it an experimental value while the EIP's
+/// canonical `INDEX_CONTRACT_ADDRESS` is still `<TBD>`.
 ///
 /// The two jump destinations encoded by the assembly are byte offsets `0x5c`
 /// (revert) and `0x60` (SYSTEM_ADDRESS-only `set`).

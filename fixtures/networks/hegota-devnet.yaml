@@ -1,4 +1,5 @@
-# Hegotá devnet — frame-transaction EIPs on one ethrex binary.
+# Hegotá devnet — frame transactions, EIP-8312 UTXOs and the experimental
+# EIP-8304 log/transaction index on one ethrex binary.
 #
 # Scope (first bring-up): EIP-8141 (frame txs) + EIP-8250 (keyed nonces) +
 # EIP-8272 (recent roots) + EIP-7906 (tx assertions). NO `--features eip-8025`
@@ -21,26 +22,27 @@
 participants:
   - el_type: ethrex
     el_image: ethrex:local
-    el_extra_params: ["--syncmode", "full", "--mempool.max-verify-gas", "500000"]
+    el_extra_params: ["--syncmode", "full", "--mempool.max-verify-gas", "500000", "--http.api", "eth,net,web3,debug,ethrex"]
     cl_type: lighthouse
     cl_image: ethpandaops/lighthouse:glamsterdam-devnet-7
     validator_count: 32
     supernode: true
   - el_type: ethrex
     el_image: ethrex:local
-    el_extra_params: ["--syncmode", "full", "--mempool.max-verify-gas", "500000"]
+    el_extra_params: ["--syncmode", "full", "--mempool.max-verify-gas", "500000", "--http.api", "eth,net,web3,debug,ethrex"]
     cl_type: lighthouse
     cl_image: ethpandaops/lighthouse:glamsterdam-devnet-7
     validator_count: 32
   - el_type: ethrex
     el_image: ethrex:local
-    el_extra_params: ["--syncmode", "full", "--mempool.max-verify-gas", "500000"]
+    el_extra_params: ["--syncmode", "full", "--mempool.max-verify-gas", "500000", "--http.api", "eth,net,web3,debug,ethrex"]
     cl_type: lighthouse
     cl_image: ethpandaops/lighthouse:glamsterdam-devnet-7
     validator_count: 32
 
 network_params:
-  seconds_per_slot: 6
+  seconds_per_slot: 3
+  slot_duration_ms: 3000
   # Osaka/Fulu from genesis.
   fulu_fork_epoch: 0
   # Amsterdam/Gloas at epoch 1. Hegotá is defined on top of Amsterdam, so
@@ -74,6 +76,14 @@ network_params:
   # sets from init code and a preloaded runtime image would otherwise leave zero;
   # the first end-of-block system call clears it.
   additional_preloaded_contracts:
+    # The paired wallet benchmark alternates between these two disposable
+    # devnet-only emitters. Put the EOA balances in the alloc overlay because
+    # generator 6.1.4's values.env loses all but one entry when a multi-account
+    # `prefunded_accounts` JSON object is sourced by bash.
+    "0x2353E650094Cdae828Ed2A3bc2503dE9123bE5E1":
+      balance: "100000000000000000000"
+    "0x8B54b45663B4aF65d51D7F98C20f533965E0a013":
+      balance: "100000000000000000000"
     "0x0000BFF46984E3725691FA540A8C7589300D8282":
       balance: "0"
       nonce: "1"

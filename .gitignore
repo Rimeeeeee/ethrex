@@ -90,6 +90,10 @@ openspec/
 dev_ethrex_l1/
 dev_ethrex_l2/
 
+# Local EIP-8304 / UTXO development environments
+/scripts/hegota-devnet/.venv/
+/scripts/hegota-devnet/.orbit-git-backup/
+
 # Logs
 logs/
 

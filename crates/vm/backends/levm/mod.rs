@@ -3458,10 +3458,10 @@ impl LEVM {
 
     /// Apply one EIP-8304 `set(first_block, table_size, table_root)` call.
     ///
-    /// Until the EIP finalizes `INDEX_CONTRACT_ADDRESS`, activation fails closed
-    /// instead of silently producing blocks without the required commitment.
-    /// Once set, an address with no code still succeeds silently as required by
-    /// the EIP.
+    /// A build with no `INDEX_CONTRACT_ADDRESS` fails closed instead of silently
+    /// producing blocks without the required commitment. The combined devnet
+    /// uses an explicitly experimental address. An address with no code still
+    /// succeeds silently as required by the EIP.
     pub fn index_contract_call(
         block_header: &BlockHeader,
         table: &IndexTable,
@@ -3521,9 +3521,9 @@ impl LEVM {
 
     /// Install the published EIP-8304 index-contract runtime with nonce 1.
     ///
-    /// This hook fails closed while `INDEX_CONTRACT_ADDRESS` is unresolved.
-    /// Once the EIP assigns it, both importer and payload builder execute the
-    /// same idempotent activation transition.
+    /// This hook fails closed when `INDEX_CONTRACT_ADDRESS` is unresolved. Both
+    /// importer and payload builder execute the same idempotent activation
+    /// transition for the combined devnet's experimental address.
     pub fn install_index_contract_code(
         db: &mut GeneralizedDatabase,
         crypto: &dyn Crypto,
@@ -5026,7 +5026,7 @@ mod eip8304_contract_tests {
     }
 
     #[test]
-    fn active_eip8304_fails_closed_without_a_consensus_address_or_on_l2() {
+    fn active_eip8304_fails_closed_without_an_address_or_on_l2() {
         let block = Block {
             header: BlockHeader {
                 number: 2,
@@ -5036,13 +5036,15 @@ mod eip8304_contract_tests {
             body: BlockBody::empty(),
         };
 
-        let error =
-            LEVM::process_eip8304_tables(&block, &[], &mut active_db(), VMType::L1, &NativeCrypto)
-                .expect_err("the draft address must not degrade into a consensus no-op");
-        assert!(error.to_string().contains("INDEX_CONTRACT_ADDRESS"));
-
-        let error = LEVM::install_index_contract_code(&mut active_db(), &NativeCrypto)
-            .expect_err("deployment must also fail closed while its address is unresolved");
+        let error = LEVM::process_eip8304_tables_at(
+            None,
+            &block,
+            &[],
+            &mut active_db(),
+            VMType::L1,
+            &NativeCrypto,
+        )
+        .expect_err("an unresolved address must not degrade into a consensus no-op");
         assert!(error.to_string().contains("INDEX_CONTRACT_ADDRESS"));
 
         let error = LEVM::process_eip8304_tables_at(

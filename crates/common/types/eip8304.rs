@@ -1,13 +1,13 @@
 //! Construction, hashing, merging, and scheduling for EIP-8304 index tables.
 //!
 //! The VM integration consumes the constants and calldata helper in this module.
-//! [`INDEX_CONTRACT_ADDRESS`] remains explicitly unset until the EIP assigns it.
-//! Activation fails closed rather than accepting blocks without the required
-//! consensus-state commitment.
+//! This devnet branch assigns [`INDEX_CONTRACT_ADDRESS`] an explicitly
+//! experimental address so EIP-8304 can be exercised end to end. The address is
+//! not canonical and must not be reused by production networks.
 
 use crate::{
     Address, H256,
-    types::{Block, Receipt},
+    types::{Block, Log, Receipt},
 };
 use ethrex_crypto::Crypto;
 use libssz_merkle::{Sha2Hasher, Sha256Hasher, merkleize, mix_in_length};
@@ -25,18 +25,28 @@ pub const INDEX_CONTRACT_GAS_LIMIT: u64 = 30_000_000;
 pub const MAX_TOPICS_PER_LOG: usize = 4;
 
 /// Local-storage encoding version for [`IndexTable`].
-const INDEX_TABLE_STORAGE_VERSION: u8 = 1;
+const INDEX_TABLE_STORAGE_VERSION: u8 = 2;
+
+/// Domain separator for the experimental full-log commitment entry.
+///
+/// The extension deliberately uses a fixed-width, unambiguous preimage instead
+/// of the JSON representation returned by RPC. This keeps node and wallet
+/// verification independent of serialization details.
+pub const LOG_COMMITMENT_DOMAIN: &[u8] = b"EIP8304_LOG_V1";
 
 /// System caller used for EIP-8304 index-contract updates.
 pub use crate::constants::SYSTEM_ADDRESS;
 
-/// EIP-8304 has not assigned the index contract an address yet.
+/// Experimental EIP-8304 index-contract address used only by the combined
+/// EIP-8304 + EIP-8312 devnet.
 ///
-/// Keeping the unresolved value explicit prevents an experimental placeholder
-/// from accidentally becoming a consensus constant. Change this to a concrete
-/// `Address` once the EIP finalizes `INDEX_CONTRACT_ADDRESS`.
-/// This is to be replaced with the actual address once it is finalized in the EIP-8304 specification.
-pub const INDEX_CONTRACT_ADDRESS: Option<Address> = None;
+/// The draft EIP still leaves `INDEX_CONTRACT_ADDRESS` unresolved. Keeping this
+/// address visually tied to the EIP number makes devnet inspection convenient,
+/// but it is not a proposal for the eventual mainnet constant.
+pub const INDEX_CONTRACT_ADDRESS: Option<Address> = Some(crate::H160([
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x83, 0x04,
+]));
 
 /// Build the 96-byte calldata for the index contract's `set` operation.
 ///
@@ -61,6 +71,9 @@ pub enum IndexEntryType {
     LogTopic1 = 4,
     LogTopic2 = 5,
     LogTopic3 = 6,
+    /// Experimental extension that binds the complete log payload while
+    /// retaining EIP-8304's content index for discovery.
+    LogCommitment = 7,
 }
 
 /// A typed EIP-8304 index entry before canonical binary encoding.
@@ -106,6 +119,12 @@ pub enum IndexEntry {
         transaction_index: u32,
         log_index: u32,
     },
+    LogCommitment {
+        log_root: H256,
+        block_number: u64,
+        transaction_index: u32,
+        log_index: u32,
+    },
 }
 
 impl IndexEntry {
@@ -118,6 +137,7 @@ impl IndexEntry {
             Self::LogTopic1 { .. } => IndexEntryType::LogTopic1,
             Self::LogTopic2 { .. } => IndexEntryType::LogTopic2,
             Self::LogTopic3 { .. } => IndexEntryType::LogTopic3,
+            Self::LogCommitment { .. } => IndexEntryType::LogCommitment,
         }
     }
 
@@ -130,7 +150,8 @@ impl IndexEntry {
             | Self::LogTopic0 { .. }
             | Self::LogTopic1 { .. }
             | Self::LogTopic2 { .. }
-            | Self::LogTopic3 { .. } => 50,
+            | Self::LogTopic3 { .. }
+            | Self::LogCommitment { .. } => 50,
         }
     }
 
@@ -200,11 +221,43 @@ impl IndexEntry {
                 encoded.extend_from_slice(topic.as_bytes());
                 append_position(&mut encoded, *block_number, *transaction_index, *log_index);
             }
+            Self::LogCommitment {
+                log_root,
+                block_number,
+                transaction_index,
+                log_index,
+            } => {
+                encoded.extend_from_slice(log_root.as_bytes());
+                append_position(&mut encoded, *block_number, *transaction_index, *log_index);
+            }
         }
 
         debug_assert_eq!(encoded.len(), self.encoded_len());
         EncodedIndexEntry(encoded)
     }
+}
+
+/// Commit to one complete EVM log using an unambiguous canonical preimage:
+///
+/// `SHA256(domain || address || topic_count || topics || data_length || data)`.
+///
+/// Topic count is one byte because the EVM permits at most four topics and data
+/// length is an eight-byte big-endian integer. The table stores only this root;
+/// an RPC server can return the selected raw log and a wallet can verify it
+/// without downloading the containing receipt.
+pub fn log_commitment(log: &Log) -> H256 {
+    let mut preimage = Vec::with_capacity(
+        LOG_COMMITMENT_DOMAIN.len() + 20 + 1 + log.topics.len() * 32 + 8 + log.data.len(),
+    );
+    preimage.extend_from_slice(LOG_COMMITMENT_DOMAIN);
+    preimage.extend_from_slice(log.address.as_bytes());
+    preimage.push(log.topics.len() as u8);
+    for topic in &log.topics {
+        preimage.extend_from_slice(topic.as_bytes());
+    }
+    preimage.extend_from_slice(&(log.data.len() as u64).to_be_bytes());
+    preimage.extend_from_slice(&log.data);
+    H256(Sha2Hasher.hash(&preimage))
 }
 
 fn append_position(
@@ -397,6 +450,12 @@ impl IndexTable {
                     };
                     entries.push(topic_entry);
                 }
+                entries.push(IndexEntry::LogCommitment {
+                    log_root: log_commitment(log),
+                    block_number,
+                    transaction_index,
+                    log_index,
+                });
             }
 
             let receipt_log_count = u32::try_from(receipt.logs.len())
@@ -686,7 +745,7 @@ fn validate_encoded_entry(encoded: &[u8]) -> Result<(), IndexTableError> {
     );
     let expected_len = match type_id {
         0 => 42,
-        1 | 3..=6 => 50,
+        1 | 3..=7 => 50,
         2 => 38,
         _ => {
             return Err(IndexTableError::MalformedStoredTable(
@@ -728,6 +787,70 @@ pub fn calculate_table_root(entries: &[EncodedIndexEntry]) -> H256 {
         .collect();
     let merkle_root = merkleize(&Sha2Hasher, &entry_hashes, Some(entry_hashes.len()));
     H256(mix_in_length(&Sha2Hasher, &merkle_root, entry_hashes.len()))
+}
+
+/// Build the SSZ Merkle branch for one encoded entry in an EIP-8304 table.
+///
+/// The returned siblings reconstruct the pre-length-mix tree root, starting at
+/// the leaf and ending immediately below that root. A verifier then mixes the
+/// table's entry count into the reconstructed root exactly as
+/// [`calculate_table_root`] does. Keeping this helper beside the root
+/// calculation prevents the devnet query RPC from inventing a second tree
+/// shape or hashing convention.
+pub fn table_entry_proof(entries: &[EncodedIndexEntry], index: usize) -> Option<Vec<H256>> {
+    table_entry_proofs(entries, &[index])?.pop()
+}
+
+/// Build SSZ Merkle branches for multiple table entries while hashing the
+/// table only once.
+pub fn table_entry_proofs(
+    entries: &[EncodedIndexEntry],
+    indices: &[usize],
+) -> Option<Vec<Vec<H256>>> {
+    if indices.iter().any(|index| *index >= entries.len()) {
+        return None;
+    }
+    if indices.is_empty() {
+        return Some(Vec::new());
+    }
+
+    let width = entries.len().next_power_of_two();
+    let mut layer: Vec<_> = entries
+        .iter()
+        .map(|entry| Sha2Hasher.hash(entry.as_bytes()))
+        .collect();
+    layer.resize(width, [0; 32]);
+    let mut layers = vec![layer.clone()];
+    while layer.len() > 1 {
+        layer = layer
+            .chunks_exact(2)
+            .map(|pair| {
+                let mut children = [0_u8; 64];
+                children[..32].copy_from_slice(&pair[0]);
+                children[32..].copy_from_slice(&pair[1]);
+                Sha2Hasher.hash(&children)
+            })
+            .collect();
+        layers.push(layer.clone());
+    }
+
+    Some(
+        indices
+            .iter()
+            .map(|index| {
+                let mut branch_index = *index;
+                layers
+                    .iter()
+                    .take(layers.len() - 1)
+                    .map(|layer| {
+                        let sibling = H256(layer[branch_index ^ 1]);
+                        branch_index /= 2;
+                        sibling
+                    })
+                    .collect()
+            })
+            .collect(),
+    )
 }
 
 /// A table whose root is due to be committed while processing `commit_block`.
@@ -845,7 +968,10 @@ mod tests {
         let mut expected_system_address = [0xff; 20];
         expected_system_address[19] = 0xfe;
         assert_eq!(SYSTEM_ADDRESS, Address::from(expected_system_address));
-        assert_eq!(INDEX_CONTRACT_ADDRESS, None);
+        assert_eq!(
+            INDEX_CONTRACT_ADDRESS,
+            Some(Address::from_low_u64_be(0x8304))
+        );
         assert_eq!(INDEX_CONTRACT_GAS_LIMIT, 30_000_000);
     }
 
@@ -1001,7 +1127,7 @@ mod tests {
 
         assert_eq!(table.first_block(), 10);
         assert_eq!(table.table_size(), 1);
-        assert_eq!(table.entry_count(), 12);
+        assert_eq!(table.entry_count(), 15);
         assert!(
             table
                 .encoded_entries()
@@ -1049,6 +1175,14 @@ mod tests {
             })
             .collect();
         assert_eq!(topic_counts, [2, 2, 1, 1]);
+        assert_eq!(
+            table
+                .encoded_entries()
+                .iter()
+                .filter(|entry| entry_type_id(entry) == IndexEntryType::LogCommitment as u16)
+                .count(),
+            3
+        );
         assert_eq!(
             table.table_root(),
             calculate_table_root(table.encoded_entries())
@@ -1174,6 +1308,42 @@ mod tests {
                     .unwrap()
             )
         );
+    }
+
+    #[test]
+    fn entry_proofs_reconstruct_the_mixed_in_table_root() {
+        for entry_count in 1..=9 {
+            let entries: Vec<_> = (0..entry_count)
+                .map(|index| {
+                    IndexEntry::LogTopic0 {
+                        topic: repeated_hash(index as u8),
+                        block_number: 12,
+                        transaction_index: index as u32,
+                        log_index: 0,
+                    }
+                    .encode()
+                })
+                .collect();
+            let root = calculate_table_root(&entries);
+
+            for index in 0..entry_count {
+                let mut node = Sha2Hasher.hash(entries[index].as_bytes());
+                let mut branch_index = index;
+                for sibling in table_entry_proof(&entries, index).unwrap() {
+                    let mut children = [0_u8; 64];
+                    if branch_index.is_multiple_of(2) {
+                        children[..32].copy_from_slice(&node);
+                        children[32..].copy_from_slice(sibling.as_bytes());
+                    } else {
+                        children[..32].copy_from_slice(sibling.as_bytes());
+                        children[32..].copy_from_slice(&node);
+                    }
+                    node = Sha2Hasher.hash(&children);
+                    branch_index /= 2;
+                }
+                assert_eq!(H256(mix_in_length(&Sha2Hasher, &node, entry_count)), root);
+            }
+        }
     }
 
     #[test]

@@ -18,7 +18,15 @@ RUN --mount=type=cache,target=/var/cache/apt,sharing=locked \
 # Force cargo to fetch git deps via the git CLI instead of libgit2. The bundled
 # libgit2 hangs on some hosts/networks inside containers; the CLI also supports
 # single-commit fetches for rev-pinned deps.
-ENV CARGO_NET_GIT_FETCH_WITH_CLI=true
+ENV CARGO_NET_GIT_FETCH_WITH_CLI=true \
+    CARGO_NET_RETRY=10
+
+# GitHub occasionally resets long recursive submodule fetches over HTTP/2 in
+# Docker Desktop. Use HTTP/1.1 and tolerate slow transfers; the cargo steps
+# below also retry the complete fetch without discarding BuildKit's git cache.
+RUN git config --system http.version HTTP/1.1 \
+    && git config --system http.lowSpeedLimit 1024 \
+    && git config --system http.lowSpeedTime 600
 
 # Install cargo-chef via prebuilt binary (cargo-binstall) — avoids ~2 min source build.
 # cargo-binstall pinned for reproducibility; bump deliberately.
@@ -52,7 +60,9 @@ RUN cargo chef prepare --recipe-path recipe.json
 
 
 # --- Builder ---
-# Cook deps first (cached unless recipe.json changes), then build the app.
+# Cook only the ethrex binary's dependency graph. Without the package/target
+# selectors cargo-chef builds every workspace member, including the unrelated
+# L2 prover stack and its deeply nested Git submodules.
 FROM chef AS builder
 
 ARG PROFILE=release
@@ -72,7 +82,13 @@ COPY --from=planner --link /ethrex/recipe.json recipe.json
 RUN --mount=type=cache,target=/usr/local/cargo/registry,sharing=locked \
     --mount=type=cache,target=/usr/local/cargo/git,sharing=locked \
     --mount=type=cache,target=/ethrex/target,id=ethrex-target-${TARGETARCH},sharing=locked \
-    cargo chef cook --profile $PROFILE --recipe-path recipe.json $BUILD_FLAGS
+    for attempt in 1 2 3; do \
+        cargo chef cook --profile "$PROFILE" --recipe-path recipe.json \
+            --package ethrex --bin ethrex $BUILD_FLAGS && break; \
+        if [ "$attempt" -eq 3 ]; then exit 1; fi; \
+        echo "cargo-chef network fetch failed (attempt $attempt/3); retrying..." >&2; \
+        sleep $((attempt * 10)); \
+    done
 
 # Fetch solc using buildx's TARGETARCH (no shell uname).
 RUN case "$TARGETARCH" in \
@@ -103,7 +119,7 @@ ENV COMPILE_CONTRACTS=true
 RUN --mount=type=cache,target=/usr/local/cargo/registry,sharing=locked \
     --mount=type=cache,target=/usr/local/cargo/git,sharing=locked \
     --mount=type=cache,target=/ethrex/target,id=ethrex-target-${TARGETARCH},sharing=locked \
-    cargo build --profile $PROFILE $BUILD_FLAGS \
+    cargo build --profile $PROFILE --package ethrex --bin ethrex $BUILD_FLAGS \
     && mkdir -p /ethrex/bin \
     && cp /ethrex/target/${PROFILE}/ethrex /ethrex/bin/ethrex
 
