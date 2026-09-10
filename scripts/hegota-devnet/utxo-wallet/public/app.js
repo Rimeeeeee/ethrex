@@ -202,7 +202,7 @@ function renderDiscovery() {
       metric("wallet RPC calls", metrics.walletRpcCalls || metrics.rpcCalls),
       metric("response bytes", Number(metrics.responseBytes || 0).toLocaleString()),
       metric(tables ? "tables loaded" : "logs returned", tables ? metrics.tablesLoaded : metrics.logsReturned),
-      metric(tables ? "receipts fetched" : "range chunks", tables ? metrics.receiptsFetched : metrics.chunks)
+      metric(tables ? "UPT records" : "range chunks", tables ? metrics.uptRecordsReturned : metrics.chunks)
     ].join("");
   }
 

@@ -121,8 +121,8 @@ pub const GAS_UTXO_INPUT: u64 = 2 * COLD_STORAGE_ACCESS_AMSTERDAM
 /// Per proof sibling: the keccak of one 64-byte interior node (2 words).
 pub const GAS_UTXO_SIBLING: u64 = KECCAK25_STATIC + 2 * KECCAK25_DYNAMIC_BASE;
 
-/// Per created UTXO output: the `UtxoCreated` log (LOG3 with 64 bytes of data).
-pub const GAS_UTXO_OUT: u64 = LOGN_STATIC + 3 * LOGN_DYNAMIC_BASE + 64 * LOGN_DYNAMIC_BYTE_BASE;
+/// Per created UTXO output: the `UtxoCreated` log (LOG4 with 32 bytes of data).
+pub const GAS_UTXO_OUT: u64 = LOGN_STATIC + 4 * LOGN_DYNAMIC_BASE + 32 * LOGN_DYNAMIC_BYTE_BASE;
 
 /// Per account output: the marginal recipient cost of a value transfer under
 /// EIP-2780, plus its EIP-7708 transfer log.
@@ -135,7 +135,7 @@ pub const GAS_UTXO_ACCOUNT_OUT: u64 =
 const _: () = assert!(GAS_UTXO_FRAME == 13_000);
 const _: () = assert!(GAS_UTXO_INPUT == 16_048);
 const _: () = assert!(GAS_UTXO_SIBLING == 42);
-const _: () = assert!(GAS_UTXO_OUT == 2_012);
+const _: () = assert!(GAS_UTXO_OUT == 2_131);
 const _: () = assert!(GAS_UTXO_ACCOUNT_OUT == 9_000);
 // ethrex-common carries copies for mempool/admission math (it cannot depend on
 // levm); assert the two agree so a repricing cannot silently diverge them.

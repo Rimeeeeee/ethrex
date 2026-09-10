@@ -7,10 +7,11 @@
 
 use crate::{
     Address, H256,
-    types::{Block, Log, Receipt},
+    types::{Block, Receipt},
 };
 use ethrex_crypto::Crypto;
 use libssz_merkle::{Sha2Hasher, Sha256Hasher, merkleize, mix_in_length};
+use std::collections::{BTreeMap, BTreeSet};
 
 /// Number of blocks covered by the index tables at each protocol level.
 pub const TABLE_SIZES: [u64; 5] = [1, 4, 16, 64, 256];
@@ -25,14 +26,7 @@ pub const INDEX_CONTRACT_GAS_LIMIT: u64 = 30_000_000;
 pub const MAX_TOPICS_PER_LOG: usize = 4;
 
 /// Local-storage encoding version for [`IndexTable`].
-const INDEX_TABLE_STORAGE_VERSION: u8 = 2;
-
-/// Domain separator for the experimental full-log commitment entry.
-///
-/// The extension deliberately uses a fixed-width, unambiguous preimage instead
-/// of the JSON representation returned by RPC. This keeps node and wallet
-/// verification independent of serialization details.
-pub const LOG_COMMITMENT_DOMAIN: &[u8] = b"EIP8304_LOG_V1";
+const INDEX_TABLE_STORAGE_VERSION: u8 = 1;
 
 /// System caller used for EIP-8304 index-contract updates.
 pub use crate::constants::SYSTEM_ADDRESS;
@@ -71,9 +65,6 @@ pub enum IndexEntryType {
     LogTopic1 = 4,
     LogTopic2 = 5,
     LogTopic3 = 6,
-    /// Experimental extension that binds the complete log payload while
-    /// retaining EIP-8304's content index for discovery.
-    LogCommitment = 7,
 }
 
 /// A typed EIP-8304 index entry before canonical binary encoding.
@@ -119,12 +110,6 @@ pub enum IndexEntry {
         transaction_index: u32,
         log_index: u32,
     },
-    LogCommitment {
-        log_root: H256,
-        block_number: u64,
-        transaction_index: u32,
-        log_index: u32,
-    },
 }
 
 impl IndexEntry {
@@ -137,7 +122,6 @@ impl IndexEntry {
             Self::LogTopic1 { .. } => IndexEntryType::LogTopic1,
             Self::LogTopic2 { .. } => IndexEntryType::LogTopic2,
             Self::LogTopic3 { .. } => IndexEntryType::LogTopic3,
-            Self::LogCommitment { .. } => IndexEntryType::LogCommitment,
         }
     }
 
@@ -150,8 +134,7 @@ impl IndexEntry {
             | Self::LogTopic0 { .. }
             | Self::LogTopic1 { .. }
             | Self::LogTopic2 { .. }
-            | Self::LogTopic3 { .. }
-            | Self::LogCommitment { .. } => 50,
+            | Self::LogTopic3 { .. } => 50,
         }
     }
 
@@ -221,43 +204,11 @@ impl IndexEntry {
                 encoded.extend_from_slice(topic.as_bytes());
                 append_position(&mut encoded, *block_number, *transaction_index, *log_index);
             }
-            Self::LogCommitment {
-                log_root,
-                block_number,
-                transaction_index,
-                log_index,
-            } => {
-                encoded.extend_from_slice(log_root.as_bytes());
-                append_position(&mut encoded, *block_number, *transaction_index, *log_index);
-            }
         }
 
         debug_assert_eq!(encoded.len(), self.encoded_len());
         EncodedIndexEntry(encoded)
     }
-}
-
-/// Commit to one complete EVM log using an unambiguous canonical preimage:
-///
-/// `SHA256(domain || address || topic_count || topics || data_length || data)`.
-///
-/// Topic count is one byte because the EVM permits at most four topics and data
-/// length is an eight-byte big-endian integer. The table stores only this root;
-/// an RPC server can return the selected raw log and a wallet can verify it
-/// without downloading the containing receipt.
-pub fn log_commitment(log: &Log) -> H256 {
-    let mut preimage = Vec::with_capacity(
-        LOG_COMMITMENT_DOMAIN.len() + 20 + 1 + log.topics.len() * 32 + 8 + log.data.len(),
-    );
-    preimage.extend_from_slice(LOG_COMMITMENT_DOMAIN);
-    preimage.extend_from_slice(log.address.as_bytes());
-    preimage.push(log.topics.len() as u8);
-    for topic in &log.topics {
-        preimage.extend_from_slice(topic.as_bytes());
-    }
-    preimage.extend_from_slice(&(log.data.len() as u64).to_be_bytes());
-    preimage.extend_from_slice(&log.data);
-    H256(Sha2Hasher.hash(&preimage))
 }
 
 fn append_position(
@@ -450,12 +401,6 @@ impl IndexTable {
                     };
                     entries.push(topic_entry);
                 }
-                entries.push(IndexEntry::LogCommitment {
-                    log_root: log_commitment(log),
-                    block_number,
-                    transaction_index,
-                    log_index,
-                });
             }
 
             let receipt_log_count = u32::try_from(receipt.logs.len())
@@ -745,7 +690,7 @@ fn validate_encoded_entry(encoded: &[u8]) -> Result<(), IndexTableError> {
     );
     let expected_len = match type_id {
         0 => 42,
-        1 | 3..=7 => 50,
+        1 | 3..=6 => 50,
         2 => 38,
         _ => {
             return Err(IndexTableError::MalformedStoredTable(
@@ -848,6 +793,71 @@ pub fn table_entry_proofs(
                         sibling
                     })
                     .collect()
+            })
+            .collect(),
+    )
+}
+
+/// One node in a minimal shared proof for several entries of the same table.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct TableProofNode {
+    pub level: usize,
+    pub node_index: usize,
+    pub hash: H256,
+}
+
+/// Construct a minimal shared proof for several entries under one EIP-8304
+/// table root. Selected sibling leaves are recomputed from their returned
+/// entries rather than repeated as proof hashes.
+pub fn table_multiproof(
+    entries: &[EncodedIndexEntry],
+    indices: &[usize],
+) -> Option<Vec<TableProofNode>> {
+    if indices.iter().any(|index| *index >= entries.len()) {
+        return None;
+    }
+    if indices.is_empty() || entries.len() <= 1 {
+        return Some(Vec::new());
+    }
+
+    let width = entries.len().next_power_of_two();
+    let mut layer = entries
+        .iter()
+        .map(|entry| H256(Sha2Hasher.hash(entry.as_bytes())))
+        .collect::<Vec<_>>();
+    layer.resize(width, H256::zero());
+    let mut layers = vec![layer.clone()];
+    while layer.len() > 1 {
+        layer = layer
+            .chunks_exact(2)
+            .map(|pair| {
+                let mut children = [0u8; 64];
+                children[..32].copy_from_slice(pair[0].as_bytes());
+                children[32..].copy_from_slice(pair[1].as_bytes());
+                H256(Sha2Hasher.hash(&children))
+            })
+            .collect();
+        layers.push(layer.clone());
+    }
+
+    let mut known = indices.iter().copied().collect::<BTreeSet<_>>();
+    let mut proof = BTreeMap::new();
+    for (level, layer) in layers.iter().take(layers.len() - 1).enumerate() {
+        for index in &known {
+            let sibling = *index ^ 1;
+            if !known.contains(&sibling) {
+                proof.insert((level, sibling), layer[sibling]);
+            }
+        }
+        known = known.into_iter().map(|index| index / 2).collect();
+    }
+    Some(
+        proof
+            .into_iter()
+            .map(|((level, node_index), hash)| TableProofNode {
+                level,
+                node_index,
+                hash,
             })
             .collect(),
     )
@@ -1127,7 +1137,7 @@ mod tests {
 
         assert_eq!(table.first_block(), 10);
         assert_eq!(table.table_size(), 1);
-        assert_eq!(table.entry_count(), 15);
+        assert_eq!(table.entry_count(), 12);
         assert!(
             table
                 .encoded_entries()
@@ -1175,14 +1185,6 @@ mod tests {
             })
             .collect();
         assert_eq!(topic_counts, [2, 2, 1, 1]);
-        assert_eq!(
-            table
-                .encoded_entries()
-                .iter()
-                .filter(|entry| entry_type_id(entry) == IndexEntryType::LogCommitment as u16)
-                .count(),
-            3
-        );
         assert_eq!(
             table.table_root(),
             calculate_table_root(table.encoded_entries())
@@ -1584,5 +1586,28 @@ mod tests {
             IndexTable::decode_storage(&corrupt),
             Err(IndexTableError::StoredTableRootMismatch)
         );
+    }
+
+    #[test]
+    fn table_multiproof_omits_selected_sibling_entries() {
+        let table = IndexTable::new(
+            4,
+            1,
+            (0..6)
+                .map(|value| IndexEntry::Transaction {
+                    transaction_hash: H256::from_low_u64_be(value),
+                    block_number: 4,
+                    transaction_index: value as u32,
+                    cumulative_log_count: 0,
+                })
+                .collect(),
+        )
+        .unwrap();
+
+        let proof = table_multiproof(table.encoded_entries(), &[0, 1, 2, 3, 4, 5]).unwrap();
+        assert_eq!(proof.len(), 1);
+        assert_eq!(proof[0].level, 1);
+        assert_eq!(proof[0].node_index, 3);
+        assert_eq!(table_multiproof(table.encoded_entries(), &[6]), None);
     }
 }

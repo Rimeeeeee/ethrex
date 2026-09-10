@@ -1,11 +1,12 @@
 //! A frame receipt must survive the block-data flush to disk.
 //!
 //! `RECEIPTS_V2` holds the internal storage codec (`Receipt::encode_storage` /
-//! `Receipt::decode_storage`), which for an EIP-8141 frame receipt carries
-//! `succeeded` and the aggregated top-level logs that the consensus layout
-//! deliberately omits. Writing the consensus layout into that table instead
-//! leaves the row undecodable, and only for frame receipts: the two codecs
-//! coincide for every other transaction type.
+//! `Receipt::decode_storage`). Its frame-receipt layout retains compatibility
+//! slots for `succeeded` and aggregate logs, but both are canonicalized from the
+//! per-frame receipts so those duplicate fields cannot drift from consensus.
+//! Writing the consensus layout into that table instead leaves the row
+//! undecodable, and only for frame receipts: the two codecs coincide for every
+//! other transaction type.
 //!
 //! Reads are served from the in-memory buffer until the block flushes, so these
 //! assertions only bite after `flush_block_data`.
@@ -27,21 +28,21 @@ fn log_at(address: Address) -> Log {
     }
 }
 
-/// A frame receipt whose every field distinguishes the storage codec from the
-/// consensus one: `succeeded` and the top-level `logs` exist only in storage.
+/// A frame receipt with aggregate fields matching its canonical frame receipts.
 fn frame_receipt() -> Receipt {
     let payer = Address::from_low_u64_be(0x8141);
+    let log = log_at(Address::from_low_u64_be(0xaaaa));
     Receipt {
         tx_type: TxType::Frame,
         succeeded: true,
         cumulative_gas_used: 0x52fe,
-        logs: vec![log_at(Address::from_low_u64_be(0xfffe))],
+        logs: vec![log.clone()],
         payer: Some(payer),
         frame_receipts: Some(vec![
             FrameReceipt {
                 status: FRAME_RECEIPT_STATUS_SUCCESS,
                 gas_used: 0x1234,
-                logs: vec![log_at(Address::from_low_u64_be(0xaaaa))],
+                logs: vec![log],
             },
             FrameReceipt {
                 status: FRAME_RECEIPT_STATUS_SUCCESS,
@@ -84,19 +85,17 @@ async fn frame_receipt_survives_the_flush_to_disk() {
     assert_eq!(stored, receipt, "frame receipt changed across the flush");
 }
 
-/// The fields the consensus layout drops are exactly the ones worth asserting
-/// individually, so a partial regression cannot hide behind the equality check
-/// above.
+/// Stale compatibility fields must be replaced by values derived from the
+/// canonical per-frame receipts when the row is persisted.
 #[tokio::test]
-async fn flushed_frame_receipt_keeps_the_storage_only_fields() {
+async fn flushed_frame_receipt_canonicalizes_derived_fields() {
     let store = Store::new("", EngineType::InMemory).expect("store");
     let block = block_at(7);
     let hash = block.hash();
 
-    // `succeeded: false` with all-SUCCESS frames cannot be re-derived from the
-    // frame statuses, so it can only survive if the row really carried it.
     let mut receipt = frame_receipt();
     receipt.succeeded = false;
+    receipt.logs = vec![log_at(Address::from_low_u64_be(0xfffe))];
 
     store.buffer_block_with_receipts_for_test(&block, vec![receipt.clone()]);
     store.flush_block_data_for_test().expect("flush");
@@ -107,8 +106,15 @@ async fn flushed_frame_receipt_keeps_the_storage_only_fields() {
         .expect("decode")
         .expect("present");
 
-    assert!(!stored.succeeded, "succeeded was re-derived, not persisted");
-    assert_eq!(stored.logs, receipt.logs, "aggregated logs were dropped");
+    assert!(
+        stored.succeeded,
+        "status was not derived from frame receipts"
+    );
+    assert_eq!(
+        stored.logs,
+        vec![log_at(Address::from_low_u64_be(0xaaaa))],
+        "logs were not derived from frame receipts"
+    );
     assert_eq!(stored.payer, receipt.payer, "payer was dropped");
     assert_eq!(
         stored.frame_receipts.as_ref().map(Vec::len),

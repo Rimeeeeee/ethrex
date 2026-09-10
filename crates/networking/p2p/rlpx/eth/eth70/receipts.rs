@@ -324,13 +324,17 @@ mod tests {
                 logs: vec![],
             },
         ];
+        let logs = frame_receipts
+            .iter()
+            .flat_map(|receipt| receipt.logs.iter().cloned())
+            .collect();
         let receipt = Receipt {
             tx_type: TxType::Frame,
             // Derived on decode from the per-frame statuses, so a SKIPPED frame
             // makes this false.
             succeeded: false,
             cumulative_gas_used: 123_456,
-            logs: vec![],
+            logs,
             payer: Some(payer),
             frame_receipts: Some(frame_receipts.clone()),
         };

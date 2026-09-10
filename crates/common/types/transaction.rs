@@ -2665,8 +2665,9 @@ impl FrameTransaction {
                     .to_string(),
             );
         }
-        // EIP-8141 signature list validation: scheme must be a known value; msg
-        // must be empty or a non-zero 32-byte digest.
+        // EIP-8141 signature list validation: scheme must be a known value,
+        // protocol-validated signatures must have their scheme's exact wire
+        // length, and msg must be empty or a non-zero 32-byte digest.
         for (i, sig) in self.signatures.iter().enumerate() {
             match sig.scheme {
                 // ARBITRARY (0) carries no recoverable signer; per EIP-8141 the
@@ -2678,7 +2679,22 @@ impl FrameTransaction {
                         ));
                     }
                 }
-                FRAME_SIG_SCHEME_SECP256K1 | FRAME_SIG_SCHEME_P256 => {}
+                FRAME_SIG_SCHEME_SECP256K1 => {
+                    if sig.signature.len() != 65 {
+                        return Err(format!(
+                            "Signature {i}: SECP256K1 signature must be 65 bytes, got {}",
+                            sig.signature.len()
+                        ));
+                    }
+                }
+                FRAME_SIG_SCHEME_P256 => {
+                    if sig.signature.len() != 128 {
+                        return Err(format!(
+                            "Signature {i}: P256 signature must be 128 bytes, got {}",
+                            sig.signature.len()
+                        ));
+                    }
+                }
                 other => {
                     return Err(format!("Signature {i}: unsupported scheme {other}"));
                 }
@@ -2899,6 +2915,28 @@ impl FrameTransaction {
                     Some(_) => {}
                 }
             }
+            // APPROVE cannot be called anywhere inside an atomic batch. A frame
+            // belongs to a batch when it carries the flag or immediately follows
+            // a flagged frame (the terminating member), so both must advertise
+            // an empty approval scope.
+            if self.frame_is_in_atomic_batch(i) && frame.scope_restriction() != 0 {
+                return Err(format!(
+                    "Frame {i}: atomic-batch frames must have zero approval scope"
+                ));
+            }
+        }
+
+        // EIP-8141 applies EIP-7825's cap to the transaction's worst-case
+        // execution reservation. This implementation currently exposes one gas
+        // budget per frame, so all declared frame gas is conservatively treated
+        // as execution gas. The calldata floor is already part of
+        // `total_gas_limit()` via `max(standard_gas_limit, calldata_floor_total)`.
+        if self.total_gas_limit() > crate::constants::TX_MAX_GAS_LIMIT_AMSTERDAM {
+            return Err(format!(
+                "Frame transaction execution gas limit {} exceeds EIP-7825 maximum {}",
+                self.total_gas_limit(),
+                crate::constants::TX_MAX_GAS_LIMIT_AMSTERDAM
+            ));
         }
 
         // EIP-8312: a vault-sender transaction with no UTXO frame has neither a
@@ -6142,12 +6180,12 @@ mod tests {
     }
 
     #[test]
-    fn cumulative_frame_gas_limit_equal_to_i64_max_is_accepted() {
+    fn cumulative_frame_gas_limit_equal_to_i64_max_is_rejected_by_eip7825_cap() {
         let a = (i64::MAX as u64) / 2;
         let b = i64::MAX as u64 - a;
         let tx = make_frame_tx_with_gas_limits(vec![a, b]);
-        tx.validate_static_constraints(true)
-            .expect("exact i64::MAX total should be accepted");
+        let err = tx.validate_static_constraints(true).unwrap_err();
+        assert!(err.contains("EIP-7825 maximum"), "unexpected error: {err}");
     }
 
     #[test]

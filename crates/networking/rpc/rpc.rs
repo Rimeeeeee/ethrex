@@ -1450,7 +1450,7 @@ pub async fn map_debug_requests(req: &RpcRequest, context: RpcApiContext) -> Res
 /// enabling all of `debug_`):
 /// - Frame transactions (EIP-8141): `ethrex_simulateFrameTransaction`
 /// - EIP-8304 devnet inspection/query: `ethrex_getEip8304Table`,
-///   `ethrex_queryEip8304Table`, `ethrex_getEip8304Logs`
+///   `ethrex_queryEip8304Table`, `ethrex_getUtxoProofs`
 pub async fn map_ethrex_requests(
     req: &RpcRequest,
     context: RpcApiContext,
@@ -1463,7 +1463,7 @@ pub async fn map_ethrex_requests(
         "ethrex_queryEip8304Table" => {
             crate::ethrex::QueryEip8304TableRequest::call(req, context).await
         }
-        "ethrex_getEip8304Logs" => crate::ethrex::GetEip8304LogsRequest::call(req, context).await,
+        "ethrex_getUtxoProofs" => crate::ethrex::GetUtxoProofsRequest::call(req, context).await,
         unknown_ethrex_method => Err(RpcErr::MethodNotFound(unknown_ethrex_method.to_owned())),
     }
 }

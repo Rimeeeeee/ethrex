@@ -187,7 +187,13 @@ mod tests {
         // Old path: Vec<Vec<ReceiptWithBloom>> encoded directly, then snappy.
         let old_wire: Vec<Vec<ReceiptWithBloom>> = receipts
             .iter()
-            .map(|block| block.iter().map(ReceiptWithBloom::from).collect())
+            .map(|block| {
+                block
+                    .iter()
+                    .map(ReceiptWithBloom::try_from)
+                    .collect::<Result<Vec<_>, _>>()
+                    .expect("sample contains only non-frame receipts")
+            })
             .collect();
         let mut old_encoded = Vec::new();
         Encoder::new(&mut old_encoded)
@@ -237,11 +243,16 @@ mod tests {
     /// their wire item carries the EIP-8141 consensus payload (matching the trie).
     #[test]
     fn frame_receipt_roundtrips_over_eth68() {
+        let frame_log = Log {
+            address: Address::from_low_u64_be(0xbeef),
+            topics: vec![],
+            data: CommonBytes::from_static(b"frame"),
+        };
         let frame = Receipt {
             tx_type: TxType::Frame,
             succeeded: true,
             cumulative_gas_used: 250000,
-            logs: vec![],
+            logs: vec![frame_log.clone()],
             payer: Some(Address::from_low_u64_be(0x1234)),
             frame_receipts: Some(vec![
                 FrameReceipt {
@@ -252,11 +263,7 @@ mod tests {
                 FrameReceipt {
                     status: FRAME_RECEIPT_STATUS_SUCCESS,
                     gas_used: 150000,
-                    logs: vec![Log {
-                        address: Address::from_low_u64_be(0xbeef),
-                        topics: vec![],
-                        data: CommonBytes::from_static(b"frame"),
-                    }],
+                    logs: vec![frame_log],
                 },
             ]),
         };
@@ -270,6 +277,7 @@ mod tests {
         assert_eq!(decoded_frame.tx_type, TxType::Frame);
         assert_eq!(decoded_frame.payer, frame.payer);
         assert_eq!(decoded_frame.frame_receipts, frame.frame_receipts);
+        assert_eq!(decoded_frame.logs, frame.logs);
         assert_eq!(decoded_frame.cumulative_gas_used, 250000);
 
         // The per-item wire bytes equal the consensus / trie bytes wrapped as an

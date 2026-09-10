@@ -6,17 +6,17 @@
 //!     migrated from `crates/common/types/transaction.rs`).
 
 use bytes::Bytes;
-use ethrex_common::constants::GAS_PER_BLOB;
+use ethrex_common::constants::{GAS_PER_BLOB, TX_MAX_GAS_LIMIT_AMSTERDAM};
 use ethrex_common::types::BATCH_SIZE;
 use ethrex_common::types::{
     APPROVE_EXECUTION, APPROVE_EXECUTION_AND_PAYMENT, APPROVE_PAYMENT, BATCH_PATH_LEN, Block,
     BlockBody, BlockHeader, ChainConfig, EIP4844Transaction, FRAME_SIG_SCHEME_ARBITRARY,
-    FRAME_SIG_SCHEME_SECP256K1, FRAME_TX_MAX_VERIFY_GAS, Frame, FrameMode, FrameSignature,
-    FrameTransaction, FrameValidationError, MAX_SIBLINGS, P2PTransaction, PrefixShape, RING_SIZE,
-    SLOT_NEXT_INDEX, SLOT_RING_BASE, Spend, SpendInput, SpendOutput, Transaction,
-    WrappedFrameTransaction, batch_slot, batch_slot_for_block, fold, frame_tx_expiry_verifier,
-    hash_pair, is_spent, merkle_proof, merkle_root, opening_leaf, ring_slot, seals_batch,
-    slot_batch_base, slot_spent_base, spent_bit_location, utxo_vault,
+    FRAME_SIG_SCHEME_P256, FRAME_SIG_SCHEME_SECP256K1, FRAME_TX_MAX_VERIFY_GAS, Frame, FrameMode,
+    FrameSignature, FrameTransaction, FrameValidationError, MAX_SIBLINGS, P2PTransaction,
+    PrefixShape, RING_SIZE, SLOT_NEXT_INDEX, SLOT_RING_BASE, Spend, SpendInput, SpendOutput,
+    Transaction, WrappedFrameTransaction, batch_slot, batch_slot_for_block, fold,
+    frame_tx_expiry_verifier, hash_pair, is_spent, merkle_proof, merkle_root, opening_leaf,
+    ring_slot, seals_batch, slot_batch_base, slot_spent_base, spent_bit_location, utxo_vault,
 };
 use ethrex_common::types::{BlobsBundle, Fork, MAX_BLOBS_PER_TX, TxType};
 use ethrex_rlp::decode::RLPDecode;
@@ -581,6 +581,97 @@ fn atomic_batch_followed_by_verify_frame_is_invalid() {
             .unwrap_err()
             .contains("atomic batch flag followed by a VERIFY frame")
     );
+}
+
+#[test]
+fn atomic_batch_flagged_frame_with_approval_scope_is_invalid() {
+    let mut tx = make_test_frame_tx();
+    tx.frames = vec![
+        Frame {
+            mode: FrameMode::Sender as u8,
+            flags: 0x04 | APPROVE_PAYMENT,
+            target: Some(Address::from_low_u64_be(0xB0B)),
+            gas_limit: 21_000,
+            value: U256::zero(),
+            data: Bytes::new(),
+        },
+        Frame {
+            mode: FrameMode::Sender as u8,
+            flags: 0,
+            target: Some(Address::from_low_u64_be(0xCAFE)),
+            gas_limit: 21_000,
+            value: U256::zero(),
+            data: Bytes::new(),
+        },
+    ];
+
+    let err = tx.validate_static_constraints(false).unwrap_err();
+    assert!(
+        err.contains("zero approval scope"),
+        "unexpected error: {err}"
+    );
+}
+
+#[test]
+fn atomic_batch_terminator_with_approval_scope_is_invalid() {
+    let mut tx = make_test_frame_tx();
+    tx.frames = vec![
+        Frame {
+            mode: FrameMode::Sender as u8,
+            flags: 0x04,
+            target: Some(Address::from_low_u64_be(0xB0B)),
+            gas_limit: 21_000,
+            value: U256::zero(),
+            data: Bytes::new(),
+        },
+        Frame {
+            mode: FrameMode::Sender as u8,
+            flags: APPROVE_PAYMENT,
+            target: Some(Address::from_low_u64_be(0xCAFE)),
+            gas_limit: 21_000,
+            value: U256::zero(),
+            data: Bytes::new(),
+        },
+    ];
+
+    let err = tx.validate_static_constraints(false).unwrap_err();
+    assert!(
+        err.contains("zero approval scope"),
+        "unexpected error: {err}"
+    );
+}
+
+#[test]
+fn static_validation_enforces_protocol_signature_lengths() {
+    let mut tx = make_test_frame_tx();
+    tx.signatures[0].signature = Bytes::from(vec![0u8; 64]);
+    let err = tx.validate_static_constraints(false).unwrap_err();
+    assert!(err.contains("must be 65 bytes"), "unexpected error: {err}");
+
+    tx.signatures[0].scheme = FRAME_SIG_SCHEME_P256;
+    tx.signatures[0].signature = Bytes::from(vec![0u8; 64]);
+    let err = tx.validate_static_constraints(false).unwrap_err();
+    assert!(err.contains("must be 128 bytes"), "unexpected error: {err}");
+
+    tx.signatures[0].signature = Bytes::from(vec![0u8; 128]);
+    assert!(tx.validate_static_constraints(false).is_ok());
+}
+
+#[test]
+fn static_validation_enforces_eip7825_execution_cap() {
+    let mut tx = make_test_frame_tx();
+    tx.frames[0].gas_limit = 0;
+    tx.frames[1].gas_limit = 0;
+    let intrinsic = tx.total_gas_limit();
+    assert!(intrinsic < TX_MAX_GAS_LIMIT_AMSTERDAM);
+
+    tx.frames[1].gas_limit = TX_MAX_GAS_LIMIT_AMSTERDAM - intrinsic;
+    assert_eq!(tx.total_gas_limit(), TX_MAX_GAS_LIMIT_AMSTERDAM);
+    assert!(tx.validate_static_constraints(false).is_ok());
+
+    tx.frames[1].gas_limit += 1;
+    let err = tx.validate_static_constraints(false).unwrap_err();
+    assert!(err.contains("EIP-7825 maximum"), "unexpected error: {err}");
 }
 
 #[test]

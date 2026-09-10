@@ -144,9 +144,10 @@ class Rpc:
         resubmissions = 0
         first_receipt_ms = None
         first_canonical_receipt_ms = None
+        last_submission = started
 
         def resubmit_after_reorg():
-            nonlocal resubmissions
+            nonlocal resubmissions, last_submission
             if raw_tx is None:
                 return
             try:
@@ -156,13 +157,24 @@ class Rpc:
                         f"reorg resubmission returned {returned_hash}, expected {tx_hash}"
                     )
                 resubmissions += 1
+                last_submission = time.monotonic()
             except RuntimeError as error:
                 # A peer may have already restored the transaction to its pool.
                 message = str(error).lower()
-                if not any(marker in message for marker in (
+                if any(marker in message for marker in (
                     "already known", "known transaction", "already imported"
                 )):
-                    raise
+                    last_submission = time.monotonic()
+                    return
+                if any(marker in message for marker in (
+                    "nonce too low", "utxo input is already spent"
+                )):
+                    transaction = self.call("eth_getTransactionByHash", [tx_hash])
+                    receipt = self.call("eth_getTransactionReceipt", [tx_hash])
+                    if transaction is not None or receipt is not None:
+                        last_submission = time.monotonic()
+                        return
+                raise
 
         while time.monotonic() < deadline:
             receipt = self.call("eth_getTransactionReceipt", [tx_hash])
@@ -213,6 +225,15 @@ class Rpc:
                     orphaned_hashes.add(orphan_hash)
                     resubmit_after_reorg()
                 last_receipt = None
+            # A transaction can be accepted and then dropped from this devnet's
+            # pool before it ever receives a receipt. Re-submit the exact raw
+            # bytes periodically; transaction hashes make this idempotent.
+            if (
+                receipt is None
+                and raw_tx is not None
+                and time.monotonic() - last_submission >= 12
+            ):
+                resubmit_after_reorg()
             # Poll quickly enough to prepare the next workload transaction for
             # a three-second devnet slot without waiting most of another slot.
             time.sleep(0.5)
@@ -229,8 +250,44 @@ def gas_params(rpc: Rpc):
     priority = 1_000_000_000
     return priority, max(gp * 2, priority * 2)
 
+def submit_raw_transaction(rpc: Rpc, raw: bytes) -> tuple[str, str]:
+    """Submit idempotently across the devnet's broadcast/inclusion race.
+
+    ethrex can broadcast a transaction and then validate it against a newer
+    head before returning the RPC response. For a UTXO transaction included in
+    that interval, the response can say that its exact input is already spent.
+    Accept such an error only when the exact locally computed hash is already
+    visible in the pool or chain; unrelated spent-input errors still fail.
+    """
+    raw_hex = "0x" + raw.hex()
+    expected_hash = "0x" + keccak(raw).hex()
+    try:
+        returned_hash = rpc.call("eth_sendRawTransaction", [raw_hex])
+        if returned_hash.lower() != expected_hash.lower():
+            raise RuntimeError(
+                f"eth_sendRawTransaction returned {returned_hash}, expected {expected_hash}"
+            )
+        return expected_hash, raw_hex
+    except RuntimeError as error:
+        message = str(error).lower()
+        race_markers = (
+            "already known",
+            "known transaction",
+            "already imported",
+            "nonce too low",
+            "utxo input is already spent",
+        )
+        if not any(marker in message for marker in race_markers):
+            raise
+        transaction = rpc.call("eth_getTransactionByHash", [expected_hash])
+        receipt = rpc.call("eth_getTransactionReceipt", [expected_hash])
+        if transaction is None and receipt is None:
+            raise
+        return expected_hash, raw_hex
+
 def send_legacy_like(rpc: Rpc, key: str, to: bytes | None, value: int, data: bytes, gas: int,
-                     nonce: int | None = None, confirmations: int = 0) -> dict:
+                     nonce: int | None = None, confirmations: int = 0,
+                     receipt_timeout_s: int = 180) -> dict:
     acct = Account.from_key(key)
     chain_id = int(rpc.call("eth_chainId", []), 16)
     if nonce is None:
@@ -244,9 +301,13 @@ def send_legacy_like(rpc: Rpc, key: str, to: bytes | None, value: int, data: byt
     if to is not None:
         tx["to"] = to_checksum_address("0x" + to.hex())
     signed = acct.sign_transaction(tx)
-    raw_hex = "0x" + signed.raw_transaction.hex()
-    tx_hash = rpc.call("eth_sendRawTransaction", [raw_hex])
-    receipt = rpc.wait_receipt(tx_hash, confirmations=confirmations, raw_tx=raw_hex)
+    tx_hash, raw_hex = submit_raw_transaction(rpc, signed.raw_transaction)
+    receipt = rpc.wait_receipt(
+        tx_hash,
+        timeout_s=receipt_timeout_s,
+        confirmations=confirmations,
+        raw_tx=raw_hex,
+    )
     return {"txHash": tx_hash, "receipt": receipt, "confirmation": rpc.last_wait_meta}
 
 def encode_frame(mode: int, flags: int, target: bytes | None, gas_limit: int, value: int, data: bytes) -> bytes:
@@ -332,10 +393,9 @@ def block_openings(rpc: Rpc, block: int) -> list[dict]:
     }])
     openings = []
     for lg in logs:
-        data = bytes.fromhex(lg["data"][2:])
         openings.append({
-            "index": int.from_bytes(data[:32], "big"),
-            "valueWei": int.from_bytes(data[32:64], "big"),
+            "index": int(lg["topics"][3], 16),
+            "valueWei": int(lg["data"], 16),
             "source": bytes.fromhex(lg["topics"][1][2:])[-20:],
             "recipient": bytes.fromhex(lg["topics"][2][2:])[-20:],
         })
@@ -359,7 +419,7 @@ def utxo_frame_gas(inputs: list[dict], n_utxo_outs: int, n_account_outs: int) ->
     gas = 13_000
     for inp in inputs:
         gas += 16_048 + 42 * (len(inp["siblings"]) + len(inp.get("batchSiblings", []))) + 383
-    gas += 2_012 * n_utxo_outs
+    gas += 2_131 * n_utxo_outs
     gas += (9_000 + 183_600) * n_account_outs
     return gas
 
@@ -421,19 +481,19 @@ def run_spend(rpc: Rpc, cmd: dict, sponsored: bool) -> dict:
         signatures = actor_entries
 
     raw = encode_envelope(chain_id, nonce_keys, nonce_seq, sender, frames, signatures, priority, max_fee)
-    tx_hash = rpc.call("eth_sendRawTransaction", ["0x" + raw.hex()])
+    tx_hash, raw_hex = submit_raw_transaction(rpc, raw)
     receipt = rpc.wait_receipt(
         tx_hash,
+        timeout_s=int(cmd.get("receiptTimeoutSeconds", 180)),
         confirmations=int(cmd.get("confirmations", 0)),
-        raw_tx="0x" + raw.hex(),
+        raw_tx=raw_hex,
     )
     created = []
     for lg in receipt.get("logs", []):
         if lg["address"].lower() == VAULT_HEX and lg["topics"][0].lower() == "0x" + UTXO_CREATED_TOPIC.hex():
-            data = bytes.fromhex(lg["data"][2:])
             created.append({
-                "index": int.from_bytes(data[:32], "big"),
-                "valueWei": str(int.from_bytes(data[32:64], "big")),
+                "index": int(lg["topics"][3], 16),
+                "valueWei": str(int(lg["data"], 16)),
                 "recipient": "0x" + bytes.fromhex(lg["topics"][2][2:])[-20:].hex(),
             })
     return {
@@ -446,10 +506,9 @@ def run_spend(rpc: Rpc, cmd: dict, sponsored: bool) -> dict:
     }
 
 def created_from_log(lg: dict, block: int) -> dict:
-    data = bytes.fromhex(lg["data"][2:])
     return {
-        "index": int.from_bytes(data[:32], "big"),
-        "valueWei": str(int.from_bytes(data[32:64], "big")),
+        "index": int(lg["topics"][3], 16),
+        "valueWei": str(int(lg["data"], 16)),
         "source": "0x" + bytes.fromhex(lg["topics"][1][2:])[-20:].hex(),
         "recipient": "0x" + bytes.fromhex(lg["topics"][2][2:])[-20:].hex(),
         "creationBlock": block,
@@ -512,7 +571,11 @@ def run_multi_sponsored_spend(rpc: Rpc, cmd: dict) -> dict:
         route_output_counts.append(len(utxo_outs))
 
     nonce_keys = [0]
-    nonce_seq = int(rpc.call("eth_getTransactionCount", ["0x" + sponsor_addr.hex(), "latest"]), 16)
+    nonce_seq = (
+        int(cmd["nonce"])
+        if cmd.get("nonce") is not None
+        else int(rpc.call("eth_getTransactionCount", ["0x" + sponsor_addr.hex(), "pending"]), 16)
+    )
     sponsor_entry_blank = encode_sig_entry(SIG_SCHEME_SECP256K1, None, b"", b"")
     pre_image = encode_envelope(
         chain_id, nonce_keys, nonce_seq, sponsor_addr, frames,
@@ -533,11 +596,12 @@ def run_multi_sponsored_spend(rpc: Rpc, cmd: dict) -> dict:
             "frameGasLimits": frame_gas_limits,
             "signedMaxGasLimit": max_gas_limit,
         }
-    tx_hash = rpc.call("eth_sendRawTransaction", ["0x" + raw.hex()])
+    tx_hash, raw_hex = submit_raw_transaction(rpc, raw)
     receipt = rpc.wait_receipt(
         tx_hash,
+        timeout_s=int(cmd.get("receiptTimeoutSeconds", 180)),
         confirmations=int(cmd.get("confirmations", 0)),
-        raw_tx="0x" + raw.hex(),
+        raw_tx=raw_hex,
     )
     block = int(receipt["blockNumber"], 16)
     created = [
@@ -590,27 +654,30 @@ def main():
         r = send_legacy_like(
             rpc, cmd["key"], addr_of(cmd["to"]), int(cmd["valueWei"]), b"", 250_000,
             cmd.get("nonce"), int(cmd.get("confirmations", 0)),
+            int(cmd.get("receiptTimeoutSeconds", 180)),
         )
         out = {"txHash": r["txHash"], "block": int(r["receipt"]["blockNumber"], 16), "status": r["receipt"].get("status"), "confirmation": r["confirmation"]}
     elif op == "deploySponsor":
         r = send_legacy_like(
             rpc, cmd["key"], None, 0, SPONSOR_INITCODE, 2_000_000,
             cmd.get("nonce"), int(cmd.get("confirmations", 0)),
+            int(cmd.get("receiptTimeoutSeconds", 180)),
         )
         out = {"txHash": r["txHash"], "address": r["receipt"]["contractAddress"], "status": r["receipt"].get("status"), "confirmation": r["confirmation"]}
     elif op == "deposit":
         # A deposit updates the global index plus opening state and emits a
-        # LOG3. Fresh-state deposits estimate around 136k gas on this devnet;
+        # LOG4. Fresh-state deposits estimate around 136k gas on this devnet;
         # keep enough headroom for state-dependent variation.
         r = send_legacy_like(
             rpc, cmd["key"], VAULT, int(cmd["valueWei"]), addr_of(cmd["recipient"]), 250_000,
             cmd.get("nonce"), int(cmd.get("confirmations", 0)),
+            int(cmd.get("receiptTimeoutSeconds", 180)),
         )
         receipt = r["receipt"]
         index = None
         for lg in receipt.get("logs", []):
             if lg["address"].lower() == VAULT_HEX and lg["topics"][0].lower() == "0x" + UTXO_CREATED_TOPIC.hex():
-                index = int.from_bytes(bytes.fromhex(lg["data"][2:])[:32], "big")
+                index = int(lg["topics"][3], 16)
         out = {
             "txHash": r["txHash"],
             "block": int(receipt["blockNumber"], 16),
@@ -626,14 +693,17 @@ def main():
     elif op == "multiSponsoredSpend":
         out = run_multi_sponsored_spend(rpc, cmd)
     elif op == "waitReceipt":
-        receipt = rpc.wait_receipt(cmd["txHash"])
+        receipt = rpc.wait_receipt(
+            cmd["txHash"],
+            timeout_s=int(cmd.get("receiptTimeoutSeconds", 180)),
+            confirmations=int(cmd.get("confirmations", 0)),
+        )
         created = []
         for lg in receipt.get("logs", []):
             if lg["address"].lower() == VAULT_HEX and lg["topics"][0].lower() == "0x" + UTXO_CREATED_TOPIC.hex():
-                data = bytes.fromhex(lg["data"][2:])
                 created.append({
-                    "index": int.from_bytes(data[:32], "big"),
-                    "valueWei": str(int.from_bytes(data[32:64], "big")),
+                    "index": int(lg["topics"][3], 16),
+                    "valueWei": str(int(lg["data"], 16)),
                     "source": "0x" + bytes.fromhex(lg["topics"][1][2:])[-20:].hex(),
                     "recipient": "0x" + bytes.fromhex(lg["topics"][2][2:])[-20:].hex(),
                 })

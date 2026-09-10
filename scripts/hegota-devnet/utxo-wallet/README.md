@@ -10,11 +10,18 @@ This is a complete Vercel project for the ethrex/Hegota UTXO devnet:
 
 On the combined local devnet, the Discovery Lab supports both recipient-filtered
 receipt-log scanning and EIP-8304 table scanning. The latter verifies committed
-table roots, posting proofs, and this devnet's experimental type-7 full-log
-commitments before resolving matching positions through selected raw-log
-payloads. It does not download complete transaction receipts. The UI can
-compare latency, RPC calls, response bytes, and result-set equality at a frozen
-head, or decode the table for a selected block.
+table roots and a complete recipient range plus vault/signature/source/index
+candidate entries under one shared multiproof per table. The local Node backend
+then fetches all selected UPT records in one RPC and verifies one shared opening
+multiproof per touched block against the vault roots. It does not download
+transaction receipts. The UI can compare latency, RPC calls, response bytes,
+UPT records, and result-set equality at a frozen head, or decode the table for a
+selected block.
+
+The Vercel Python function remains a compatibility deployment for the public
+Hegota endpoint. Its table mode still reads full EIP-8304 table bodies and block
+receipts; use `server.mjs` and the combined devnet when measuring the new
+proof-query + UPT path.
 
 The default RPC is:
 
@@ -85,9 +92,10 @@ The local server uses the ethrex devnet Python environment and the original chec
 
 ## Ethrex requirements
 
-Table discovery requires the combined devnet branch and its
-`ethrex_getEip8304Table` RPC. The current public Hegota endpoint may support
-receipt-log discovery only until it is upgraded. The project bundles the
+Optimized table discovery requires the combined devnet branch and its
+`ethrex_queryEip8304Table` and `ethrex_getUtxoProofs` RPCs. The current public
+Hegota endpoint may support receipt-log discovery only until it is upgraded.
+The project bundles the
 transaction-building helper from:
 
 ```

@@ -1,7 +1,7 @@
 use crate::api::tables::{
     ACCOUNT_CODES, ACCOUNT_FLATKEYVALUE, ACCOUNT_TRIE_NODES, BLOCK_NUMBERS, BODIES,
     CANONICAL_BLOCK_HASHES, FULLSYNC_HEADERS, HEADERS, RECEIPTS_V2, STORAGE_FLATKEYVALUE,
-    STORAGE_TRIE_NODES, TRANSACTION_LOCATIONS,
+    STORAGE_TRIE_NODES, TRANSACTION_LOCATIONS, UTXO_PROOF_TABLES,
 };
 use crate::api::{
     PrefixResult, StorageBackend, StorageLockedView, StorageReadView, StorageWriteBatch,
@@ -82,6 +82,7 @@ impl RocksDBBackend {
             RECEIPTS_V2,
             TRANSACTION_LOCATIONS,
             FULLSYNC_HEADERS,
+            UTXO_PROOF_TABLES,
         ];
 
         // Open all column families

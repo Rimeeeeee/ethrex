@@ -72,7 +72,7 @@ use ethrex_common::types::block_execution_witness::ExecutionWitness;
 use ethrex_common::types::fee_config::FeeConfig;
 use ethrex_common::types::{
     AccountInfo, AccountState, AccountUpdate, BalSynthesisItem, Block, BlockHash, BlockHeader,
-    BlockNumber, Code, FRAME_TX_MAX_VERIFY_GAS, FrameTransaction, Transaction,
+    BlockNumber, Code, FRAME_TX_MAX_VERIFY_GAS, FrameTransaction, Transaction, UtxoProofTable,
     WrappedEIP4844Transaction, WrappedFrameTransaction, synthesize_bal_updates,
     validate_block_body,
 };
@@ -2344,13 +2344,27 @@ impl Blockchain {
         // Keep the accepted block available while the update batch takes
         // ownership. EIP-8304 tables are written only after the block update has
         // been staged successfully, so invalid blocks never populate the cache.
+        let block_hash = block.hash();
+        let chain_config = self.storage.get_chain_config();
+        let utxo_proof_table = chain_config
+            .is_utxo_frames_activated(block.header.timestamp)
+            .then(|| {
+                UtxoProofTable::from_receipts(
+                    chain_config.chain_id,
+                    block.header.number,
+                    block_hash,
+                    &execution_result.receipts,
+                )
+                .map_err(|error| ChainError::Custom(error.to_string()))
+            })
+            .transpose()?;
         let index_tables = execution_result.index_tables;
         let index_table_block = (!index_tables.is_empty()).then(|| block.clone());
 
         let update_batch = UpdateBatch {
             account_updates: account_updates_list.state_updates,
             storage_updates: account_updates_list.storage_updates,
-            receipts: vec![(block.hash(), execution_result.receipts)],
+            receipts: vec![(block_hash, execution_result.receipts)],
             blocks: vec![block],
             code_updates: account_updates_list.code_updates,
             commit_depth,
@@ -2362,6 +2376,10 @@ impl Blockchain {
         self.storage
             .store_block_updates(update_batch)
             .map_err(ChainError::from)?;
+
+        if let Some(table) = utxo_proof_table {
+            self.storage.store_utxo_proof_table(&table)?;
+        }
 
         if let Some(block) = index_table_block {
             self.storage

@@ -269,10 +269,9 @@ def utxo_created_in_block(rpc, block_number):
     }])
     out = []
     for log in logs:
-        data = bytes.fromhex(log["data"][2:])
         out.append({
-            "index": int.from_bytes(data[:32], "big"),
-            "value": int.from_bytes(data[32:64], "big"),
+            "index": int(log["topics"][3], 16),
+            "value": int(log["data"], 16),
             "source": "0x" + log["topics"][1][-40:],
             "recipient": "0x" + log["topics"][2][-40:],
         })

@@ -127,14 +127,13 @@ def wallet_address() -> str | None:
 def opening_from_log(log: dict) -> dict | None:
     data = log.get("data", "")
     topics = log.get("topics", [])
-    if len(data) < 130 or len(topics) < 3:
+    if len(data) != 66 or len(topics) != 4:
         return None
     raw = data[2:]
-    word = lambda offset: int(raw[offset:offset + 64], 16)
     topic_address = lambda topic: "0x" + topic[-40:].lower()
     return {
-        "index": word(0),
-        "valueWei": str(word(64)),
+        "index": int(topics[3], 16),
+        "valueWei": str(int(raw, 16)),
         "source": topic_address(topics[1]),
         "recipient": topic_address(topics[2]),
         "creationBlock": int(log["blockNumber"], 16),

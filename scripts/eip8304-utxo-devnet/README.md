@@ -113,34 +113,49 @@ commitment delay. The response decodes every entry and includes its table root,
 contract storage slot, covered block range, and server-side load time.
 
 Wallet discovery uses the separate `ethrex_queryEip8304Table` extension. Its
-third parameter is an array of `{typeId, content}` posting keys. Ethrex
-binary-searches each key in the canonical sorted table and returns only the
-matching ranges, their adjacent non-match boundaries, compact deduplicated SSZ
-proof nodes, proven transaction entries, and one proven type-7 full-log
-commitment for each position in the intersection. Type 7 is an experimental
-format extension and changes the committed table roots; this devnet must not be
-described as byte-for-byte compatible with the draft EIP-8304 table format.
+third parameter is an array of `{typeId, content}` posting keys. The optional
+fourth parameter requests other canonical entry types at the positions in the
+matched range. The wallet queries the complete recipient (`typeId: 5`) range
+and requests types 2, 3, 4, and 6: vault address, event signature, source, and
+UTXO index. Ethrex binary-searches the canonical sorted table and returns the
+complete range, adjacent non-match boundaries, transaction hashes, candidate
+entries, and one minimal shared multiproof for the response. EIP-8304 entry
+types remain exactly 0 through 6; no private type is added to the committed
+table.
 
-After verifying those proofs, the wallet calls `ethrex_getEip8304Logs` once
-with the selected positions. The RPC returns only the raw logs at those
-positions. Each payload is SHA-256 committed as
-`EIP8304_LOG_V1 || address || topic_count || topics || data_length || data`, so
-the wallet can verify the source, recipient, UTXO index, and value without
-downloading or trusting a complete transaction receipt.
+The value is not present in an EIP-8304 entry. For matched positions the wallet
+therefore makes one batched `ethrex_getUtxoProofs` call. Ethrex returns only the
+selected UTXO Proof Table (UPT) records and one shared openings-tree multiproof
+per touched block, not complete receipts or complete per-block UPTs. The wallet
+then uses one multi-slot `eth_getProof` call and checks those blocks' openings
+root slot values against the EIP-8312 vault. In this devnet benchmark the EL RPC
+is the chain source; a light-client wallet must additionally verify the returned
+account/storage proof nodes against a trusted header state root. A UPT is a block-hash-keyed,
+non-consensus availability object derived from canonical receipts; the native
+openings root, rather than the UPT's database record, authenticates
+`index/source/recipient/value`.
+
+The creation event is now
+`UtxoCreated(address indexed source, address indexed recipient, uint64 indexed index, uint256 value)`:
+`topics[3]` carries the index and the sole 32-byte data word carries the value.
 
 ## Wallet
 
 The Orbit wallet can discover the same UTXO set in two ways:
 
 - current path: recipient-filtered `eth_getLogs`, then decode receipt logs;
-- extended EIP-8304 path: verify posting-range and log-commitment proofs plus
-  every table root, intersect positions, then fetch only the selected raw logs.
+- indexed path: verify the complete recipient range and candidate entries with
+  one shared EIP-8304 multiproof per table, then fetch selected UPT records with
+  one batched RPC and one shared opening multiproof per touched block.
 
-Table queries, historical root checks, and proof results are cached across
-wallet scans. Selected raw logs are deliberately fetched again for each scan so
-the measured warm path does not silently become an all-RAM result. Uncached
-tables and payload batches use bounded parallelism
-(`UTXO_DISCOVERY_CONCURRENCY`, default 8).
+Verified table-query records are tagged and cached by the table's end-block
+hash; a warm lookup rechecks that block hash before reuse. Historical table
+roots are cached under that block hash and root. Verified UPT records are
+cached by exact block hash plus event position, so a reorganization cannot
+silently reuse a record from a replaced block. `clearDiscoveryCaches()` and an
+RPC endpoint change clear all three cache layers. Uncached table requests use
+bounded parallelism (`UTXO_DISCOVERY_CONCURRENCY`, default 8), while all UPT
+records required by one wallet scan are sent in one RPC (up to 4,096 records).
 
 Start it against the published EL RPC endpoint:
 
@@ -250,9 +265,10 @@ log/table lookup rather than thousands of unrelated storage reads.
 
 The report records a cold run plus median and p95 after discarded warmups. It
 also records provider time, RPC calls, bytes, candidate UTXOs, table sizes,
-table/query time, returned versus full-table entries, proof bytes and
-verification time, cache hits, matching positions, selected logs, route
-mix, block gaps, gas, and inclusion time.
+table/query time, returned versus full-table entries, EIP multiproof bytes and
+verification time, block-hash cache checks, matching positions, UPT calls,
+records, proof nodes, cache hits, route mix, block gaps, gas, and inclusion
+time.
 
 Run against a fresh three-second-slot devnet:
 
@@ -301,6 +317,17 @@ node scripts/eip8304-utxo-devnet/diagnose-last-mixed-run.mjs \
   --env scripts/hegota-devnet/utxo-demo/wallets.env
 ```
 
+The mixed benchmark owns funder nonces locally and reconciles them against the
+canonical `latest` nonce between confirmed transactions. It does not trust the
+pending nonce because a queued higher-nonce transaction can make that value skip
+a missing nonce. Bootstrap rejects duplicate or already-spent carrier indices.
+Each alternating carrier bank retains its history so a post-confirmation reorg
+can refresh a re-included output or roll back to its previous unspent input.
+Raw transaction submission is idempotent by locally computed transaction hash,
+and a transaction dropped before its first receipt is re-submitted every 12
+seconds. Activity reorged just before the aligned start is classified as
+pre-range and excluded from benchmark totals.
+
 ## Sparse 100+ block wallet benchmark
 
 The dense benchmark above is deliberately unfavorable to EIP-8304: all 100
@@ -314,8 +341,8 @@ By default five events are separated by a seeded random 25-30 block gap, so the 
 event history spans at least 100 blocks. All four wallets then scan the same
 aligned 144-block range. After the range closes, the script waits 16 more blocks
 so aggregated EIP-8304 tables are committed. This lets the table wallet use
-16/64-block tables and fetch only the proven log payloads at matching
-positions. It is a relevant sparse-discovery workload, although it does not
+16/64-block tables and fetch only the proven UPT records at matching positions.
+It is a relevant sparse-discovery workload, although it does not
 assume that tables must beat a locally indexed `eth_getLogs` implementation.
 
 Run it against an already-active devnet:

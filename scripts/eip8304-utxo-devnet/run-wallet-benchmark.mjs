@@ -142,7 +142,7 @@ function htmlEscape(value) {
 function renderReport(results, seed, rpcUrl) {
   const rows = results.flatMap((item) => [
     { scenario: item.scenario, method: 'Receipt logs', className: 'logs', fanoutUtxos: item.correctness.discoveredFanoutUtxos, ...item.receiptLogs.totals },
-    { scenario: item.scenario, method: 'Extended EIP-8304', className: 'tables', fanoutUtxos: item.correctness.discoveredFanoutUtxos, ...item.eip8304Tables.totals },
+    { scenario: item.scenario, method: 'EIP-8304 + UPT', className: 'tables', fanoutUtxos: item.correctness.discoveredFanoutUtxos, ...item.eip8304Tables.totals },
   ]);
   const maximum = Math.max(...rows.map((row) => row.discoveryMs), 1);
   const averages = (method) => {
@@ -165,12 +165,12 @@ function renderReport(results, seed, rpcUrl) {
       <div class="bar-row"><span>Receipt logs</span><i class="logs" style="width:${Math.max(1, logs.discoveryMs / maximum * 100)}%"></i><b>${logs.discoveryMs.toFixed(2)} ms</b></div>
       <div class="bar-row"><span>EIP-8304</span><i class="tables" style="width:${Math.max(1, tables.discoveryMs / maximum * 100)}%"></i><b>${tables.discoveryMs.toFixed(2)} ms</b></div></section>`;
   }).join('');
-  const tableRows = rows.map((row) => `<tr><td>${row.scenario}</td><td>${row.method}</td><td>${row.discoveryMs.toFixed(3)}</td><td>${row.walletTotalMs.toFixed(3)}</td><td>${row.providerRpcMs.toFixed(3)}</td><td>${row.walletRpcCalls}</td><td>${row.responseBytes}</td><td>${row.tablesLoaded || 0}</td><td>${row.entriesExamined || 0}</td><td>${row.logPayloadRpcCalls || 0}</td><td>${row.fanoutUtxos}</td></tr>`).join('');
+  const tableRows = rows.map((row) => `<tr><td>${row.scenario}</td><td>${row.method}</td><td>${row.discoveryMs.toFixed(3)}</td><td>${row.walletTotalMs.toFixed(3)}</td><td>${row.providerRpcMs.toFixed(3)}</td><td>${row.walletRpcCalls}</td><td>${row.responseBytes}</td><td>${row.tablesLoaded || 0}</td><td>${row.entriesExamined || 0}</td><td>${row.uptRpcCalls || 0}</td><td>${row.fanoutUtxos}</td></tr>`).join('');
   return `<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>EIP-8304 wallet discovery benchmark</title><style>
     :root{color-scheme:dark;font-family:Inter,system-ui,sans-serif;background:#0b0e14;color:#edf2f7}body{max-width:1050px;margin:auto;padding:32px}h1{margin-bottom:4px}.meta{color:#98a6b8}.cards{display:grid;grid-template-columns:repeat(3,1fr);gap:12px;margin:24px 0}.card,.case{border:1px solid #273244;border-radius:12px;background:#121824;padding:16px}.card b{display:block;font-size:24px}.card small{color:#98a6b8}.pass{color:#72e2c0}.fail{color:#ff817b}.bar-row{display:grid;grid-template-columns:110px 1fr 100px;align-items:center;gap:10px;margin:9px 0}.bar-row i{display:block;height:13px;border-radius:8px}.logs{background:#9580ff}.tables{background:#72e2c0}.bar-row b{text-align:right;font:12px ui-monospace,monospace}table{width:100%;border-collapse:collapse;margin-top:26px;font-size:12px}th,td{padding:9px;border-bottom:1px solid #273244;text-align:right}th:first-child,td:first-child,th:nth-child(2),td:nth-child(2){text-align:left}@media(max-width:700px){.cards{grid-template-columns:1fr}.bar-row{grid-template-columns:90px 1fr}.bar-row b{grid-column:2}}</style></head><body>
     <h1>EIP-8304 wallet discovery</h1><div class="meta">Seed ${seed} Â· ${htmlEscape(rpcUrl)} Â· five paired scenarios</div>
-    <div class="cards"><div class="card"><b>${logsAverage.toFixed(2)} ms</b><small>mean receipt-log discovery</small></div><div class="card"><b>${tablesAverage.toFixed(2)} ms</b><small>mean EIP-8304 discovery</small></div><div class="card"><b class="${allCorrect ? 'pass' : 'fail'}">${allCorrect ? 'MATCH' : 'MISMATCH'}</b><small>result-set correctness</small></div></div>
-    ${bars}<table><thead><tr><th>Case</th><th>Method</th><th>Source ms</th><th>Wallet ms</th><th>Provider ms</th><th>Wallet calls</th><th>Bytes</th><th>Tables</th><th>Entries</th><th>Payload RPCs</th><th>Fan-out UTXOs</th></tr></thead><tbody>${tableRows}</tbody></table>
+    <div class="cards"><div class="card"><b>${logsAverage.toFixed(2)} ms</b><small>mean receipt-log discovery</small></div><div class="card"><b>${tablesAverage.toFixed(2)} ms</b><small>mean EIP-8304 + UPT discovery</small></div><div class="card"><b class="${allCorrect ? 'pass' : 'fail'}">${allCorrect ? 'MATCH' : 'MISMATCH'}</b><small>result-set correctness</small></div></div>
+    ${bars}<table><thead><tr><th>Case</th><th>Method</th><th>Source ms</th><th>Wallet ms</th><th>Provider ms</th><th>Wallet calls</th><th>Bytes</th><th>Tables</th><th>Entries</th><th>UPT RPCs</th><th>Fan-out UTXOs</th></tr></thead><tbody>${tableRows}</tbody></table>
     <p class="meta">Transaction inclusion time and gas are recorded separately in summary.json and comparison.csv; they are chain-change costs, not discovery costs.</p></body></html>`;
 }
 
@@ -406,7 +406,7 @@ async function main() {
 
   const balancesAfter = {};
   for (const wallet of allWallets) balancesAfter[wallet.name] = BigInt(await rpc('eth_getBalance', [wallet.address, 'latest'])).toString();
-  const rows = [['scenario', 'method', 'source_discovery_ms', 'wallet_total_ms', 'provider_rpc_ms', 'table_load_us', 'source_rpc_calls', 'wallet_rpc_calls', 'response_bytes', 'tables_loaded', 'entries_examined', 'matched_positions', 'root_checks', 'receipts_fetched', 'selected_logs_returned', 'log_payload_rpc_calls', 'logs_returned', 'range_blocks', 'utxos_required_per_block', 'utxos_created_in_workload_block', 'fanout_utxos_created', 'fanout_utxos_discovered', 'scenario_elapsed_ms', 'deposit_inclusion_ms', 'spend_inclusion_ms', 'deposit_gas', 'spend_gas', 'same_results']];
+  const rows = [['scenario', 'method', 'source_discovery_ms', 'wallet_total_ms', 'provider_rpc_ms', 'table_load_us', 'source_rpc_calls', 'wallet_rpc_calls', 'response_bytes', 'tables_loaded', 'entries_examined', 'matched_positions', 'root_checks', 'receipts_fetched', 'logs_returned', 'upt_rpc_calls', 'upt_root_proof_rpc_calls', 'upt_blocks_returned', 'upt_records_returned', 'upt_proof_nodes', 'upt_proof_bytes', 'upt_cache_hits', 'range_blocks', 'utxos_required_per_block', 'utxos_created_in_workload_block', 'fanout_utxos_created', 'fanout_utxos_discovered', 'scenario_elapsed_ms', 'deposit_inclusion_ms', 'spend_inclusion_ms', 'deposit_gas', 'spend_gas', 'same_results']];
   for (const item of caseResults) {
     for (const [method, value] of [['receiptLogs', item.receiptLogs], ['eip8304Tables', item.eip8304Tables]]) {
       const metrics = value.totals;
@@ -414,8 +414,9 @@ async function main() {
         item.scenario, method, metrics.discoveryMs, metrics.walletTotalMs, metrics.providerRpcMs,
         metrics.providerTableLoadMicros, metrics.rpcCalls, metrics.walletRpcCalls,
         metrics.responseBytes, metrics.tablesLoaded, metrics.entriesExamined,
-        metrics.matchedPositions, metrics.rootChecks, metrics.receiptsFetched,
-        metrics.selectedLogsReturned, metrics.logPayloadRpcCalls, metrics.logsReturned,
+        metrics.matchedPositions, metrics.rootChecks, metrics.receiptsFetched, metrics.logsReturned,
+        metrics.uptRpcCalls, metrics.uptRootProofRpcCalls, metrics.uptBlocksReturned,
+        metrics.uptRecordsReturned, metrics.uptProofNodes, metrics.uptProofBytes, metrics.uptCacheHits,
         1,
         item.correctness.requiredUtxosPerBlock, item.blocks.workloadUtxosCreated,
         item.correctness.createdFanoutUtxos, item.correctness.discoveredFanoutUtxos,

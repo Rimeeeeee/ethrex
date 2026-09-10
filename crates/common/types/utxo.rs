@@ -24,7 +24,14 @@ use ethrex_rlp::{
 };
 use serde::{Deserialize, Serialize};
 
-use crate::{Address, H256, U256, utils::keccak};
+use crate::{
+    Address, H256, U256,
+    types::{Log, Receipt},
+    utils::keccak,
+};
+use libssz_merkle::{Sha2Hasher, Sha256Hasher};
+use std::collections::{BTreeMap, BTreeSet};
+use thiserror::Error;
 
 /// Vault system contract address (`address(0x8312)`). Holds every unspent
 /// UTXO's value; its code handles deposits only, and every other write to its
@@ -73,6 +80,43 @@ pub const UTXO_CREATED_TOPIC: H256 = H256([
     0x55, 0xa9, 0x07, 0x18, 0x37, 0x42, 0xa4, 0xb6, 0x3a, 0xa8, 0x24, 0xc5, 0x76, 0x29, 0x6f, 0x5e,
 ]);
 
+/// Version of the experimental self-contained UTXO Proof Table archive object.
+pub const UTXO_PROOF_TABLE_FORMAT_VERSION: u16 = 2;
+
+/// Domain from the UPT v2 proposal, separating a block-table content hash from
+/// every other SHA-256 commitment.
+pub const UTXO_PROOF_TABLE_HASH_DOMAIN: &[u8] = b"UPT_BLOCK_V2\0";
+
+/// The opening fields authenticated by the native UTXO openings root.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct UtxoOpening {
+    pub index: u64,
+    pub source: Address,
+    pub recipient: Address,
+    pub value: U256,
+}
+
+/// Decode the canonical four-topic `UtxoCreated` event used by deposits and
+/// settlement outputs. Malformed or foreign logs are not native openings.
+pub fn decode_utxo_created_log(log: &Log) -> Option<UtxoOpening> {
+    if log.address != utxo_vault()
+        || log.topics.len() != 4
+        || log.topics[0] != UTXO_CREATED_TOPIC
+        || log.data.len() != 32
+        || log.topics[1].as_bytes()[..12] != [0; 12]
+        || log.topics[2].as_bytes()[..12] != [0; 12]
+        || log.topics[3].as_bytes()[..24] != [0; 24]
+    {
+        return None;
+    }
+    Some(UtxoOpening {
+        index: u64::from_be_bytes(log.topics[3].as_bytes()[24..].try_into().ok()?),
+        source: Address::from_slice(&log.topics[1].as_bytes()[12..]),
+        recipient: Address::from_slice(&log.topics[2].as_bytes()[12..]),
+        value: U256::from_big_endian(&log.data),
+    })
+}
+
 /// Regular-gas components of `utxo_frame_gas`, per the EIP's schedule. The
 /// state-gas components depend on the live EIP-8037 per-byte cost, so the VM adds
 /// them; admission uses [`Spend::admission_gas`], which sums both with the
@@ -80,7 +124,7 @@ pub const UTXO_CREATED_TOPIC: H256 = H256([
 pub const GAS_UTXO_FRAME: u64 = 13_000;
 pub const GAS_UTXO_INPUT: u64 = 16_048;
 pub const GAS_UTXO_SIBLING: u64 = 42;
-pub const GAS_UTXO_OUT: u64 = 2_012;
+pub const GAS_UTXO_OUT: u64 = 2_131;
 pub const GAS_UTXO_ACCOUNT_OUT: u64 = 9_000;
 /// Canonical EIP-8037 values at the pinned per-state-byte cost. levm asserts at
 /// compile time that its derived values agree with these.
@@ -648,4 +692,646 @@ pub fn merkle_proof(leaves: &[H256], position: usize) -> Option<Vec<H256>> {
         idx /= 2;
     }
     Some(proof)
+}
+
+/// One self-contained UTXO opening joined to its EIP-8304 event position.
+/// Records are stored in ascending global-index order; their array offset is
+/// the opening position and is therefore not duplicated in this structure.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct UtxoProofRecord {
+    pub index: u64,
+    pub source: Address,
+    pub recipient: Address,
+    pub value: U256,
+    pub transaction_index: u32,
+    pub transaction_log_index: u32,
+}
+
+impl UtxoProofRecord {
+    pub const ENCODED_LEN: usize = 88;
+
+    pub fn opening_leaf(&self) -> H256 {
+        opening_leaf(self.index, self.source, self.recipient, self.value)
+    }
+
+    fn encode_into(&self, encoded: &mut Vec<u8>) {
+        encoded.extend_from_slice(&self.index.to_be_bytes());
+        encoded.extend_from_slice(self.source.as_bytes());
+        encoded.extend_from_slice(self.recipient.as_bytes());
+        encoded.extend_from_slice(&self.value.to_big_endian());
+        encoded.extend_from_slice(&self.transaction_index.to_be_bytes());
+        encoded.extend_from_slice(&self.transaction_log_index.to_be_bytes());
+    }
+
+    fn decode(encoded: &[u8]) -> Result<Self, UtxoProofTableError> {
+        if encoded.len() != Self::ENCODED_LEN {
+            return Err(UtxoProofTableError::Malformed("invalid record length"));
+        }
+        Ok(Self {
+            index: u64::from_be_bytes(
+                encoded[..8]
+                    .try_into()
+                    .map_err(|_| UtxoProofTableError::Malformed("invalid record index"))?,
+            ),
+            source: Address::from_slice(&encoded[8..28]),
+            recipient: Address::from_slice(&encoded[28..48]),
+            value: U256::from_big_endian(&encoded[48..80]),
+            transaction_index: u32::from_be_bytes(
+                encoded[80..84]
+                    .try_into()
+                    .map_err(|_| UtxoProofTableError::Malformed("invalid transaction index"))?,
+            ),
+            transaction_log_index: u32::from_be_bytes(
+                encoded[84..88]
+                    .try_into()
+                    .map_err(|_| UtxoProofTableError::Malformed("invalid transaction log index"))?,
+            ),
+        })
+    }
+}
+
+/// One node in a shared openings-tree multiproof. `level == 0` addresses the
+/// padded leaf layer and increasing levels approach the root.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct UtxoProofNode {
+    pub level: usize,
+    pub node_index: usize,
+    pub hash: H256,
+}
+
+/// Block-scoped UTXO Proof Table retained outside Ethereum state.
+/// Its contents remain untrusted until a wallet verifies `openings_root`
+/// against the native vault and folds the selected records to that root.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct UtxoProofTable {
+    chain_id: u64,
+    vault: Address,
+    block_number: u64,
+    block_hash: H256,
+    openings_root: H256,
+    records: Vec<UtxoProofRecord>,
+    internal_nodes: Vec<H256>,
+    event_position_index: BTreeMap<(u32, u32), usize>,
+}
+
+#[derive(Clone, Debug, Error, PartialEq, Eq)]
+pub enum UtxoProofTableError {
+    #[error("UTXO proof table contains too many transactions or logs")]
+    PositionOverflow,
+    #[error("UTXO proof table indexes are duplicate or non-consecutive")]
+    NonConsecutiveIndexes,
+    #[error("UTXO proof table contains duplicate event positions")]
+    DuplicateEventPositions,
+    #[error("malformed UTXO proof table: {0}")]
+    Malformed(&'static str),
+    #[error("stored UTXO proof table root does not match its records")]
+    RootMismatch,
+    #[error("stored UTXO proof table internal nodes do not match its records")]
+    InternalNodesMismatch,
+}
+
+impl UtxoProofTable {
+    const STORAGE_HEADER_LEN: usize = 2 + 32 + 20 + 8 + 32 + 32 + 4 + 4;
+
+    /// Build the block UPT from canonical receipts. This parser is shared with
+    /// consensus root construction through [`decode_utxo_created_log`] and
+    /// [`opening_leaf`], preventing the archive and accepted root from drifting.
+    pub fn from_receipts(
+        chain_id: u64,
+        block_number: u64,
+        block_hash: H256,
+        receipts: &[Receipt],
+    ) -> Result<Self, UtxoProofTableError> {
+        let mut records = Vec::new();
+        for (transaction_index, receipt) in receipts.iter().enumerate() {
+            let transaction_index = u32::try_from(transaction_index)
+                .map_err(|_| UtxoProofTableError::PositionOverflow)?;
+            for (transaction_log_index, log) in receipt.logs.iter().enumerate() {
+                let Some(opening) = decode_utxo_created_log(log) else {
+                    continue;
+                };
+                records.push(UtxoProofRecord {
+                    index: opening.index,
+                    source: opening.source,
+                    recipient: opening.recipient,
+                    value: opening.value,
+                    transaction_index,
+                    transaction_log_index: u32::try_from(transaction_log_index)
+                        .map_err(|_| UtxoProofTableError::PositionOverflow)?,
+                });
+            }
+        }
+        records.sort_unstable_by_key(|record| record.index);
+        u32::try_from(records.len()).map_err(|_| UtxoProofTableError::PositionOverflow)?;
+        Self::STORAGE_HEADER_LEN
+            .checked_add(
+                records
+                    .len()
+                    .checked_mul(UtxoProofRecord::ENCODED_LEN)
+                    .ok_or(UtxoProofTableError::PositionOverflow)?,
+            )
+            .and_then(|offset| u32::try_from(offset).ok())
+            .ok_or(UtxoProofTableError::PositionOverflow)?;
+        let event_position_index = validate_records(&records)?;
+        let leaves = records
+            .iter()
+            .map(UtxoProofRecord::opening_leaf)
+            .collect::<Vec<_>>();
+        let openings_root = merkle_root(&leaves);
+        let internal_nodes = opening_internal_nodes(&leaves);
+        u32::try_from(internal_nodes.len()).map_err(|_| UtxoProofTableError::PositionOverflow)?;
+        Ok(Self {
+            chain_id,
+            vault: utxo_vault(),
+            block_number,
+            block_hash,
+            openings_root,
+            records,
+            internal_nodes,
+            event_position_index,
+        })
+    }
+
+    pub const fn chain_id(&self) -> u64 {
+        self.chain_id
+    }
+
+    pub const fn vault(&self) -> Address {
+        self.vault
+    }
+
+    pub const fn block_number(&self) -> u64 {
+        self.block_number
+    }
+
+    pub const fn block_hash(&self) -> H256 {
+        self.block_hash
+    }
+
+    pub const fn openings_root(&self) -> H256 {
+        self.openings_root
+    }
+
+    pub fn records(&self) -> &[UtxoProofRecord] {
+        &self.records
+    }
+
+    pub fn internal_nodes(&self) -> &[H256] {
+        &self.internal_nodes
+    }
+
+    pub fn table_hash(&self) -> H256 {
+        let encoded = self.encode_canonical_ssz();
+        let mut preimage = Vec::with_capacity(UTXO_PROOF_TABLE_HASH_DOMAIN.len() + encoded.len());
+        preimage.extend_from_slice(UTXO_PROOF_TABLE_HASH_DOMAIN);
+        preimage.extend_from_slice(&encoded);
+        H256(Sha2Hasher.hash(&preimage))
+    }
+
+    /// Canonical SSZ serialization used by the UPT v2 `table_hash`. Both lists
+    /// contain fixed-size elements, so the two offsets are sufficient and the
+    /// still-open maximum-list bounds do not affect serialized bytes.
+    pub fn encode_canonical_ssz(&self) -> Vec<u8> {
+        let records_offset = u32::try_from(Self::STORAGE_HEADER_LEN)
+            .expect("the fixed UPT header length fits uint32");
+        let records_bytes = self
+            .records
+            .len()
+            .checked_mul(UtxoProofRecord::ENCODED_LEN)
+            .expect("UPT record byte length fits usize");
+        let internal_nodes_offset = usize::try_from(records_offset)
+            .expect("uint32 fits usize")
+            .checked_add(records_bytes)
+            .and_then(|offset| u32::try_from(offset).ok())
+            .expect("UPT construction bounds its record list to uint32");
+        let internal_node_bytes = self
+            .internal_nodes
+            .len()
+            .checked_mul(32)
+            .expect("UPT internal-node byte length fits usize");
+        let capacity = usize::try_from(internal_nodes_offset)
+            .expect("uint32 fits usize")
+            .checked_add(internal_node_bytes)
+            .expect("UPT canonical encoding length fits usize");
+        let mut encoded = Vec::with_capacity(capacity);
+        encoded.extend_from_slice(&UTXO_PROOF_TABLE_FORMAT_VERSION.to_le_bytes());
+        encoded.extend_from_slice(&U256::from(self.chain_id).to_little_endian());
+        encoded.extend_from_slice(self.vault.as_bytes());
+        encoded.extend_from_slice(&self.block_number.to_le_bytes());
+        encoded.extend_from_slice(self.block_hash.as_bytes());
+        encoded.extend_from_slice(self.openings_root.as_bytes());
+        encoded.extend_from_slice(&records_offset.to_le_bytes());
+        encoded.extend_from_slice(&internal_nodes_offset.to_le_bytes());
+        for record in &self.records {
+            encoded.extend_from_slice(&record.index.to_le_bytes());
+            encoded.extend_from_slice(record.source.as_bytes());
+            encoded.extend_from_slice(record.recipient.as_bytes());
+            encoded.extend_from_slice(&record.value.to_little_endian());
+            encoded.extend_from_slice(&record.transaction_index.to_le_bytes());
+            encoded.extend_from_slice(&record.transaction_log_index.to_le_bytes());
+        }
+        for node in &self.internal_nodes {
+            encoded.extend_from_slice(node.as_bytes());
+        }
+        encoded
+    }
+
+    /// Select records by event position and construct one minimal shared
+    /// openings-tree multiproof for all selected records in this block.
+    pub fn select_by_event_positions(
+        &self,
+        positions: &BTreeSet<(u32, u32)>,
+    ) -> Result<(Vec<(usize, UtxoProofRecord)>, Vec<UtxoProofNode>), UtxoProofTableError> {
+        let mut selected = positions
+            .iter()
+            .map(|position| {
+                let index = *self.event_position_index.get(position).ok_or(
+                    UtxoProofTableError::Malformed(
+                        "requested event position is not a UTXO opening",
+                    ),
+                )?;
+                Ok((index, self.records[index]))
+            })
+            .collect::<Result<Vec<_>, UtxoProofTableError>>()?;
+        selected.sort_unstable_by_key(|(index, _)| *index);
+        let indices = selected.iter().map(|(index, _)| *index).collect::<Vec<_>>();
+        let proof = self.stored_opening_multiproof(&indices)?;
+        Ok((selected, proof))
+    }
+
+    fn stored_opening_multiproof(
+        &self,
+        indices: &[usize],
+    ) -> Result<Vec<UtxoProofNode>, UtxoProofTableError> {
+        if indices.iter().any(|index| *index >= self.records.len()) {
+            return Err(UtxoProofTableError::Malformed("invalid opening selection"));
+        }
+        if indices.is_empty() || self.records.len() <= 1 {
+            return Ok(Vec::new());
+        }
+        let width = self.records.len().next_power_of_two();
+        let height = width.trailing_zeros() as usize;
+        let mut known = indices.iter().copied().collect::<BTreeSet<_>>();
+        let mut proof = BTreeMap::new();
+        for level in 0..height {
+            for index in &known {
+                let sibling = *index ^ 1;
+                if known.contains(&sibling) {
+                    continue;
+                }
+                let hash = if level == 0 {
+                    self.records
+                        .get(sibling)
+                        .map(UtxoProofRecord::opening_leaf)
+                        .unwrap_or_default()
+                } else {
+                    let depth = height - level;
+                    let heap_index = (1usize << depth) - 1 + sibling;
+                    *self
+                        .internal_nodes
+                        .get(heap_index)
+                        .ok_or(UtxoProofTableError::InternalNodesMismatch)?
+                };
+                proof.insert((level, sibling), hash);
+            }
+            known = known.into_iter().map(|index| index / 2).collect();
+        }
+        Ok(proof
+            .into_iter()
+            .map(|((level, node_index), hash)| UtxoProofNode {
+                level,
+                node_index,
+                hash,
+            })
+            .collect())
+    }
+
+    /// Local persistence encoding. The RPC exposes typed fields; this compact
+    /// fixed-width format is deliberately independent of JSON serialization.
+    pub fn encode_storage(&self) -> Vec<u8> {
+        let mut encoded = Vec::with_capacity(
+            Self::STORAGE_HEADER_LEN
+                + self.records.len() * UtxoProofRecord::ENCODED_LEN
+                + self.internal_nodes.len() * 32,
+        );
+        encoded.extend_from_slice(&UTXO_PROOF_TABLE_FORMAT_VERSION.to_be_bytes());
+        let mut chain_id = [0u8; 32];
+        chain_id[24..].copy_from_slice(&self.chain_id.to_be_bytes());
+        encoded.extend_from_slice(&chain_id);
+        encoded.extend_from_slice(self.vault.as_bytes());
+        encoded.extend_from_slice(&self.block_number.to_be_bytes());
+        encoded.extend_from_slice(self.block_hash.as_bytes());
+        encoded.extend_from_slice(self.openings_root.as_bytes());
+        encoded.extend_from_slice(&(self.records.len() as u32).to_be_bytes());
+        encoded.extend_from_slice(&(self.internal_nodes.len() as u32).to_be_bytes());
+        for record in &self.records {
+            record.encode_into(&mut encoded);
+        }
+        for node in &self.internal_nodes {
+            encoded.extend_from_slice(node.as_bytes());
+        }
+        encoded
+    }
+
+    pub fn decode_storage(encoded: &[u8]) -> Result<Self, UtxoProofTableError> {
+        if encoded.len() < Self::STORAGE_HEADER_LEN {
+            return Err(UtxoProofTableError::Malformed("truncated header"));
+        }
+        let version = u16::from_be_bytes(
+            encoded[..2]
+                .try_into()
+                .map_err(|_| UtxoProofTableError::Malformed("invalid version"))?,
+        );
+        if version != UTXO_PROOF_TABLE_FORMAT_VERSION {
+            return Err(UtxoProofTableError::Malformed("unsupported version"));
+        }
+        if encoded[2..26] != [0; 24] {
+            return Err(UtxoProofTableError::Malformed("chain ID exceeds uint64"));
+        }
+        let chain_id = u64::from_be_bytes(
+            encoded[26..34]
+                .try_into()
+                .map_err(|_| UtxoProofTableError::Malformed("invalid chain ID"))?,
+        );
+        let vault = Address::from_slice(&encoded[34..54]);
+        if vault != utxo_vault() {
+            return Err(UtxoProofTableError::Malformed("unexpected vault"));
+        }
+        let block_number = u64::from_be_bytes(
+            encoded[54..62]
+                .try_into()
+                .map_err(|_| UtxoProofTableError::Malformed("invalid block number"))?,
+        );
+        let block_hash = H256::from_slice(&encoded[62..94]);
+        let openings_root = H256::from_slice(&encoded[94..126]);
+        let record_count = u32::from_be_bytes(
+            encoded[126..130]
+                .try_into()
+                .map_err(|_| UtxoProofTableError::Malformed("invalid record count"))?,
+        ) as usize;
+        let internal_count = u32::from_be_bytes(
+            encoded[130..134]
+                .try_into()
+                .map_err(|_| UtxoProofTableError::Malformed("invalid node count"))?,
+        ) as usize;
+        let expected_len = Self::STORAGE_HEADER_LEN
+            .checked_add(
+                record_count
+                    .checked_mul(UtxoProofRecord::ENCODED_LEN)
+                    .ok_or(UtxoProofTableError::Malformed("record length overflow"))?,
+            )
+            .and_then(|length| {
+                internal_count
+                    .checked_mul(32)
+                    .and_then(|nodes| length.checked_add(nodes))
+            })
+            .ok_or(UtxoProofTableError::Malformed("table length overflow"))?;
+        if encoded.len() != expected_len {
+            return Err(UtxoProofTableError::Malformed("payload length mismatch"));
+        }
+        let mut offset = Self::STORAGE_HEADER_LEN;
+        let mut records = Vec::with_capacity(record_count);
+        for _ in 0..record_count {
+            let end = offset + UtxoProofRecord::ENCODED_LEN;
+            records.push(UtxoProofRecord::decode(&encoded[offset..end])?);
+            offset = end;
+        }
+        let event_position_index = validate_records(&records)?;
+        let mut internal_nodes = Vec::with_capacity(internal_count);
+        for _ in 0..internal_count {
+            internal_nodes.push(H256::from_slice(&encoded[offset..offset + 32]));
+            offset += 32;
+        }
+        let leaves = records
+            .iter()
+            .map(UtxoProofRecord::opening_leaf)
+            .collect::<Vec<_>>();
+        if merkle_root(&leaves) != openings_root {
+            return Err(UtxoProofTableError::RootMismatch);
+        }
+        if opening_internal_nodes(&leaves) != internal_nodes {
+            return Err(UtxoProofTableError::InternalNodesMismatch);
+        }
+        Ok(Self {
+            chain_id,
+            vault,
+            block_number,
+            block_hash,
+            openings_root,
+            records,
+            internal_nodes,
+            event_position_index,
+        })
+    }
+}
+
+fn validate_records(
+    records: &[UtxoProofRecord],
+) -> Result<BTreeMap<(u32, u32), usize>, UtxoProofTableError> {
+    if records.windows(2).any(|pair| {
+        pair[0]
+            .index
+            .checked_add(1)
+            .is_none_or(|next| pair[1].index != next)
+    }) {
+        return Err(UtxoProofTableError::NonConsecutiveIndexes);
+    }
+    let mut positions = BTreeMap::new();
+    for (index, record) in records.iter().enumerate() {
+        if positions
+            .insert(
+                (record.transaction_index, record.transaction_log_index),
+                index,
+            )
+            .is_some()
+        {
+            return Err(UtxoProofTableError::DuplicateEventPositions);
+        }
+    }
+    Ok(positions)
+}
+
+/// Heap-prefix internal-node representation required by UPT v2. Leaf hashes
+/// remain recomputable from records and are intentionally not duplicated.
+fn opening_internal_nodes(leaves: &[H256]) -> Vec<H256> {
+    if leaves.len() <= 1 {
+        return Vec::new();
+    }
+    let width = leaves.len().next_power_of_two();
+    let mut heap = vec![H256::zero(); width * 2 - 1];
+    heap[width - 1..width - 1 + leaves.len()].copy_from_slice(leaves);
+    for index in (0..width - 1).rev() {
+        heap[index] = hash_pair(heap[index * 2 + 1], heap[index * 2 + 2]);
+    }
+    heap.truncate(width - 1);
+    heap
+}
+
+/// Minimal shared proof for multiple openings. When both children are selected,
+/// neither is repeated as a proof node; their parent is computed directly.
+pub fn opening_multiproof(leaves: &[H256], indices: &[usize]) -> Option<Vec<UtxoProofNode>> {
+    if indices.iter().any(|index| *index >= leaves.len()) {
+        return None;
+    }
+    if indices.is_empty() || leaves.len() <= 1 {
+        return Some(Vec::new());
+    }
+    let width = leaves.len().next_power_of_two();
+    let mut layer = leaves.to_vec();
+    layer.resize(width, H256::zero());
+    let mut layers = vec![layer.clone()];
+    while layer.len() > 1 {
+        layer = layer
+            .chunks_exact(2)
+            .map(|pair| hash_pair(pair[0], pair[1]))
+            .collect();
+        layers.push(layer.clone());
+    }
+
+    let mut known = indices.iter().copied().collect::<BTreeSet<_>>();
+    let mut proof = BTreeMap::new();
+    for (level, layer) in layers.iter().take(layers.len() - 1).enumerate() {
+        for index in &known {
+            let sibling = *index ^ 1;
+            if !known.contains(&sibling) {
+                proof.insert((level, sibling), layer[sibling]);
+            }
+        }
+        known = known.into_iter().map(|index| index / 2).collect();
+    }
+    Some(
+        proof
+            .into_iter()
+            .map(|((level, node_index), hash)| UtxoProofNode {
+                level,
+                node_index,
+                hash,
+            })
+            .collect(),
+    )
+}
+
+#[cfg(test)]
+mod proof_table_tests {
+    use super::*;
+    use crate::types::TxType;
+
+    fn address_topic(address: Address) -> H256 {
+        let mut topic = [0u8; 32];
+        topic[12..].copy_from_slice(address.as_bytes());
+        H256(topic)
+    }
+
+    fn index_topic(index: u64) -> H256 {
+        let mut topic = [0u8; 32];
+        topic[24..].copy_from_slice(&index.to_be_bytes());
+        H256(topic)
+    }
+
+    fn created_log(index: u64, source: Address, recipient: Address, value: U256) -> Log {
+        Log {
+            address: utxo_vault(),
+            topics: vec![
+                UTXO_CREATED_TOPIC,
+                address_topic(source),
+                address_topic(recipient),
+                index_topic(index),
+            ],
+            data: Bytes::copy_from_slice(&value.to_big_endian()),
+        }
+    }
+
+    #[test]
+    fn canonical_log_decoder_rejects_the_old_three_topic_shape() {
+        let source = Address::repeat_byte(0x11);
+        let recipient = Address::repeat_byte(0x22);
+        let value = U256::from(99u64);
+        let canonical = created_log(7, source, recipient, value);
+        assert_eq!(
+            decode_utxo_created_log(&canonical),
+            Some(UtxoOpening {
+                index: 7,
+                source,
+                recipient,
+                value,
+            })
+        );
+
+        let mut legacy = canonical;
+        legacy.topics.pop();
+        let mut legacy_data = [0u8; 64];
+        legacy_data[24..32].copy_from_slice(&7u64.to_be_bytes());
+        legacy_data[32..].copy_from_slice(&value.to_big_endian());
+        legacy.data = Bytes::copy_from_slice(&legacy_data);
+        assert_eq!(decode_utxo_created_log(&legacy), None);
+    }
+
+    #[test]
+    fn proof_table_round_trips_and_selects_one_shared_opening_proof() {
+        let source = Address::repeat_byte(0x11);
+        let recipient = Address::repeat_byte(0x22);
+        let foreign = Log {
+            address: Address::repeat_byte(0xff),
+            topics: Vec::new(),
+            data: Bytes::new(),
+        };
+        let receipts = vec![
+            Receipt::new(
+                TxType::Legacy,
+                true,
+                0,
+                vec![
+                    foreign,
+                    created_log(10, source, recipient, U256::from(100u64)),
+                    created_log(11, source, recipient, U256::from(200u64)),
+                ],
+            ),
+            Receipt::new(
+                TxType::Legacy,
+                true,
+                0,
+                vec![created_log(12, recipient, source, U256::from(300u64))],
+            ),
+        ];
+        let table = UtxoProofTable::from_receipts(31_337, 5, H256::repeat_byte(0x33), &receipts)
+            .expect("valid proof table");
+        assert_eq!(table.records().len(), 3);
+        assert_eq!(table.records()[0].transaction_log_index, 1);
+        assert_eq!(
+            table.openings_root(),
+            merkle_root(
+                &table
+                    .records()
+                    .iter()
+                    .map(UtxoProofRecord::opening_leaf)
+                    .collect::<Vec<_>>()
+            )
+        );
+
+        let encoded = table.encode_storage();
+        assert_eq!(UtxoProofTable::decode_storage(&encoded).unwrap(), table);
+        assert_ne!(table.table_hash(), H256::zero());
+
+        let requested = BTreeSet::from([(0, 1), (1, 0)]);
+        let (selected, proof) = table.select_by_event_positions(&requested).unwrap();
+        assert_eq!(
+            selected
+                .iter()
+                .map(|(_, record)| record.index)
+                .collect::<Vec<_>>(),
+            [10, 12]
+        );
+        assert_eq!(proof.len(), 2);
+        assert_eq!(proof[0].level, 0);
+        assert_eq!(proof[0].node_index, 1);
+        assert_eq!(proof[1].level, 0);
+        assert_eq!(proof[1].node_index, 3);
+
+        let mut corrupt = encoded;
+        corrupt[UtxoProofTable::STORAGE_HEADER_LEN + 48] ^= 1;
+        assert_eq!(
+            UtxoProofTable::decode_storage(&corrupt),
+            Err(UtxoProofTableError::RootMismatch)
+        );
+    }
 }

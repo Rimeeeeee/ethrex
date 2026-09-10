@@ -9,19 +9,18 @@ use ethrex_blockchain::vm::StoreVmDatabase;
 use ethrex_common::{
     Address, U256,
     types::{
-        BlockHeader, FRAME_RECEIPT_STATUS_SUCCESS, PrefixShape, Transaction, ValidationPrefix,
-        calculate_base_fee_per_blob_gas,
-        eip8304::{
-            EncodedIndexEntry, IndexTable, TABLE_SIZES, TABLES_PER_LEVEL, log_commitment,
-            table_entry_proofs,
-        },
+        BlockHeader, FRAME_RECEIPT_STATUS_SUCCESS, PrefixShape, RING_SIZE, Transaction,
+        UTXO_PROOF_TABLE_FORMAT_VERSION, UtxoProofNode, UtxoProofRecord, UtxoProofTable,
+        ValidationPrefix, calculate_base_fee_per_blob_gas,
+        eip8304::{EncodedIndexEntry, IndexTable, TABLE_SIZES, TABLES_PER_LEVEL, table_multiproof},
+        ring_slot,
     },
 };
 use ethrex_vm::backends::{FrameValidationOutcome, levm::get_max_allowed_gas_limit};
 use serde::Serialize;
 use serde_json::Value;
 use std::{
-    collections::{HashMap, HashSet, hash_map::Entry},
+    collections::{BTreeMap, BTreeSet, HashSet},
     time::Instant,
 };
 
@@ -80,6 +79,7 @@ pub struct QueryEip8304TableRequest {
     pub first_block: BlockIdentifier,
     pub table_size: u64,
     queries: Vec<Eip8304ContentQuery>,
+    candidate_type_ids: Vec<u16>,
 }
 
 #[derive(Debug)]
@@ -130,23 +130,22 @@ struct Eip8304TableQueryResult {
     table_root: String,
     queries: Vec<Eip8304PostingRange>,
     transactions: Vec<Eip8304ProvenEntry>,
-    log_commitments: Vec<Eip8304ProvenEntry>,
+    candidate_entries: Vec<Eip8304ProvenEntry>,
+    proof_format: &'static str,
     proof_nodes: Vec<Eip8304ProofNode>,
     load_micros: u128,
     query_micros: u128,
 }
 
-/// A batched request for raw logs at positions already proven through an
-/// EIP-8304 content query. The response intentionally contains no receipt
-/// envelope: the wallet authenticates each payload against its type-7 table
-/// commitment.
+/// Batched UPT request for event positions already discovered through a
+/// recipient-first EIP-8304 query.
 #[derive(Debug)]
-pub struct GetEip8304LogsRequest {
-    positions: Vec<Eip8304LogPosition>,
+pub struct GetUtxoProofsRequest {
+    positions: Vec<UtxoEventPosition>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
-struct Eip8304LogPosition {
+struct UtxoEventPosition {
     block_number: u64,
     transaction_index: u32,
     log_index: u32,
@@ -154,15 +153,44 @@ struct Eip8304LogPosition {
 
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
-struct Eip8304SelectedLog {
+struct UtxoProofRecordResult {
+    position: String,
+    index: String,
+    source: String,
+    recipient: String,
+    value: String,
+    transaction_index: String,
+    transaction_log_index: String,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct UtxoProofNodeResult {
+    level: usize,
+    node_index: String,
+    hash: String,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct UtxoBlockProofResult {
+    format_version: u16,
+    chain_id: String,
+    vault: String,
     block_number: String,
     block_hash: String,
-    transaction_index: String,
-    log_index: String,
-    address: String,
-    topics: Vec<String>,
-    data: String,
-    log_root: String,
+    openings_root: String,
+    root_storage_slot: String,
+    table_hash: String,
+    record_count: String,
+    records: Vec<UtxoProofRecordResult>,
+    proof_nodes: Vec<UtxoProofNodeResult>,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct UtxoProofsResult {
+    blocks: Vec<UtxoBlockProofResult>,
 }
 
 impl RpcHandler for GetEip8304TableRequest {
@@ -246,9 +274,9 @@ impl RpcHandler for QueryEip8304TableRequest {
         let params = params
             .as_ref()
             .ok_or(RpcErr::BadParams("No params provided".to_owned()))?;
-        if params.len() != 3 {
+        if !(3..=4).contains(&params.len()) {
             return Err(RpcErr::BadParams(format!(
-                "Expected three params and {} were provided",
+                "Expected three or four params and {} were provided",
                 params.len()
             )));
         }
@@ -272,10 +300,22 @@ impl RpcHandler for QueryEip8304TableRequest {
             .enumerate()
             .map(|(index, value)| parse_content_query(value, index))
             .collect::<Result<Vec<_>, _>>()?;
+        let candidate_type_ids = params
+            .get(3)
+            .map(parse_candidate_type_ids)
+            .transpose()?
+            .unwrap_or_default();
+        if !candidate_type_ids.is_empty() && (queries.len() != 1 || queries[0].type_id != 5) {
+            return Err(RpcErr::BadParams(
+                "candidate type proofs require exactly one complete type-5 recipient range"
+                    .to_owned(),
+            ));
+        }
         Ok(Self {
             first_block,
             table_size,
             queries,
+            candidate_type_ids,
         })
     }
 
@@ -329,11 +369,12 @@ impl RpcHandler for QueryEip8304TableRequest {
             commitment_block,
             load_micros,
             &self.queries,
+            &self.candidate_type_ids,
         )
     }
 }
 
-impl RpcHandler for GetEip8304LogsRequest {
+impl RpcHandler for GetUtxoProofsRequest {
     fn parse(params: &Option<Vec<Value>>) -> Result<Self, RpcErr> {
         let params = params
             .as_ref()
@@ -373,7 +414,7 @@ impl RpcHandler for GetEip8304LogsRequest {
                 u32::try_from(parse_quantity(field("logIndex")?, 0)?).map_err(|_| {
                     RpcErr::BadParams(format!("position {index}.logIndex exceeds uint32"))
                 })?;
-            let position = Eip8304LogPosition {
+            let position = UtxoEventPosition {
                 block_number,
                 transaction_index,
                 log_index,
@@ -389,56 +430,91 @@ impl RpcHandler for GetEip8304LogsRequest {
     }
 
     async fn handle(&self, context: RpcApiContext) -> Result<Value, RpcErr> {
-        let mut blocks = HashMap::new();
-        let mut selected = Vec::with_capacity(self.positions.len());
+        let latest = context.storage.get_latest_block_number().await?;
+        let mut requested_by_block = BTreeMap::<u64, BTreeSet<(u32, u32)>>::new();
         for position in &self.positions {
-            if let Entry::Vacant(entry) = blocks.entry(position.block_number) {
-                let header = context
-                    .storage
-                    .get_block_header(position.block_number)?
-                    .ok_or_else(|| {
-                        RpcErr::WrongParam(format!("blockNumber {}", position.block_number))
-                    })?;
-                let block_hash = header.hash();
-                let receipts = context.storage.get_receipts_for_block(&block_hash).await?;
-                entry.insert((block_hash, receipts));
+            requested_by_block
+                .entry(position.block_number)
+                .or_default()
+                .insert((position.transaction_index, position.log_index));
+        }
+
+        let chain_id = context.storage.get_chain_config().chain_id;
+        let mut blocks = Vec::with_capacity(requested_by_block.len());
+        for (block_number, positions) in requested_by_block {
+            if latest.saturating_sub(block_number) >= RING_SIZE {
+                return Err(RpcErr::BadParams(format!(
+                    "block {block_number} has left the recent openings-root ring; batched archive paths are not available in this devnet profile"
+                )));
             }
-            let (block_hash, receipts) = blocks
-                .get(&position.block_number)
-                .expect("requested block was inserted above");
-            let receipt = receipts
-                .get(position.transaction_index as usize)
-                .ok_or_else(|| {
-                    RpcErr::WrongParam(format!(
-                        "transactionIndex {} in block {}",
-                        position.transaction_index, position.block_number
-                    ))
-                })?;
-            let log = receipt
-                .logs
-                .get(position.log_index as usize)
-                .ok_or_else(|| {
-                    RpcErr::WrongParam(format!(
-                        "logIndex {} in block {} transaction {}",
-                        position.log_index, position.block_number, position.transaction_index
-                    ))
-                })?;
-            selected.push(Eip8304SelectedLog {
-                block_number: format!("0x{:x}", position.block_number),
-                block_hash: format!("{block_hash:#x}"),
-                transaction_index: format!("0x{:x}", position.transaction_index),
-                log_index: format!("0x{:x}", position.log_index),
-                address: format!("{:#x}", log.address),
-                topics: log
-                    .topics
-                    .iter()
-                    .map(|topic| format!("{topic:#x}"))
+            let header = context
+                .storage
+                .get_block_header(block_number)?
+                .ok_or_else(|| RpcErr::WrongParam(format!("blockNumber {block_number}")))?;
+            let block_hash = header.hash();
+            let table = match context.storage.get_utxo_proof_table(block_hash)? {
+                Some(table) => table,
+                None => {
+                    let receipts = context.storage.get_receipts_for_block(&block_hash).await?;
+                    let table = UtxoProofTable::from_receipts(
+                        chain_id,
+                        block_number,
+                        block_hash,
+                        &receipts,
+                    )
+                    .map_err(|error| RpcErr::Internal(error.to_string()))?;
+                    context.storage.store_utxo_proof_table(&table)?;
+                    table
+                }
+            };
+            if table.chain_id() != chain_id || table.block_number() != block_number {
+                return Err(RpcErr::Internal(
+                    "persisted UTXO proof table metadata does not match the canonical chain"
+                        .to_owned(),
+                ));
+            }
+            let (records, proof_nodes) = table
+                .select_by_event_positions(&positions)
+                .map_err(|error| RpcErr::WrongParam(error.to_string()))?;
+            blocks.push(UtxoBlockProofResult {
+                format_version: UTXO_PROOF_TABLE_FORMAT_VERSION,
+                chain_id: format!("0x{:x}", table.chain_id()),
+                vault: format!("{:#x}", table.vault()),
+                block_number: format!("0x{:x}", table.block_number()),
+                block_hash: format!("{:#x}", table.block_hash()),
+                openings_root: format!("{:#x}", table.openings_root()),
+                root_storage_slot: format!("{:#x}", ring_slot(block_number)),
+                table_hash: format!("{:#x}", table.table_hash()),
+                record_count: format!("0x{:x}", table.records().len()),
+                records: records
+                    .into_iter()
+                    .map(|(position, record)| utxo_record_to_result(position, record))
                     .collect(),
-                data: format!("0x{}", hex::encode(&log.data)),
-                log_root: format!("{:#x}", log_commitment(log)),
+                proof_nodes: proof_nodes.into_iter().map(utxo_node_to_result).collect(),
             });
         }
-        serde_json::to_value(selected).map_err(|error| RpcErr::Internal(error.to_string()))
+        serde_json::to_value(UtxoProofsResult { blocks })
+            .map_err(|error| RpcErr::Internal(error.to_string()))
+    }
+}
+
+fn utxo_record_to_result(position: usize, record: UtxoProofRecord) -> UtxoProofRecordResult {
+    UtxoProofRecordResult {
+        position: format!("0x{position:x}"),
+        index: format!("0x{:x}", record.index),
+        source: format!("{:#x}", record.source),
+        recipient: format!("{:#x}", record.recipient),
+        value: format!("0x{:x}", record.value),
+        transaction_index: format!("0x{:x}", record.transaction_index),
+        transaction_log_index: format!("0x{:x}", record.transaction_log_index),
+    }
+}
+
+fn utxo_node_to_result(node: UtxoProofNode) -> UtxoProofNodeResult {
+    UtxoProofNodeResult {
+        level: node.level,
+        node_index: format!("0x{:x}", node.node_index),
+        hash: format!("{:#x}", node.hash),
     }
 }
 
@@ -475,6 +551,37 @@ fn parse_content_query(value: &Value, index: usize) -> Result<Eip8304ContentQuer
     Ok(Eip8304ContentQuery { type_id, content })
 }
 
+fn parse_candidate_type_ids(value: &Value) -> Result<Vec<u16>, RpcErr> {
+    let values = value
+        .as_array()
+        .ok_or_else(|| RpcErr::BadParams("parameter 3 must be a type-id array".to_owned()))?;
+    if values.is_empty() || values.len() > 5 {
+        return Err(RpcErr::BadParams(
+            "parameter 3 must contain between one and five type IDs".to_owned(),
+        ));
+    }
+    let mut unique = HashSet::with_capacity(values.len());
+    let mut type_ids = Vec::with_capacity(values.len());
+    for (index, value) in values.iter().enumerate() {
+        let type_id = value
+            .as_u64()
+            .and_then(|value| u16::try_from(value).ok())
+            .filter(|value| (2..=6).contains(value))
+            .ok_or_else(|| {
+                RpcErr::BadParams(format!(
+                    "parameter 3 item {index} must be a log type ID from 2 through 6"
+                ))
+            })?;
+        if !unique.insert(type_id) {
+            return Err(RpcErr::BadParams(format!(
+                "parameter 3 item {index} duplicates type ID {type_id}"
+            )));
+        }
+        type_ids.push(type_id);
+    }
+    Ok(type_ids)
+}
+
 fn parse_quantity(value: &Value, index: u64) -> Result<u64, RpcErr> {
     if let Some(number) = value.as_u64() {
         return Ok(number);
@@ -494,6 +601,7 @@ fn table_query_to_value(
     commitment_block: u64,
     load_micros: u128,
     queries: &[Eip8304ContentQuery],
+    candidate_type_ids: &[u16],
 ) -> Result<Value, RpcErr> {
     let query_started = Instant::now();
     let entries = table.encoded_entries();
@@ -538,25 +646,20 @@ fn table_query_to_value(
             .then_some(index)
         })
         .collect::<Vec<_>>();
-    let commitment_indices = entries
+    let candidate_indices = entries
         .iter()
         .enumerate()
         .filter_map(|(index, entry)| {
-            (read_u16(entry.as_bytes(), 0).ok() == Some(7)
+            (read_u16(entry.as_bytes(), 0)
+                .ok()
+                .is_some_and(|type_id| candidate_type_ids.contains(&type_id))
                 && entry_position_key(entry).is_some_and(|key| matched_positions.contains(&key)))
             .then_some(index)
         })
         .collect::<Vec<_>>();
-    if commitment_indices.len() != matched_positions.len() {
-        return Err(RpcErr::Internal(format!(
-            "EIP-8304 log commitment count {} does not match {} selected logs",
-            commitment_indices.len(),
-            matched_positions.len()
-        )));
-    }
 
     let mut proof_indices = transaction_indices.clone();
-    proof_indices.extend(commitment_indices.iter().copied());
+    proof_indices.extend(candidate_indices.iter().copied());
     for (_, first, end) in &ranges {
         proof_indices.extend(*first..*end);
         if *first > 0 {
@@ -568,35 +671,15 @@ fn table_query_to_value(
     }
     proof_indices.sort_unstable();
     proof_indices.dedup();
-    let branches = table_entry_proofs(entries, &proof_indices)
-        .ok_or_else(|| RpcErr::Internal("could not construct EIP-8304 query proofs".to_owned()))?;
-    let proofs_by_index = proof_indices
-        .iter()
-        .copied()
-        .zip(branches)
-        .collect::<HashMap<_, _>>();
-    let mut proof_nodes = HashMap::new();
-    for (leaf_index, branch) in &proofs_by_index {
-        let mut node_index = *leaf_index;
-        for (level, sibling) in branch.iter().enumerate() {
-            proof_nodes.insert((level, node_index ^ 1), *sibling);
-            node_index /= 2;
-        }
-    }
-    let mut proof_nodes = proof_nodes
+    let proof_nodes = table_multiproof(entries, &proof_indices)
+        .ok_or_else(|| RpcErr::Internal("could not construct EIP-8304 multiproof".to_owned()))?
         .into_iter()
-        .map(|((level, node_index), hash)| Eip8304ProofNode {
-            level,
-            node_index: format!("0x{node_index:x}"),
-            hash: format!("{hash:#x}"),
+        .map(|node| Eip8304ProofNode {
+            level: node.level,
+            node_index: format!("0x{:x}", node.node_index),
+            hash: format!("{:#x}", node.hash),
         })
         .collect::<Vec<_>>();
-    proof_nodes.sort_unstable_by_key(|node| {
-        (
-            node.level,
-            usize::from_str_radix(node.node_index.trim_start_matches("0x"), 16).unwrap_or(0),
-        )
-    });
 
     let posting_ranges = ranges
         .into_iter()
@@ -607,24 +690,24 @@ fn table_query_to_value(
                 first_index: format!("0x{first:x}"),
                 end_index_exclusive: format!("0x{end:x}"),
                 entries: (first..end)
-                    .map(|index| proven_entry(entries, index, &proofs_by_index))
+                    .map(|index| proven_entry(entries, index))
                     .collect::<Result<Vec<_>, _>>()?,
                 lower_boundary: (first > 0)
-                    .then(|| proven_entry(entries, first - 1, &proofs_by_index))
+                    .then(|| proven_entry(entries, first - 1))
                     .transpose()?,
                 upper_boundary: (end < entries.len())
-                    .then(|| proven_entry(entries, end, &proofs_by_index))
+                    .then(|| proven_entry(entries, end))
                     .transpose()?,
             })
         })
         .collect::<Result<Vec<_>, RpcErr>>()?;
     let transactions = transaction_indices
         .into_iter()
-        .map(|index| proven_entry(entries, index, &proofs_by_index))
+        .map(|index| proven_entry(entries, index))
         .collect::<Result<Vec<_>, _>>()?;
-    let log_commitments = commitment_indices
+    let candidate_entries = candidate_indices
         .into_iter()
-        .map(|index| proven_entry(entries, index, &proofs_by_index))
+        .map(|index| proven_entry(entries, index))
         .collect::<Result<Vec<_>, _>>()?;
 
     let storage_slot = table_storage_slot(table)?;
@@ -643,7 +726,8 @@ fn table_query_to_value(
         table_root: format!("{:#x}", table.table_root()),
         queries: posting_ranges,
         transactions,
-        log_commitments,
+        candidate_entries,
+        proof_format: "shared-per-table-v1",
         proof_nodes,
         load_micros,
         query_micros: query_started.elapsed().as_micros(),
@@ -662,7 +746,7 @@ fn log_position_key(entry: &EncodedIndexEntry) -> Option<Vec<u8>> {
 
 fn entry_position_key(entry: &EncodedIndexEntry) -> Option<Vec<u8>> {
     let encoded = entry.as_bytes();
-    if !matches!(read_u16(encoded, 0).ok(), Some(2..=7)) {
+    if !matches!(read_u16(encoded, 0).ok(), Some(2..=6)) {
         return None;
     }
     let position_offset = encoded.len().checked_sub(16)?;
@@ -675,16 +759,7 @@ fn block_transaction_key(entry: &EncodedIndexEntry) -> Option<Vec<u8>> {
     Some(position[..12].to_vec())
 }
 
-fn proven_entry(
-    entries: &[EncodedIndexEntry],
-    index: usize,
-    proofs: &HashMap<usize, Vec<ethrex_common::H256>>,
-) -> Result<Eip8304ProvenEntry, RpcErr> {
-    if !proofs.contains_key(&index) {
-        return Err(RpcErr::Internal(format!(
-            "missing EIP-8304 proof for leaf {index}"
-        )));
-    }
+fn proven_entry(entries: &[EncodedIndexEntry], index: usize) -> Result<Eip8304ProvenEntry, RpcErr> {
     Ok(Eip8304ProvenEntry {
         entry: entry_to_view(&entries[index])?,
         leaf_index: format!("0x{index:x}"),
@@ -746,7 +821,6 @@ fn entry_to_view(entry: &EncodedIndexEntry) -> Result<Eip8304TableEntry, RpcErr>
         4 if encoded.len() == 50 => ("log.topics[1]", 34, 34, true, true),
         5 if encoded.len() == 50 => ("log.topics[2]", 34, 34, true, true),
         6 if encoded.len() == 50 => ("log.topics[3]", 34, 34, true, true),
-        7 if encoded.len() == 50 => ("log.commitment", 34, 34, true, true),
         _ => {
             return Err(RpcErr::Internal(format!(
                 "malformed EIP-8304 entry type {type_id} with length {}",
@@ -1145,6 +1219,15 @@ mod tests {
         .expect("valid query request");
         assert_eq!(query.table_size, 16);
         assert_eq!(query.queries.len(), 1);
+        assert!(query.candidate_type_ids.is_empty());
+        let recipient_query = QueryEip8304TableRequest::parse(&Some(vec![
+            json!("0x40"),
+            json!("0x10"),
+            json!([{"typeId": 5, "content": format!("{:#x}", H256::zero())}]),
+            json!([2, 3, 4, 6]),
+        ]))
+        .expect("valid recipient-first query");
+        assert_eq!(recipient_query.candidate_type_ids, [2, 3, 4, 6]);
         assert!(
             QueryEip8304TableRequest::parse(&Some(vec![
                 json!("0x40"),
@@ -1154,20 +1237,20 @@ mod tests {
             .is_err()
         );
 
-        let logs = GetEip8304LogsRequest::parse(&Some(vec![json!([
+        let proofs = GetUtxoProofsRequest::parse(&Some(vec![json!([
             {"blockNumber": "0x40", "transactionIndex": "0x2", "logIndex": "0x3"}
         ])]))
-        .expect("valid selected-log request");
+        .expect("valid batched UPT request");
         assert_eq!(
-            logs.positions,
-            vec![Eip8304LogPosition {
+            proofs.positions,
+            vec![UtxoEventPosition {
                 block_number: 64,
                 transaction_index: 2,
                 log_index: 3,
             }]
         );
         assert!(
-            GetEip8304LogsRequest::parse(&Some(vec![json!([
+            GetUtxoProofsRequest::parse(&Some(vec![json!([
                 {"blockNumber": "0x40", "transactionIndex": "0x2", "logIndex": "0x3"},
                 {"blockNumber": "0x40", "transactionIndex": "0x2", "logIndex": "0x3"}
             ])]))
@@ -1202,8 +1285,8 @@ mod tests {
                     transaction_index: 2,
                     log_index: 3,
                 },
-                IndexEntry::LogCommitment {
-                    log_root: H256::from_low_u64_be(0x5678),
+                IndexEntry::LogTopic3 {
+                    topic: H256::from_low_u64_be(0x5678),
                     block_number: 4,
                     transaction_index: 2,
                     log_index: 3,
@@ -1240,19 +1323,14 @@ mod tests {
             H256::from_low_u64_be(0x44),
             4,
             9,
-            &[
-                Eip8304ContentQuery {
-                    type_id: 2,
-                    content: address.as_bytes().to_vec(),
-                },
-                Eip8304ContentQuery {
-                    type_id: 5,
-                    content: topic.as_bytes().to_vec(),
-                },
-            ],
+            &[Eip8304ContentQuery {
+                type_id: 5,
+                content: topic.as_bytes().to_vec(),
+            }],
+            &[2, 6],
         )
         .expect("serializable query");
-        assert_eq!(query_value["queries"].as_array().unwrap().len(), 2);
+        assert_eq!(query_value["queries"].as_array().unwrap().len(), 1);
         assert_eq!(
             query_value["queries"][0]["entries"]
                 .as_array()
@@ -1260,15 +1338,9 @@ mod tests {
                 .len(),
             1
         );
-        assert_eq!(
-            query_value["queries"][1]["entries"]
-                .as_array()
-                .unwrap()
-                .len(),
-            1
-        );
         assert_eq!(query_value["transactions"].as_array().unwrap().len(), 1);
-        assert_eq!(query_value["logCommitments"].as_array().unwrap().len(), 1);
+        assert_eq!(query_value["candidateEntries"].as_array().unwrap().len(), 2);
+        assert_eq!(query_value["proofFormat"], "shared-per-table-v1");
         assert_eq!(
             query_value["transactions"][0]["content"],
             format!("{transaction_hash:#x}")

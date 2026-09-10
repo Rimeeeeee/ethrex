@@ -130,13 +130,21 @@ pub const BLOCK_ACCESS_LISTS: &str = "block_access_lists";
 /// Including the end-block hash retains competing-fork tables across reorgs.
 pub const INDEX_TABLES: &str = "eip8304_index_tables";
 
+/// Block-scoped UTXO Proof Tables.
+/// - Key: canonical or fork block hash (32 bytes)
+/// - Value: [`UtxoProofTable::encode_storage`](ethrex_common::types::UtxoProofTable::encode_storage)
+///
+/// Hash-keying preserves provisional tables across reorgs while canonical RPC
+/// lookups resolve the current block hash before reading the object.
+pub const UTXO_PROOF_TABLES: &str = "utxo_proof_tables";
+
 /// Bad blocks column family: single-keyed list of the most recent bad blocks
 /// seen by the client, served by `debug_getBadBlocks`.
 /// - [`Vec<u8>`] = [`BAD_BLOCKS_KEY`]
 /// - [`Vec<u8>`] = RLP-encoded `Vec<Block>` (sorted by descending block number)
 pub const BAD_BLOCKS: &str = "bad_blocks";
 
-pub const TABLES: [&str; 23] = [
+pub const TABLES: [&str; 24] = [
     CHAIN_DATA,
     ACCOUNT_CODES,
     ACCOUNT_CODE_METADATA,
@@ -158,6 +166,7 @@ pub const TABLES: [&str; 23] = [
     EXECUTION_WITNESSES,
     BLOCK_ACCESS_LISTS,
     INDEX_TABLES,
+    UTXO_PROOF_TABLES,
     STATE_HISTORY,
     BAD_BLOCKS,
 ];

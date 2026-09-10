@@ -247,10 +247,9 @@ def block_openings(rpc: Rpc, block: int) -> list[dict]:
     }])
     openings = []
     for lg in logs:
-        data = bytes.fromhex(lg["data"][2:])
         openings.append({
-            "index": int.from_bytes(data[:32], "big"),
-            "valueWei": int.from_bytes(data[32:64], "big"),
+            "index": int(lg["topics"][3], 16),
+            "valueWei": int(lg["data"], 16),
             "source": bytes.fromhex(lg["topics"][1][2:])[-20:],
             "recipient": bytes.fromhex(lg["topics"][2][2:])[-20:],
         })
@@ -274,7 +273,7 @@ def utxo_frame_gas(inputs: list[dict], n_utxo_outs: int, n_account_outs: int) ->
     gas = 13_000
     for inp in inputs:
         gas += 16_048 + 42 * (len(inp["siblings"]) + len(inp.get("batchSiblings", []))) + 383
-    gas += 2_012 * n_utxo_outs
+    gas += 2_131 * n_utxo_outs
     gas += (9_000 + 183_600) * n_account_outs
     return gas
 
@@ -341,10 +340,9 @@ def run_spend(rpc: Rpc, cmd: dict, sponsored: bool) -> dict:
     created = []
     for lg in receipt.get("logs", []):
         if lg["address"].lower() == VAULT_HEX and lg["topics"][0].lower() == "0x" + UTXO_CREATED_TOPIC.hex():
-            data = bytes.fromhex(lg["data"][2:])
             created.append({
-                "index": int.from_bytes(data[:32], "big"),
-                "valueWei": int.from_bytes(data[32:64], "big"),
+                "index": int(lg["topics"][3], 16),
+                "valueWei": int(lg["data"], 16),
                 "recipient": "0x" + bytes.fromhex(lg["topics"][2][2:])[-20:].hex(),
             })
     return {
@@ -386,7 +384,7 @@ def main():
         index = None
         for lg in receipt.get("logs", []):
             if lg["address"].lower() == VAULT_HEX and lg["topics"][0].lower() == "0x" + UTXO_CREATED_TOPIC.hex():
-                index = int.from_bytes(bytes.fromhex(lg["data"][2:])[:32], "big")
+                index = int(lg["topics"][3], 16)
         out = {"txHash": r["txHash"], "block": int(receipt["blockNumber"], 16), "status": receipt.get("status"), "index": index}
     elif op == "spend":
         out = run_spend(rpc, cmd, sponsored=False)
@@ -397,10 +395,9 @@ def main():
         created = []
         for lg in receipt.get("logs", []):
             if lg["address"].lower() == VAULT_HEX and lg["topics"][0].lower() == "0x" + UTXO_CREATED_TOPIC.hex():
-                data = bytes.fromhex(lg["data"][2:])
                 created.append({
-                    "index": int.from_bytes(data[:32], "big"),
-                    "valueWei": int.from_bytes(data[32:64], "big"),
+                    "index": int(lg["topics"][3], 16),
+                    "valueWei": int(lg["data"], 16),
                     "source": "0x" + bytes.fromhex(lg["topics"][1][2:])[-20:].hex(),
                     "recipient": "0x" + bytes.fromhex(lg["topics"][2][2:])[-20:].hex(),
                 })

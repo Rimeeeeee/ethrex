@@ -100,13 +100,12 @@ function forge(command) {
 }
 
 function openingFromLog(log) {
-  if (!log?.data || log.data.length < 130 || !log.topics || log.topics.length < 3) return null;
+  if (!log?.data || log.data.length !== 66 || !log.topics || log.topics.length !== 4) return null;
   const data = log.data.slice(2);
-  const word = (offset) => BigInt(`0x${data.slice(offset, offset + 64)}`);
   const topicAddress = (topic) => `0x${topic.slice(-40)}`.toLowerCase();
   return {
-    index: Number(word(0)),
-    valueWei: word(64).toString(),
+    index: Number(BigInt(log.topics[3])),
+    valueWei: BigInt(`0x${data}`).toString(),
     source: topicAddress(log.topics[1]),
     recipient: topicAddress(log.topics[2]),
     creationBlock: Number.parseInt(log.blockNumber, 16),
@@ -209,11 +208,17 @@ function tablePosition(entry) {
 }
 
 let tableQueryCache = new Map();
+let tableQueryHeads = new Map();
 let tableRootCache = new Map();
+let utxoPositionCache = new Map();
+let utxoRecordCache = new Map();
 
 function clearDiscoveryCaches() {
   tableQueryCache.clear();
+  tableQueryHeads.clear();
   tableRootCache.clear();
+  utxoPositionCache.clear();
+  utxoRecordCache.clear();
 }
 
 function discoveryConcurrency(value) {
@@ -260,28 +265,67 @@ function sha256(value) {
   return createHash('sha256').update(value).digest();
 }
 
-const LOG_COMMITMENT_DOMAIN = Buffer.from('EIP8304_LOG_V1');
+const KECCAK_MASK = (1n << 64n) - 1n;
+const KECCAK_RATE = 136;
+const KECCAK_ROTATIONS = [
+  0, 1, 62, 28, 27, 36, 44, 6, 55, 20, 3, 10, 43, 25, 39, 41, 45, 15, 21, 8, 18, 2, 61, 56, 14,
+];
+const KECCAK_ROUND_CONSTANTS = [
+  0x0000000000000001n, 0x0000000000008082n, 0x800000000000808an, 0x8000000080008000n,
+  0x000000000000808bn, 0x0000000080000001n, 0x8000000080008081n, 0x8000000000008009n,
+  0x000000000000008an, 0x0000000000000088n, 0x0000000080008009n, 0x000000008000000an,
+  0x000000008000808bn, 0x800000000000008bn, 0x8000000000008089n, 0x8000000000008003n,
+  0x8000000000008002n, 0x8000000000000080n, 0x000000000000800an, 0x800000008000000an,
+  0x8000000080008081n, 0x8000000000008080n, 0x0000000080000001n, 0x8000000080008008n,
+];
 
-function logCommitment(log) {
-  const address = hexBuffer(log.address, 'log address');
-  if (address.length !== 20) throw new Error('log address must contain 20 bytes');
-  if (!Array.isArray(log.topics) || log.topics.length > 4) throw new Error('log topics must contain at most four items');
-  const topics = log.topics.map((topic) => {
-    const encoded = hexBuffer(topic, 'log topic');
-    if (encoded.length !== 32) throw new Error('log topic must contain 32 bytes');
-    return encoded;
-  });
-  const data = hexBuffer(log.data, 'log data');
-  const dataLength = Buffer.alloc(8);
-  dataLength.writeBigUInt64BE(BigInt(data.length));
-  return `0x${sha256(Buffer.concat([
-    LOG_COMMITMENT_DOMAIN,
-    address,
-    Buffer.from([topics.length]),
-    ...topics,
-    dataLength,
-    data,
-  ])).toString('hex')}`;
+function rotateLane(value, amount) {
+  const shift = BigInt(amount);
+  return shift === 0n ? value : ((value << shift) | (value >> (64n - shift))) & KECCAK_MASK;
+}
+
+function keccakPermutation(state) {
+  for (const roundConstant of KECCAK_ROUND_CONSTANTS) {
+    const parity = Array(5).fill(0n);
+    for (let x = 0; x < 5; x += 1) {
+      for (let y = 0; y < 5; y += 1) parity[x] ^= state[x + 5 * y];
+    }
+    const delta = parity.map((_, x) => parity[(x + 4) % 5] ^ rotateLane(parity[(x + 1) % 5], 1));
+    for (let x = 0; x < 5; x += 1) {
+      for (let y = 0; y < 5; y += 1) state[x + 5 * y] = (state[x + 5 * y] ^ delta[x]) & KECCAK_MASK;
+    }
+    const rotated = Array(25).fill(0n);
+    for (let x = 0; x < 5; x += 1) {
+      for (let y = 0; y < 5; y += 1) {
+        rotated[y + 5 * ((2 * x + 3 * y) % 5)] = rotateLane(state[x + 5 * y], KECCAK_ROTATIONS[x + 5 * y]);
+      }
+    }
+    for (let x = 0; x < 5; x += 1) {
+      for (let y = 0; y < 5; y += 1) {
+        const row = x + 5 * y;
+        state[row] = (rotated[row] ^ ((~rotated[(x + 1) % 5 + 5 * y]) & rotated[(x + 2) % 5 + 5 * y])) & KECCAK_MASK;
+      }
+    }
+    state[0] = (state[0] ^ roundConstant) & KECCAK_MASK;
+  }
+}
+
+function keccak256(value) {
+  const data = Buffer.from(value);
+  const paddingLength = KECCAK_RATE - (data.length % KECCAK_RATE);
+  const padded = Buffer.concat([data, Buffer.alloc(paddingLength)]);
+  padded[data.length] = 0x01;
+  padded[padded.length - 1] |= 0x80;
+  const state = Array(25).fill(0n);
+  for (let offset = 0; offset < padded.length; offset += KECCAK_RATE) {
+    for (let lane = 0; lane < KECCAK_RATE / 8; lane += 1) {
+      state[lane] ^= padded.readBigUInt64LE(offset + lane * 8);
+    }
+    keccakPermutation(state);
+  }
+  const output = Buffer.alloc(32);
+  for (let lane = 0; lane < 4; lane += 1) output.writeBigUInt64LE(state[lane], lane * 8);
+  return output;
 }
 
 function hexBuffer(value, name) {
@@ -296,10 +340,14 @@ function mixedInRoot(node, entryCount) {
 }
 
 function proofNodeMap(table) {
-  return new Map(table.proofNodes.map((node) => [
-    `${Number(node.level)}:${BigInt(node.nodeIndex)}`,
-    hexBuffer(node.hash, 'proof node hash'),
-  ]));
+  if (!Array.isArray(table.proofNodes)) throw new Error('EIP-8304 multiproof nodes are missing');
+  const nodes = new Map();
+  for (const node of table.proofNodes) {
+    const key = `${Number(node.level)}:${BigInt(node.nodeIndex)}`;
+    if (nodes.has(key)) throw new Error(`duplicate EIP-8304 multiproof node ${key}`);
+    nodes.set(key, hexBuffer(node.hash, 'proof node hash'));
+  }
+  return nodes;
 }
 
 function decodeTableEntry(encodedValue) {
@@ -309,7 +357,7 @@ function decodeTableEntry(encodedValue) {
   const shape = typeId === 0 && encoded.length === 42 ? { contentEnd: 34, positionOffset: 34, hasTransaction: false, hasPosition: false }
     : typeId === 1 && encoded.length === 50 ? { contentEnd: 34, positionOffset: 34, hasTransaction: true, hasPosition: true }
       : typeId === 2 && encoded.length === 38 ? { contentEnd: 22, positionOffset: 22, hasTransaction: true, hasPosition: true }
-        : typeId >= 3 && typeId <= 7 && encoded.length === 50 ? { contentEnd: 34, positionOffset: 34, hasTransaction: true, hasPosition: true }
+        : typeId >= 3 && typeId <= 6 && encoded.length === 50 ? { contentEnd: 34, positionOffset: 34, hasTransaction: true, hasPosition: true }
           : null;
   if (!shape) throw new Error(`malformed encoded EIP-8304 entry type ${typeId}`);
   return {
@@ -321,12 +369,10 @@ function decodeTableEntry(encodedValue) {
   };
 }
 
-function verifyEntryProof(table, proven, proofNodes) {
+function validateProvenEntry(table, proven) {
   const entryCount = Number(BigInt(table.entryCount));
   const leafIndex = Number(BigInt(proven.leafIndex));
   if (!Number.isSafeInteger(leafIndex) || leafIndex < 0 || leafIndex >= entryCount) throw new Error(`invalid EIP-8304 proof leaf ${proven.leafIndex}`);
-  let width = 1;
-  while (width < entryCount) width *= 2;
   const decoded = decodeTableEntry(proven.encoded);
   const transactionIndex = proven.transactionIndex == null ? null : BigInt(proven.transactionIndex);
   const positionIndex = proven.positionIndex == null ? null : BigInt(proven.positionIndex);
@@ -335,18 +381,52 @@ function verifyEntryProof(table, proven, proofNodes) {
       || decoded.positionIndex !== positionIndex) {
     throw new Error(`decoded EIP-8304 entry fields do not match proven leaf ${leafIndex}`);
   }
-  let node = sha256(hexBuffer(proven.encoded, 'encoded EIP-8304 entry'));
-  let nodeIndex = leafIndex;
+  return { leafIndex, decoded };
+}
+
+function verifyTableMultiproof(table, provenEntries) {
+  const entryCount = Number(BigInt(table.entryCount));
+  if (!Number.isSafeInteger(entryCount) || entryCount < 0) throw new Error('invalid EIP-8304 entry count');
+  if (entryCount === 0) {
+    if (provenEntries.length !== 0) throw new Error('empty EIP-8304 table returned entries');
+    verifyEmptyTableRoot(table);
+    return 0;
+  }
+  let width = 1;
+  while (width < entryCount) width *= 2;
+  let known = new Map();
+  for (const proven of provenEntries) {
+    const { leafIndex } = validateProvenEntry(table, proven);
+    const leaf = sha256(hexBuffer(proven.encoded, 'encoded EIP-8304 entry'));
+    const previous = known.get(leafIndex);
+    if (previous && !previous.equals(leaf)) throw new Error(`conflicting EIP-8304 entry at leaf ${leafIndex}`);
+    known.set(leafIndex, leaf);
+  }
+  const proofNodes = proofNodeMap(table);
+  const usedProofNodes = new Set();
   for (let level = 0; width > 1; level += 1, width /= 2) {
-    const sibling = proofNodes.get(`${level}:${BigInt(nodeIndex ^ 1)}`);
-    if (!sibling) throw new Error(`missing EIP-8304 proof node at level ${level} index ${nodeIndex ^ 1}`);
-    node = nodeIndex % 2 === 0 ? sha256(Buffer.concat([node, sibling])) : sha256(Buffer.concat([sibling, node]));
-    nodeIndex = Math.floor(nodeIndex / 2);
+    const parents = new Set([...known.keys()].map((index) => Math.floor(index / 2)));
+    const next = new Map();
+    for (const parent of parents) {
+      const children = [parent * 2, parent * 2 + 1].map((index) => {
+        const calculated = known.get(index);
+        if (calculated) return calculated;
+        const key = `${level}:${BigInt(index)}`;
+        const supplied = proofNodes.get(key);
+        if (!supplied) throw new Error(`missing EIP-8304 multiproof node ${key}`);
+        usedProofNodes.add(key);
+        return supplied;
+      });
+      next.set(parent, sha256(Buffer.concat(children)));
+    }
+    known = next;
   }
-  if (`0x${mixedInRoot(node, entryCount).toString('hex')}` !== table.tableRoot.toLowerCase()) {
-    throw new Error(`invalid EIP-8304 entry proof at leaf ${leafIndex}`);
+  const root = known.get(0);
+  if (!root || `0x${mixedInRoot(root, entryCount).toString('hex')}` !== table.tableRoot.toLowerCase()) {
+    throw new Error('invalid shared EIP-8304 table multiproof');
   }
-  return leafIndex;
+  if (usedProofNodes.size !== proofNodes.size) throw new Error('EIP-8304 multiproof contains unused nodes');
+  return known.size === 1 ? new Set(provenEntries.map((entry) => String(entry.leafIndex))).size : 0;
 }
 
 function verifyEmptyTableRoot(table) {
@@ -354,18 +434,31 @@ function verifyEmptyTableRoot(table) {
   if (table.tableRoot.toLowerCase() !== expected) throw new Error('invalid empty EIP-8304 table root');
 }
 
-function verifyTableQuery(table, filters) {
+function verifyTableQuery(table, filters, candidateTypeIds) {
   const started = performance.now();
   const entryCount = Number(BigInt(table.entryCount));
   if (!Number.isSafeInteger(entryCount) || entryCount < 0) throw new Error('invalid EIP-8304 entry count');
-  if (entryCount === 0) verifyEmptyTableRoot(table);
-  const proofNodes = proofNodeMap(table);
+  if (table.proofFormat !== 'shared-per-table-v1') throw new Error('EIP-8304 query did not return the required shared multiproof');
+  if (!Array.isArray(table.queries) || table.queries.length !== filters.length) throw new Error('EIP-8304 query response omitted a requested posting range');
+
+  const serializedEntries = [
+    ...table.queries.flatMap((range) => [range.lowerBoundary, ...(range.entries || []), range.upperBoundary]),
+    ...(table.transactions || []),
+    ...(table.candidateEntries || []),
+  ].filter(Boolean);
+  const uniqueEntries = new Map();
+  for (const entry of serializedEntries) {
+    const { leafIndex } = validateProvenEntry(table, entry);
+    const previous = uniqueEntries.get(leafIndex);
+    if (previous && previous.encoded.toLowerCase() !== entry.encoded.toLowerCase()) {
+      throw new Error(`conflicting serialized EIP-8304 entry at leaf ${leafIndex}`);
+    }
+    uniqueEntries.set(leafIndex, entry);
+  }
+  const proofsVerified = verifyTableMultiproof(table, [...uniqueEntries.values()]);
+
   const requested = new Map(filters.map((filter) => [`${filter.typeId}:${filter.content.toLowerCase()}`, filter]));
   const postings = new Map();
-  let proofsVerified = 0;
-  let entriesReturned = 0;
-
-  if (!Array.isArray(table.queries) || table.queries.length !== filters.length) throw new Error('EIP-8304 query response omitted a requested posting range');
   for (const range of table.queries) {
     const key = `${range.typeId}:${range.content.toLowerCase()}`;
     const filter = requested.get(key);
@@ -381,9 +474,7 @@ function verifyTableQuery(table, filters) {
     const positions = new Map();
     for (let offset = 0; offset < range.entries.length; offset += 1) {
       const entry = range.entries[offset];
-      const leafIndex = verifyEntryProof(table, entry, proofNodes);
-      proofsVerified += 1;
-      entriesReturned += 1;
+      const { leafIndex } = validateProvenEntry(table, entry);
       if (leafIndex !== first + offset || entry.typeId !== range.typeId || entry.content.toLowerCase() !== range.content.toLowerCase()) {
         throw new Error(`non-contiguous EIP-8304 posting range ${key}`);
       }
@@ -394,17 +485,13 @@ function verifyTableQuery(table, filters) {
     if (first === 0) {
       if (range.lowerBoundary != null) throw new Error(`unexpected lower EIP-8304 boundary for ${key}`);
     } else {
-      if (!range.lowerBoundary || verifyEntryProof(table, range.lowerBoundary, proofNodes) !== first - 1) throw new Error(`invalid lower EIP-8304 boundary for ${key}`);
-      proofsVerified += 1;
-      entriesReturned += 1;
+      if (!range.lowerBoundary || validateProvenEntry(table, range.lowerBoundary).leafIndex !== first - 1) throw new Error(`invalid lower EIP-8304 boundary for ${key}`);
       if (Buffer.compare(hexBuffer(range.lowerBoundary.encoded, 'lower boundary'), prefix) >= 0) throw new Error(`lower EIP-8304 boundary does not prove completeness for ${key}`);
     }
     if (end === entryCount) {
       if (range.upperBoundary != null) throw new Error(`unexpected upper EIP-8304 boundary for ${key}`);
     } else {
-      if (!range.upperBoundary || verifyEntryProof(table, range.upperBoundary, proofNodes) !== end) throw new Error(`invalid upper EIP-8304 boundary for ${key}`);
-      proofsVerified += 1;
-      entriesReturned += 1;
+      if (!range.upperBoundary || validateProvenEntry(table, range.upperBoundary).leafIndex !== end) throw new Error(`invalid upper EIP-8304 boundary for ${key}`);
       const upper = hexBuffer(range.upperBoundary.encoded, 'upper boundary');
       if (Buffer.compare(upper, prefix) < 0 || upper.subarray(0, prefix.length).equals(prefix)) throw new Error(`upper EIP-8304 boundary does not prove completeness for ${key}`);
     }
@@ -414,92 +501,123 @@ function verifyTableQuery(table, filters) {
   let matched = null;
   for (const filter of filters) {
     const positions = postings.get(`${filter.typeId}:${filter.content.toLowerCase()}`);
-    matched = matched == null
-      ? new Map(positions)
-      : new Map([...matched].filter(([position]) => positions.has(position)));
+    matched = matched == null ? new Map(positions) : new Map([...matched].filter(([position]) => positions.has(position)));
   }
   matched ||= new Map();
+
   const transactionHashes = new Map();
   for (const transaction of table.transactions || []) {
-    verifyEntryProof(table, transaction, proofNodes);
-    proofsVerified += 1;
-    entriesReturned += 1;
     if (transaction.typeId !== 1) throw new Error('EIP-8304 query returned a non-transaction as transaction evidence');
     const key = `${BigInt(transaction.blockNumber)}:${BigInt(transaction.transactionIndex)}`;
     if (transactionHashes.has(key)) throw new Error(`duplicate EIP-8304 transaction evidence for ${key}`);
     transactionHashes.set(key, transaction.content.toLowerCase());
   }
-  for (const position of matched.values()) {
-    const key = `${BigInt(position.blockNumber)}:${BigInt(position.transactionIndex)}`;
-    if (!transactionHashes.has(key)) throw new Error(`missing EIP-8304 transaction evidence for ${key}`);
-  }
   const expectedTransactions = new Set([...matched.values()].map((position) => `${BigInt(position.blockNumber)}:${BigInt(position.transactionIndex)}`));
   if (transactionHashes.size !== expectedTransactions.size || [...transactionHashes].some(([key]) => !expectedTransactions.has(key))) {
-    throw new Error('EIP-8304 query returned transaction evidence outside the posting intersection');
+    throw new Error('EIP-8304 query returned incomplete or extraneous transaction evidence');
   }
-  const logCommitments = new Map();
-  for (const commitment of table.logCommitments || []) {
-    verifyEntryProof(table, commitment, proofNodes);
-    proofsVerified += 1;
-    entriesReturned += 1;
-    if (commitment.typeId !== 7) throw new Error('EIP-8304 query returned a non-commitment as log evidence');
-    const key = tablePosition(commitment);
-    if (logCommitments.has(key)) throw new Error(`duplicate EIP-8304 log commitment for ${key}`);
-    logCommitments.set(key, commitment.content.toLowerCase());
+
+  const requestedCandidateTypes = new Set(candidateTypeIds);
+  const candidateEntries = new Map();
+  for (const entry of table.candidateEntries || []) {
+    const key = tablePosition(entry);
+    if (!matched.has(key) || !requestedCandidateTypes.has(entry.typeId)) throw new Error(`unexpected EIP-8304 candidate entry at ${key}`);
+    const byType = candidateEntries.get(key) || new Map();
+    if (byType.has(entry.typeId)) throw new Error(`duplicate EIP-8304 type ${entry.typeId} at ${key}`);
+    byType.set(entry.typeId, entry);
+    candidateEntries.set(key, byType);
   }
-  if (logCommitments.size !== matched.size || [...matched].some(([key]) => !logCommitments.has(key))) {
-    throw new Error('EIP-8304 query did not return exactly one log commitment per matched position');
+
+  const nativePositions = new Map();
+  for (const [key, recipientEntry] of matched) {
+    const byType = candidateEntries.get(key) || new Map();
+    const addressEntry = byType.get(2);
+    const signatureEntry = byType.get(3);
+    if (!addressEntry || !signatureEntry) throw new Error(`unresolved EIP-8304 recipient candidate ${key}`);
+    if (addressEntry.content.toLowerCase() !== VAULT || signatureEntry.content.toLowerCase() !== TOPIC) continue;
+    const sourceEntry = byType.get(4);
+    const indexEntry = byType.get(6);
+    if (!sourceEntry || !indexEntry) throw new Error(`native EIP-8304 candidate lacks source or index at ${key}`);
+    const sourceWord = hexBuffer(sourceEntry.content, 'UTXO source topic');
+    const indexWord = hexBuffer(indexEntry.content, 'UTXO index topic');
+    if (sourceWord.length !== 32 || !sourceWord.subarray(0, 12).equals(Buffer.alloc(12))) throw new Error(`non-canonical UTXO source at ${key}`);
+    if (indexWord.length !== 32 || !indexWord.subarray(0, 24).equals(Buffer.alloc(24))) throw new Error(`non-canonical UTXO index at ${key}`);
+    nativePositions.set(key, {
+      ...recipientEntry,
+      source: `0x${sourceWord.subarray(12).toString('hex')}`,
+      index: Number(indexWord.readBigUInt64BE(24)),
+    });
   }
-  const proofBytes = (table.proofNodes?.length || 0) * 32;
-  const uniqueEntriesReturned = new Set([
-    ...table.queries.flatMap((range) => [range.lowerBoundary, ...range.entries, range.upperBoundary]),
-    ...(table.transactions || []),
-    ...(table.logCommitments || []),
-  ].filter(Boolean).map((entry) => String(entry.leafIndex))).size;
+
   return {
-    positions: matched,
+    positions: nativePositions,
     transactionHashes,
-    logCommitments,
     proofsVerified,
-    entriesReturned: uniqueEntriesReturned,
-    serializedEntriesReturned: entriesReturned,
-    proofBytes,
+    entriesReturned: uniqueEntries.size,
+    serializedEntriesReturned: serializedEntries.length,
+    proofBytes: (table.proofNodes?.length || 0) * 32,
     proofVerificationMs: Number((performance.now() - started).toFixed(3)),
   };
 }
 
-async function requestTableQuery(firstBlock, tableSize, filters, useCache, limit) {
+async function requestTableQuery(firstBlock, tableSize, filters, candidateTypeIds, useCache, limit) {
   const filterKey = filters.map((filter) => `${filter.typeId}:${filter.content.toLowerCase()}`).join('|');
-  const queryKey = `${rpcUrl}|${firstBlock}|${tableSize}|${filterKey}`;
-  const queryLoad = await cachedLoad(tableQueryCache, queryKey, useCache, async () => ({
-    response: await limit(() => rpcMeasured('ethrex_queryEip8304Table', [
+  const queryKey = `${rpcUrl}|${firstBlock}|${tableSize}|${filterKey}|${candidateTypeIds.join(',')}`;
+  let record = null;
+  let queryCacheHit = false;
+  let cacheValidationResponse = null;
+  const cachedBlockHash = useCache ? tableQueryHeads.get(queryKey) : null;
+  if (cachedBlockHash) {
+    record = await tableQueryCache.get(`${queryKey}|${cachedBlockHash}`);
+    if (record?.response.result) {
+      cacheValidationResponse = await limit(() => rpcMeasured('eth_getBlockByNumber', [
+        record.response.result.endBlock,
+        false,
+      ]));
+      if (cacheValidationResponse.result?.hash?.toLowerCase() === cachedBlockHash) {
+        queryCacheHit = true;
+      } else {
+        clearDiscoveryCaches();
+        record = null;
+      }
+    }
+  }
+  if (!record) {
+    record = {
+      response: await limit(() => rpcMeasured('ethrex_queryEip8304Table', [
       `0x${firstBlock.toString(16)}`,
       `0x${tableSize.toString(16)}`,
       filters,
-    ])),
-    verified: null,
-  }));
-  const record = queryLoad.value;
+      candidateTypeIds,
+      ])),
+      verified: null,
+    };
+    const returnedHash = record.response.result?.endBlockHash?.toLowerCase();
+    if (useCache && returnedHash) {
+      tableQueryHeads.set(queryKey, returnedHash);
+      tableQueryCache.set(`${queryKey}|${returnedHash}`, Promise.resolve(record));
+    }
+  }
   const table = record.response.result;
-  if (!table) return { table: null, record, queryCacheHit: queryLoad.hit, rootResponse: null, rootCacheHit: false };
+  if (!table) return { table: null, record, queryCacheHit, cacheValidationResponse, rootResponse: null, rootCacheHit: false };
 
-  const rootKey = `${rpcUrl}|${table.storageSlot}|${table.commitmentBlock}|${table.tableRoot.toLowerCase()}`;
+  const rootKey = `${rpcUrl}|${table.endBlockHash.toLowerCase()}|${table.storageSlot}|${table.commitmentBlock}|${table.tableRoot.toLowerCase()}`;
   const rootLoad = await cachedLoad(tableRootCache, rootKey, useCache, () => limit(() => rpcMeasured('eth_getStorageAt', [
     INDEX,
     table.storageSlot,
     table.commitmentBlock,
   ])));
   if (rootLoad.value.result.toLowerCase() !== table.tableRoot.toLowerCase()) {
-    tableQueryCache.delete(queryKey);
-    tableRootCache.delete(rootKey);
+    clearDiscoveryCaches();
     throw new Error(`EIP-8304 table root mismatch for ${firstBlock}/${tableSize}`);
   }
-  if (!record.verified) record.verified = verifyTableQuery(table, filters);
+  if (!record.verified) record.verified = verifyTableQuery(table, filters, candidateTypeIds);
   return {
     table,
     verified: record.verified,
     record,
-    queryCacheHit: queryLoad.hit,
+    queryCacheHit,
+    cacheValidationResponse,
     rootResponse: rootLoad.value,
     rootCacheHit: rootLoad.hit,
   };
@@ -520,15 +638,15 @@ function initialTableRanges(from, to, head) {
   return ranges;
 }
 
-async function loadTableRange(range, filters, useCache, limit) {
-  const candidate = await requestTableQuery(range.firstBlock, range.tableSize, filters, useCache, limit);
+async function loadTableRange(range, filters, candidateTypeIds, useCache, limit) {
+  const candidate = await requestTableQuery(range.firstBlock, range.tableSize, filters, candidateTypeIds, useCache, limit);
   if (candidate.table) return { attempts: [candidate], tables: [candidate], missingBlocks: [] };
   if (range.tableSize === 1) return { attempts: [candidate], tables: [], missingBlocks: [range.firstBlock] };
   const lowerSize = range.tableSize / 4;
   const children = await Promise.all(Array.from({ length: 4 }, (_, index) => loadTableRange({
     firstBlock: range.firstBlock + index * lowerSize,
     tableSize: lowerSize,
-  }, filters, useCache, limit)));
+  }, filters, candidateTypeIds, useCache, limit)));
   return {
     attempts: [candidate, ...children.flatMap((child) => child.attempts)],
     tables: children.flatMap((child) => child.tables),
@@ -536,22 +654,123 @@ async function loadTableRange(range, filters, useCache, limit) {
   };
 }
 
+function uintWord(value, bytes, name) {
+  const number = BigInt(value);
+  if (number < 0n || number >= (1n << BigInt(bytes * 8))) throw new Error(`${name} exceeds uint${bytes * 8}`);
+  const encoded = Buffer.alloc(bytes);
+  for (let offset = 0, current = number; offset < bytes; offset += 1, current >>= 8n) {
+    encoded[bytes - 1 - offset] = Number(current & 0xffn);
+  }
+  return encoded;
+}
+
+function openingLeafFromRecord(record) {
+  const source = hexBuffer(record.source, 'UPT source');
+  const recipient = hexBuffer(record.recipient, 'UPT recipient');
+  if (source.length !== 20 || recipient.length !== 20) throw new Error('UPT record addresses must contain 20 bytes');
+  return keccak256(Buffer.concat([
+    uintWord(record.index, 8, 'UPT index'),
+    source,
+    recipient,
+    uintWord(record.value, 32, 'UPT value'),
+  ]));
+}
+
+function verifyUptBlock(block, expectedPositions, transactionHashes, rootValue, chainId) {
+  if (Number(block.formatVersion) !== 2) throw new Error('unsupported UPT format version');
+  if (BigInt(block.chainId) !== chainId) throw new Error(`UPT chain ID mismatch for block ${block.blockNumber}`);
+  if (block.vault?.toLowerCase() !== VAULT) throw new Error(`UPT vault mismatch for block ${block.blockNumber}`);
+  if (BigInt(rootValue) !== BigInt(block.openingsRoot)) throw new Error(`UPT root does not match vault storage for block ${block.blockNumber}`);
+  const blockNumberValue = BigInt(block.blockNumber);
+  const recordCount = Number(BigInt(block.recordCount));
+  if (!Number.isSafeInteger(recordCount) || recordCount < 1) throw new Error(`invalid UPT record count for block ${block.blockNumber}`);
+  if (!Array.isArray(block.records) || block.records.length !== expectedPositions.size) throw new Error(`UPT omitted selected records for block ${block.blockNumber}`);
+
+  let width = 1;
+  while (width < recordCount) width *= 2;
+  let known = new Map();
+  const items = [];
+  const returnedPositions = new Set();
+  for (const record of block.records) {
+    const position = Number(BigInt(record.position));
+    if (!Number.isSafeInteger(position) || position < 0 || position >= recordCount || known.has(position)) throw new Error(`invalid or duplicate UPT opening position ${record.position}`);
+    const eventKey = `${blockNumberValue}:${BigInt(record.transactionIndex)}:${BigInt(record.transactionLogIndex)}`;
+    const expected = expectedPositions.get(eventKey);
+    if (!expected || returnedPositions.has(eventKey)) throw new Error(`unexpected or duplicate UPT event position ${eventKey}`);
+    const recordIndex = BigInt(record.index);
+    if (recordIndex !== BigInt(expected.index)
+        || record.source.toLowerCase() !== expected.source.toLowerCase()
+        || record.recipient.toLowerCase() !== `0x${expected.content.slice(-40)}`.toLowerCase()) {
+      throw new Error(`UPT record does not match EIP-8304 topics at ${eventKey}`);
+    }
+    const transactionKey = `${blockNumberValue}:${BigInt(record.transactionIndex)}`;
+    const transactionHash = transactionHashes.get(transactionKey);
+    if (!transactionHash) throw new Error(`UPT record lacks authenticated transaction hash at ${eventKey}`);
+    known.set(position, openingLeafFromRecord(record));
+    returnedPositions.add(eventKey);
+    const numericIndex = Number(recordIndex);
+    if (!Number.isSafeInteger(numericIndex)) throw new Error(`UPT index ${record.index} exceeds wallet integer precision`);
+    items.push({
+      index: numericIndex,
+      valueWei: BigInt(record.value).toString(),
+      source: record.source.toLowerCase(),
+      recipient: record.recipient.toLowerCase(),
+      creationBlock: Number(blockNumberValue),
+      txHash: transactionHash,
+      blockHash: block.blockHash.toLowerCase(),
+      transactionIndex: Number(BigInt(record.transactionIndex)),
+      logIndex: Number(BigInt(record.transactionLogIndex)),
+      openingPosition: position,
+      openingsRoot: block.openingsRoot.toLowerCase(),
+      uptTableHash: block.tableHash.toLowerCase(),
+    });
+  }
+
+  const proofNodes = new Map();
+  for (const node of block.proofNodes || []) {
+    const key = `${Number(node.level)}:${BigInt(node.nodeIndex)}`;
+    if (proofNodes.has(key)) throw new Error(`duplicate UPT multiproof node ${key}`);
+    const hash = hexBuffer(node.hash, 'UPT proof node');
+    if (hash.length !== 32) throw new Error(`invalid UPT proof node ${key}`);
+    proofNodes.set(key, hash);
+  }
+  const usedProofNodes = new Set();
+  for (let level = 0; width > 1; level += 1, width /= 2) {
+    const parents = new Set([...known.keys()].map((index) => Math.floor(index / 2)));
+    const next = new Map();
+    for (const parent of parents) {
+      const children = [parent * 2, parent * 2 + 1].map((index) => {
+        const calculated = known.get(index);
+        if (calculated) return calculated;
+        const key = `${level}:${BigInt(index)}`;
+        const supplied = proofNodes.get(key);
+        if (!supplied) throw new Error(`missing UPT multiproof node ${key}`);
+        usedProofNodes.add(key);
+        return supplied;
+      });
+      next.set(parent, keccak256(Buffer.concat(children)));
+    }
+    known = next;
+  }
+  const root = known.get(0);
+  if (!root || `0x${root.toString('hex')}` !== block.openingsRoot.toLowerCase()) throw new Error(`invalid UPT opening multiproof for block ${block.blockNumber}`);
+  if (usedProofNodes.size !== proofNodes.size) throw new Error(`UPT multiproof for block ${block.blockNumber} contains unused nodes`);
+  return { items, proofNodes: proofNodes.size };
+}
+
 async function scanTables({ address, fromBlock = 0, toBlock, enrich = true, cache = true, concurrency } = {}) {
   if (!isAddress(address)) throw new Error('address must be a 20-byte hex address');
   const head = Number.parseInt(await rpc('eth_blockNumber', []), 16);
+  const chainId = BigInt(await rpc('eth_chainId', []));
   const from = blockNumber(fromBlock, 'fromBlock');
   const to = toBlock == null || toBlock === '' ? head : Math.min(blockNumber(toBlock, 'toBlock'), head);
   const discoveryStarted = performance.now();
   const paddedRecipient = `0x${address.slice(2).padStart(64, '0')}`.toLowerCase();
-  const filters = [
-    { typeId: 2, content: VAULT },
-    { typeId: 3, content: TOPIC },
-    { typeId: 5, content: paddedRecipient },
-  ];
+  const filters = [{ typeId: 5, content: paddedRecipient }];
+  const candidateTypeIds = [2, 3, 4, 6];
   const limit = createLimiter(discoveryConcurrency(concurrency));
   const positions = new Map();
   const transactionHashes = new Map();
-  const logCommitments = new Map();
   const tables = [];
   let rpcCalls = 0;
   let responseBytes = 0;
@@ -563,12 +782,19 @@ async function scanTables({ address, fromBlock = 0, toBlock, enrich = true, cach
   let rootChecks = 0;
   let queryCacheHits = 0;
   let rootCacheHits = 0;
+  let cacheValidationRpcCalls = 0;
   let proofsVerified = 0;
   let proofBytes = 0;
   let proofVerificationMs = 0;
-  const loaded = await Promise.all(initialTableRanges(from, to, head).map((range) => loadTableRange(range, filters, cache, limit)));
+  const loaded = await Promise.all(initialTableRanges(from, to, head).map((range) => loadTableRange(range, filters, candidateTypeIds, cache, limit)));
   const missingBlocks = loaded.flatMap((range) => range.missingBlocks);
   for (const candidate of loaded.flatMap((range) => range.attempts)) {
+    if (candidate.cacheValidationResponse) {
+      rpcCalls += 1;
+      cacheValidationRpcCalls += 1;
+      responseBytes += candidate.cacheValidationResponse.responseBytes;
+      providerRpcMs += candidate.cacheValidationResponse.elapsedMs;
+    }
     if (candidate.queryCacheHit) queryCacheHits += 1;
     else {
       rpcCalls += 1;
@@ -608,47 +834,84 @@ async function scanTables({ address, fromBlock = 0, toBlock, enrich = true, cach
     proofVerificationMs += selected.queryCacheHit ? 0 : selected.verified.proofVerificationMs;
     for (const [key, entry] of selected.verified.positions) positions.set(key, entry);
     for (const [key, hash] of selected.verified.transactionHashes) transactionHashes.set(key, hash);
-    for (const [key, root] of selected.verified.logCommitments) logCommitments.set(key, root);
   }
 
   const utxos = [];
-  const positionRequests = [...positions.values()].map((position) => ({
-    blockNumber: position.blockNumber,
-    transactionIndex: position.transactionIndex,
-    logIndex: position.positionIndex,
-  }));
-  const payloadChunks = [];
-  for (let offset = 0; offset < positionRequests.length; offset += 1024) payloadChunks.push(positionRequests.slice(offset, offset + 1024));
-  const payloadResults = await Promise.all(payloadChunks.map((chunk) => limit(() => rpcMeasured('ethrex_getEip8304Logs', [chunk]))));
-  const selectedLogs = new Map();
-  for (const response of payloadResults) {
-    rpcCalls += 1;
-    responseBytes += response.responseBytes;
-    providerRpcMs += response.elapsedMs;
-    if (!Array.isArray(response.result)) throw new Error('ethrex_getEip8304Logs did not return an array');
-    for (const rawLog of response.result) {
-      const key = `${BigInt(rawLog.blockNumber)}:${BigInt(rawLog.transactionIndex)}:${BigInt(rawLog.logIndex)}`;
-      if (!positions.has(key) || selectedLogs.has(key)) throw new Error(`unexpected or duplicate selected EIP-8304 log ${key}`);
-      const calculatedRoot = logCommitment(rawLog);
-      if (calculatedRoot !== logCommitments.get(key) || rawLog.logRoot?.toLowerCase() !== calculatedRoot) {
-        throw new Error(`selected EIP-8304 log does not match its proven commitment at ${key}`);
-      }
-      selectedLogs.set(key, rawLog);
+  const uncachedPositions = new Map();
+  let uptCacheHits = 0;
+  for (const [key, position] of positions) {
+    const positionCacheKey = `${rpcUrl}|${key}`;
+    const cachedBlockHash = cache ? utxoPositionCache.get(positionCacheKey) : null;
+    const cached = cachedBlockHash ? utxoRecordCache.get(`${rpcUrl}|${cachedBlockHash}|${key}`) : null;
+    if (cached) {
+      uptCacheHits += 1;
+      utxos.push({ ...cached });
+    } else {
+      uncachedPositions.set(key, position);
     }
   }
-  if (selectedLogs.size !== positions.size) throw new Error('ethrex_getEip8304Logs omitted a proven log position');
-  for (const [key, position] of positions) {
-    const rawLog = selectedLogs.get(key);
-    const transactionKey = `${BigInt(position.blockNumber)}:${BigInt(position.transactionIndex)}`;
-    const transactionHash = transactionHashes.get(transactionKey);
-    if (!transactionHash) throw new Error(`EIP-8304 transaction hash missing for ${transactionKey}`);
-    const log = { ...rawLog, transactionHash };
-    const item = openingFromLog(log);
-    if (!item || item.recipient !== address.toLowerCase() || log.address.toLowerCase() !== VAULT
-        || log.topics[0]?.toLowerCase() !== TOPIC) {
-      throw new Error(`EIP-8304 position did not resolve to the requested UtxoCreated log`);
+
+  let uptRpcCalls = 0;
+  let uptRootProofRpcCalls = 0;
+  let uptBlocksReturned = 0;
+  let uptRecordsReturned = 0;
+  let uptProofNodes = 0;
+  if (uncachedPositions.size > 4096) throw new Error('one wallet scan cannot request more than 4096 uncached UPT records');
+  if (uncachedPositions.size > 0) {
+    const request = [...uncachedPositions.values()].map((position) => ({
+      blockNumber: position.blockNumber,
+      transactionIndex: position.transactionIndex,
+      logIndex: position.positionIndex,
+    }));
+    const uptResponse = await limit(() => rpcMeasured('ethrex_getUtxoProofs', [request]));
+    rpcCalls += 1;
+    uptRpcCalls += 1;
+    responseBytes += uptResponse.responseBytes;
+    providerRpcMs += uptResponse.elapsedMs;
+    if (!uptResponse.result || !Array.isArray(uptResponse.result.blocks)) throw new Error('ethrex_getUtxoProofs returned an invalid response');
+
+    const expectedByBlock = new Map();
+    for (const [key, position] of uncachedPositions) {
+      const blockKey = String(BigInt(position.blockNumber));
+      const expected = expectedByBlock.get(blockKey) || new Map();
+      expected.set(key, position);
+      expectedByBlock.set(blockKey, expected);
     }
-    utxos.push(item);
+    if (uptResponse.result.blocks.length !== expectedByBlock.size) throw new Error('ethrex_getUtxoProofs omitted or duplicated a requested block');
+    const rootSlots = [...new Set(uptResponse.result.blocks.map((block) => `0x${BigInt(block.rootStorageSlot).toString(16)}`))];
+    const rootResponse = await limit(() => rpcMeasured('eth_getProof', [VAULT, rootSlots, 'latest']));
+    rpcCalls += 1;
+    uptRootProofRpcCalls += 1;
+    rootChecks += rootSlots.length;
+    responseBytes += rootResponse.responseBytes;
+    providerRpcMs += rootResponse.elapsedMs;
+    const rootValues = new Map((rootResponse.result?.storageProof || []).map((proof) => [BigInt(proof.key).toString(), proof.value]));
+    if (rootValues.size !== rootSlots.length) throw new Error('eth_getProof omitted a UPT openings-root slot');
+
+    const returnedKeys = new Set();
+    for (const block of uptResponse.result.blocks) {
+      const blockKey = BigInt(block.blockNumber).toString();
+      const expected = expectedByBlock.get(blockKey);
+      if (!expected) throw new Error(`ethrex_getUtxoProofs returned unexpected block ${block.blockNumber}`);
+      const rootValue = rootValues.get(BigInt(block.rootStorageSlot).toString());
+      if (rootValue == null) throw new Error(`missing vault root for block ${block.blockNumber}`);
+      const verified = verifyUptBlock(block, expected, transactionHashes, rootValue, chainId);
+      uptBlocksReturned += 1;
+      uptRecordsReturned += verified.items.length;
+      uptProofNodes += verified.proofNodes;
+      for (const item of verified.items) {
+        const key = `${BigInt(item.creationBlock)}:${BigInt(item.transactionIndex)}:${BigInt(item.logIndex)}`;
+        if (returnedKeys.has(key)) throw new Error(`duplicate verified UPT record ${key}`);
+        returnedKeys.add(key);
+        utxos.push(item);
+        if (cache) {
+          const blockHash = item.blockHash.toLowerCase();
+          utxoPositionCache.set(`${rpcUrl}|${key}`, blockHash);
+          utxoRecordCache.set(`${rpcUrl}|${blockHash}|${key}`, { ...item });
+        }
+      }
+    }
+    if (returnedKeys.size !== uncachedPositions.size) throw new Error('UPT response omitted a requested opening');
   }
 
   const discoveryMs = Number((performance.now() - discoveryStarted).toFixed(3));
@@ -677,13 +940,19 @@ async function scanTables({ address, fromBlock = 0, toBlock, enrich = true, cach
       rootChecks,
       queryCacheHits,
       rootCacheHits,
+      cacheValidationRpcCalls,
       proofsVerified,
       proofBytes,
       proofVerificationMs: Number(proofVerificationMs.toFixed(3)),
       receiptsFetched: 0,
       receiptRpcCalls: 0,
-      selectedLogsReturned: selectedLogs.size,
-      logPayloadRpcCalls: payloadResults.length,
+      uptRpcCalls,
+      uptRootProofRpcCalls,
+      uptBlocksReturned,
+      uptRecordsReturned,
+      uptProofNodes,
+      uptProofBytes: uptProofNodes * 32,
+      uptCacheHits,
       blocksTouched: new Set([...positions.values()].map((entry) => String(entry.blockNumber))).size,
       walletTotalMs,
       walletRpcCalls: enrich ? rpcCalls + utxos.length + 1 : rpcCalls,
@@ -694,7 +963,7 @@ async function scanTables({ address, fromBlock = 0, toBlock, enrich = true, cach
 
 function resultIdentity(scanResult) {
   const canonical = scanResult.utxos.map((item) => [
-    item.creationBlock, item.txHash, item.logIndex, item.index, item.source, item.recipient, item.valueWei,
+    item.creationBlock, item.txHash, item.index, item.source, item.recipient, item.valueWei,
   ]).sort((a, b) => JSON.stringify(a).localeCompare(JSON.stringify(b)));
   return createHash('sha256').update(JSON.stringify(canonical)).digest('hex');
 }
@@ -991,4 +1260,14 @@ if (process.argv[1] && resolve(process.argv[1]) === fileURLToPath(import.meta.ur
   server.listen(PORT, HOST, () => console.log(`Standalone UTXO wallet â†’ http://${HOST}:${PORT} (${rpcUrl})`));
 }
 
-export { benchmarkDiscovery, clearDiscoveryCaches, compareDiscovery, rpc, scan, scanLogs, scanTables };
+export {
+  benchmarkDiscovery,
+  clearDiscoveryCaches,
+  compareDiscovery,
+  keccak256,
+  openingLeafFromRecord,
+  rpc,
+  scan,
+  scanLogs,
+  scanTables,
+};

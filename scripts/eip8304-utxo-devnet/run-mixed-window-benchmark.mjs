@@ -3,7 +3,7 @@
  * Continuous mixed-address EIP-8312 workload. Every activity transaction has
  * four independently signed routes and creates 70-100 UTXOs in one block.
  * The same early UTXO is located through receipt logs and root-verified
- * extended EIP-8304 tables with selected log payloads over 100- and 150-block
+ * canonical EIP-8304 tables with selected, opening-root-proven UPT records over 100- and 150-block
  * windows.
  */
 import { spawn } from 'node:child_process';
@@ -21,6 +21,7 @@ const VAULT = '0x0000000000000000000000000000000000008312';
 const INDEX = '0x0000000000000000000000000000000000008304';
 const UTXO_CREATED_TOPIC = '0x3b19241465a47bc187f1d9c7db70834855a907183742a4b63aa824c576296f5e';
 const WEI = 1_000_000_000_000_000_000n;
+const SLOT_SPENT_BASE = 1n << 129n;
 
 function argument(name, fallback) {
   const index = process.argv.indexOf(name);
@@ -76,6 +77,137 @@ function mulberry32(seed) {
 const sleep = (milliseconds) => new Promise((resolveSleep) => setTimeout(resolveSleep, milliseconds));
 const quantity = (value) => Number(BigInt(value));
 const alignUp = (value, alignment) => Math.ceil(value / alignment) * alignment;
+const hexQuantity = (value) => `0x${BigInt(value).toString(16)}`;
+
+async function loadCanonicalNonces(rpc, accounts) {
+  const nonces = new Map();
+  for (const account of accounts) {
+    const key = account.address.toLowerCase();
+    if (!nonces.has(key)) {
+      nonces.set(key, quantity(await rpc('eth_getTransactionCount', [account.address, 'latest'])));
+    }
+  }
+  return nonces;
+}
+
+function currentNonce(nonces, account) {
+  const key = account.address.toLowerCase();
+  const nonce = nonces.get(key);
+  if (nonce == null) throw new Error(`nonce was not initialized for ${account.name}`);
+  return nonce;
+}
+
+function advanceNonce(nonces, account, nonce) {
+  nonces.set(account.address.toLowerCase(), nonce + 1);
+}
+
+async function synchronizeCanonicalNonce(rpc, nonces, account) {
+  const localNonce = currentNonce(nonces, account);
+  const chainNonce = quantity(await rpc('eth_getTransactionCount', [account.address, 'latest']));
+  if (chainNonce !== localNonce) nonces.set(account.address.toLowerCase(), chainNonce);
+  return { nonce: chainNonce, changed: chainNonce !== localNonce, previous: localNonce };
+}
+
+async function isUtxoSpent(rpc, index, spentWords = new Map()) {
+  const numericIndex = BigInt(index);
+  const slot = SLOT_SPENT_BASE + (numericIndex >> 8n);
+  const slotKey = slot.toString();
+  if (!spentWords.has(slotKey)) {
+    spentWords.set(slotKey, BigInt(await rpc('eth_getStorageAt', [VAULT, hexQuantity(slot), 'latest'])));
+  }
+  return (spentWords.get(slotKey) & (1n << (numericIndex & 0xffn))) !== 0n;
+}
+
+async function assertUniqueUnspentCarriers(rpc, carriers) {
+  const flattened = carriers.flat();
+  const indexes = new Set(flattened.map((carrier) => carrier.index));
+  if (indexes.size !== flattened.length) {
+    throw new Error(`carrier bootstrap produced duplicate UTXO indices (${[...flattened.map((carrier) => carrier.index)].join(', ')}); refusing to enter the measured range`);
+  }
+
+  const spentWords = new Map();
+  for (const carrier of flattened) {
+    if (await isUtxoSpent(rpc, carrier.index, spentWords)) {
+      throw new Error(`carrier UTXO #${carrier.index} is already spent before the measured range`);
+    }
+  }
+}
+
+const topicAddress = (topic) => `0x${topic.slice(-40)}`.toLowerCase();
+
+function refreshCarrierFromReceipt(receipt, expected) {
+  const openings = (receipt.logs || []).filter((log) => (
+    log.address?.toLowerCase() === VAULT
+      && log.topics?.length === 4
+      && log.topics[0]?.toLowerCase() === UTXO_CREATED_TOPIC
+      && log.data?.length === 66
+  )).map((log) => ({
+    index: quantity(log.topics[3]),
+    valueWei: BigInt(log.data).toString(),
+    source: topicAddress(log.topics[1]),
+    recipient: topicAddress(log.topics[2]),
+    creationBlock: quantity(receipt.blockNumber),
+    txHash: receipt.transactionHash,
+    blockHash: receipt.blockHash,
+    logIndex: quantity(log.logIndex || '0x0'),
+  }));
+  const exact = openings.find((opening) => opening.index === expected.index);
+  if (exact) return exact;
+  const equivalent = openings.filter((opening) => (
+    opening.source === expected.source.toLowerCase()
+      && opening.recipient === expected.recipient.toLowerCase()
+      && opening.valueWei === String(expected.valueWei)
+  ));
+  return equivalent.length === 1 ? equivalent[0] : null;
+}
+
+async function canonicalReceipt(rpc, transactionHash) {
+  const receipt = await rpc('eth_getTransactionReceipt', [transactionHash]);
+  if (!receipt) return null;
+  const block = await rpc('eth_getBlockByNumber', [receipt.blockNumber, false]);
+  return block?.hash?.toLowerCase() === receipt.blockHash?.toLowerCase() ? receipt : null;
+}
+
+async function resolveCarrierHistory(rpc, history, label, timeoutMs) {
+  const deadline = Date.now() + Math.min(timeoutMs, 120_000);
+  while (Date.now() < deadline) {
+    let pendingCreation = false;
+    for (let cursor = history.length - 1; cursor >= 0; cursor -= 1) {
+      const candidate = history[cursor];
+      const receipt = await canonicalReceipt(rpc, candidate.txHash);
+      if (receipt) {
+        const refreshed = refreshCarrierFromReceipt(receipt, candidate);
+        if (refreshed && !(await isUtxoSpent(rpc, refreshed.index))) {
+          const discarded = history.slice(cursor + 1);
+          const discardedGenerations = discarded.length;
+          const reindexed = refreshed.index !== candidate.index || refreshed.creationBlock !== candidate.creationBlock;
+          history.splice(cursor + 1);
+          history[cursor] = refreshed;
+          return {
+            carrier: refreshed,
+            discardedGenerations,
+            discardedTransactionHashes: [...new Set(discarded.map((item) => item.txHash))],
+            reindexed,
+          };
+        }
+        continue;
+      }
+
+      // Do not fall back to this carrier's input while its creating transaction
+      // is still pending: both transactions would then compete to spend it.
+      const transaction = await rpc('eth_getTransactionByHash', [candidate.txHash]);
+      if (transaction && transaction.blockHash == null) {
+        pendingCreation = true;
+        break;
+      }
+    }
+    if (!pendingCreation) {
+      throw new Error(`${label}: no canonical, unspent carrier remains after a reorg`);
+    }
+    await sleep(1_000);
+  }
+  throw new Error(`${label}: pending carrier creation did not settle within ${Math.min(timeoutMs, 120_000)} ms`);
+}
 
 function forge(python, command) {
   return new Promise((resolveForge, rejectForge) => {
@@ -143,13 +275,13 @@ function htmlEscape(value) {
 function renderReport(summary) {
   const checkpointRows = summary.checkpoints.flatMap((checkpoint) => [
     ['Receipt logs', 'receiptLogs', checkpoint.receiptLogs],
-    ['Proof query + selected logs', 'eip8304Tables', checkpoint.eip8304Tables],
+    ['EIP-8304 + batched UPT', 'eip8304Tables', checkpoint.eip8304Tables],
   ].map(([method, key, result]) => {
     const statistics = checkpoint.statistics[key];
-    return `<tr><td>${checkpoint.windowBlocks}</td><td>${method}</td><td>${result.discoveryMs.toFixed(3)}</td><td>${statistics.discoveryMs.median.toFixed(3)}</td><td>${statistics.discoveryMs.p95.toFixed(3)}</td><td>${statistics.rpcCalls.median}</td><td>${statistics.responseBytes.median}</td><td>${result.tablesLoaded || 0}</td><td>${result.logPayloadRpcCalls || 0}</td><td>${result.candidates}</td><td>${result.found ? 'found' : 'missing'}</td></tr>`;
+    return `<tr><td>${checkpoint.windowBlocks}</td><td>${method}</td><td>${result.discoveryMs.toFixed(3)}</td><td>${statistics.discoveryMs.median.toFixed(3)}</td><td>${statistics.discoveryMs.p95.toFixed(3)}</td><td>${statistics.rpcCalls.median}</td><td>${statistics.responseBytes.median}</td><td>${result.tablesLoaded || 0}</td><td>${result.uptRpcCalls || 0}</td><td>${result.candidates}</td><td>${result.found ? 'found' : 'missing'}</td></tr>`;
   })).join('');
   const recentBlocks = summary.activity.slice(-12).map((activity) => `<tr><td>${activity.block}</td><td>${activity.targetUtxos}</td><td>${activity.actualUtxos}</td><td>${activity.gapFromPrevious ?? '-'}</td><td>${activity.routes.map((route) => `${htmlEscape(route.source)}→${htmlEscape(route.destination)} (${route.destinationUtxos})`).join('<br>')}</td><td>${activity.gasUsed}</td><td>${activity.confirmation?.reorgs || 0}</td><td>${activity.confirmation?.resubmissions || 0}</td></tr>`).join('');
-  return `<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Mixed-address EIP-8304 benchmark</title><style>:root{color-scheme:dark;font-family:Inter,system-ui,sans-serif;background:#0b0e14;color:#edf2f7}body{max-width:1100px;margin:auto;padding:32px}.cards{display:grid;grid-template-columns:repeat(3,1fr);gap:12px}.card{background:#121824;border:1px solid #273244;border-radius:12px;padding:16px}.card b{display:block;font-size:24px}.card small,.meta{color:#98a6b8}.pass{color:#72e2c0}table{width:100%;border-collapse:collapse;margin:24px 0;font-size:12px}th,td{padding:9px;border-bottom:1px solid #273244;text-align:right;vertical-align:top}th:first-child,td:first-child,th:nth-child(2),td:nth-child(2){text-align:left}@media(max-width:700px){.cards{grid-template-columns:1fr}}</style></head><body><h1>Mixed-address extended EIP-8304 lookup</h1><p class="meta">Seed ${summary.seed} · tracked UTXO #${summary.tracked.index} · ${htmlEscape(summary.tracked.recipient)} · ${summary.configuration.discoveryRepetitions} measured runs after ${summary.configuration.discoveryWarmups} warmups</p><div class="cards"><div class="card"><b>${summary.activity.length}</b><small>activity blocks</small></div><div class="card"><b>${summary.totalCreatedUtxos}</b><small>UTXOs created</small></div><div class="card"><b class="pass">MATCH</b><small>all cold and measured result hashes</small></div></div><h2>Specific-item lookup</h2><table><thead><tr><th>Window</th><th>Method</th><th>Cold ms</th><th>Median ms</th><th>p95 ms</th><th>Median calls</th><th>Median bytes</th><th>Tables</th><th>Payload RPCs</th><th>Candidates</th><th>Item</th></tr></thead><tbody>${checkpointRows}</tbody></table><h2>Latest mixed-route blocks</h2><table><thead><tr><th>Block</th><th>Target</th><th>Created</th><th>Gap</th><th>Routes</th><th>Gas</th><th>Reorgs</th><th>Resubmits</th></tr></thead><tbody>${recentBlocks}</tbody></table></body></html>`;
+  return `<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Mixed-address EIP-8304 benchmark</title><style>:root{color-scheme:dark;font-family:Inter,system-ui,sans-serif;background:#0b0e14;color:#edf2f7}body{max-width:1100px;margin:auto;padding:32px}.cards{display:grid;grid-template-columns:repeat(3,1fr);gap:12px}.card{background:#121824;border:1px solid #273244;border-radius:12px;padding:16px}.card b{display:block;font-size:24px}.card small,.meta{color:#98a6b8}.pass{color:#72e2c0}table{width:100%;border-collapse:collapse;margin:24px 0;font-size:12px}th,td{padding:9px;border-bottom:1px solid #273244;text-align:right;vertical-align:top}th:first-child,td:first-child,th:nth-child(2),td:nth-child(2){text-align:left}@media(max-width:700px){.cards{grid-template-columns:1fr}}</style></head><body><h1>Mixed-address EIP-8304 + UPT lookup</h1><p class="meta">Seed ${summary.seed} · tracked UTXO #${summary.tracked.index} · ${htmlEscape(summary.tracked.recipient)} · ${summary.configuration.discoveryRepetitions} measured runs after ${summary.configuration.discoveryWarmups} warmups</p><div class="cards"><div class="card"><b>${summary.activity.length}</b><small>activity blocks</small></div><div class="card"><b>${summary.totalCreatedUtxos}</b><small>UTXOs created</small></div><div class="card"><b class="pass">MATCH</b><small>all cold and measured result hashes</small></div></div><h2>Specific-item lookup</h2><table><thead><tr><th>Window</th><th>Method</th><th>Cold ms</th><th>Median ms</th><th>p95 ms</th><th>Median calls</th><th>Median bytes</th><th>Tables</th><th>UPT RPCs</th><th>Candidates</th><th>Item</th></tr></thead><tbody>${checkpointRows}</tbody></table><h2>Latest mixed-route blocks</h2><table><thead><tr><th>Block</th><th>Target</th><th>Created</th><th>Gap</th><th>Routes</th><th>Gas</th><th>Reorgs</th><th>Resubmits</th></tr></thead><tbody>${recentBlocks}</tbody></table></body></html>`;
 }
 
 async function main() {
@@ -229,22 +361,52 @@ async function main() {
   const runStartedAt = new Date().toISOString();
 
   console.log('Creating two alternating carrier UTXOs per wallet outside the measured range');
-  const carriers = inspectors.map(() => []);
+  // Assign nonces in the benchmark process. Depending on a fresh EL nonce read
+  // for every identical deposit allowed an old raw transaction to be returned
+  // again, making two carrier banks point at the same UTXO. Reconcile against
+  // canonical state between sends, because this devnet's pending count may skip
+  // a missing nonce when a higher-nonce transaction remains queued.
+  const nextNonces = await loadCanonicalNonces(rpc, funders);
+  const carrierIndexes = new Set();
+  const carrierHistories = inspectors.map(() => [[], []]);
   for (let index = 0; index < inspectors.length; index += 1) {
     const owner = inspectors[index];
     const funder = funders[index % funders.length];
     for (let bank = 0; bank < 2; bank += 1) {
+      const nonceState = await synchronizeCanonicalNonce(rpc, nextNonces, funder);
+      const nonce = nonceState.nonce;
+      if (nonceState.changed) {
+        console.log(`${funder.name}: bootstrap nonce resynchronized ${nonceState.previous} -> ${nonce}`);
+      }
       const deposit = await forge(python, {
         op: 'deposit', key: funder.key, recipient: owner.address, valueWei: carrierValueWei.toString(),
-        confirmations,
+        confirmations, nonce, receiptTimeoutSeconds: Math.ceil(waitTimeoutMs / 1_000),
       });
       if (deposit.status !== '0x1' || deposit.index == null) throw new Error(`${owner.name}: carrier ${bank} deposit failed`);
+      advanceNonce(nextNonces, funder, nonce);
+      if (carrierIndexes.has(deposit.index)) {
+        throw new Error(`${owner.name}: carrier ${bank} reused UTXO #${deposit.index}; the deposit transaction was replayed`);
+      }
       const scan = await scanLogs({ address: owner.address, fromBlock: deposit.block, toBlock: deposit.block, enrich: false });
       const opening = scan.utxos.find((item) => item.index === deposit.index);
       if (!opening) throw new Error(`${owner.name}: carrier UTXO #${deposit.index} was not found`);
-      carriers[index].push(opening);
+      if (opening.recipient.toLowerCase() !== owner.address || BigInt(opening.valueWei) !== carrierValueWei) {
+        throw new Error(`${owner.name}: carrier UTXO #${deposit.index} does not match its requested recipient and value`);
+      }
+      carrierIndexes.add(deposit.index);
+      carrierHistories[index][bank].push(opening);
     }
   }
+  const bootstrapCarriers = carrierHistories.map((banks) => banks.map((history) => history.at(-1)));
+  await assertUniqueUnspentCarriers(rpc, bootstrapCarriers);
+  await writeFile(resolve(outputDir, 'bootstrap.json'), JSON.stringify({
+    carriers: bootstrapCarriers.map((banks, index) => ({
+      owner: inspectors[index].name,
+      address: inspectors[index].address,
+      banks: banks.map((carrier, bank) => ({ bank, ...carrier })),
+    })),
+  }, null, 2) + '\n');
+  console.log(`Carrier bootstrap verified: ${carrierIndexes.size} distinct, unspent UTXOs`);
 
   const headAfterBootstrap = quantity(await rpc('eth_blockNumber', []));
   const scanStartBlock = alignUp(headAfterBootstrap + 2, 64);
@@ -317,6 +479,9 @@ async function main() {
   }
 
   let activityNumber = 0;
+  let carrierRecoveryCount = 0;
+  let nonceResynchronizationCount = 0;
+  const orphanedActivityTransactions = new Set();
   while (quantity(await rpc('eth_blockNumber', [])) < secondEndBlock) {
     // Alternating banks allow consecutive activity blocks: a carrier created
     // in block N is not reused until at least block N+2.
@@ -331,6 +496,41 @@ async function main() {
       while (destinationIndex === sourceIndex);
       return inspectors[destinationIndex];
     });
+    const carrierResolutions = await Promise.all(inspectors.map((source, sourceIndex) => (
+      resolveCarrierHistory(
+        rpc,
+        carrierHistories[sourceIndex][carrierBank],
+        `${source.name} bank ${carrierBank}`,
+        waitTimeoutMs,
+      )
+    )));
+    const recoveredThisActivity = carrierResolutions.reduce(
+      (sum, resolution) => sum + resolution.discardedGenerations + (resolution.reindexed ? 1 : 0),
+      0,
+    );
+    if (recoveredThisActivity > 0) {
+      carrierRecoveryCount += recoveredThisActivity;
+      console.log(`Recovered ${recoveredThisActivity} carrier state reference(s) after a reorg`);
+    }
+    const newlyOrphaned = new Set(carrierResolutions.flatMap((resolution) => resolution.discardedTransactionHashes));
+    for (const transactionHash of newlyOrphaned) {
+      orphanedActivityTransactions.add(transactionHash);
+      const record = activity.find((item) => item.txHash === transactionHash);
+      if (record) record.orphaned = true;
+      if (tracked?.txHash === transactionHash) tracked = null;
+    }
+    for (let sourceIndex = 0; sourceIndex < carrierResolutions.length; sourceIndex += 1) {
+      const resolution = carrierResolutions[sourceIndex];
+      if (!resolution.reindexed) continue;
+      const record = activity.find((item) => item.txHash === resolution.carrier.txHash);
+      if (record) {
+        record.block = resolution.carrier.creationBlock;
+        record.blockHash = resolution.carrier.blockHash;
+        record.routes[sourceIndex].changeIndex = resolution.carrier.index;
+        record.reindexedAfterReorg = true;
+      }
+      if (tracked?.txHash === resolution.carrier.txHash) tracked = null;
+    }
     const routes = inspectors.map((source, sourceIndex) => {
       const destination = destinations[sourceIndex];
       const destinationOuts = Array.from({ length: destinationCounts[sourceIndex] }, () => ({
@@ -339,19 +539,27 @@ async function main() {
       }));
       return {
         actorKeys: [source.key],
-        inputs: [carriers[sourceIndex][carrierBank]],
+        inputs: [carrierResolutions[sourceIndex].carrier],
         utxoOuts: [...destinationOuts, { recipient: source.address, valueWei: '0' }],
         accountOuts: [],
         changeIndex: destinationOuts.length,
       };
     });
     const sponsor = funders[activityNumber % funders.length];
+    const nonceState = await synchronizeCanonicalNonce(rpc, nextNonces, sponsor);
+    const sponsorNonce = nonceState.nonce;
+    if (nonceState.changed) {
+      nonceResynchronizationCount += 1;
+      console.log(`${sponsor.name}: resynchronized nonce ${nonceState.previous} -> ${sponsorNonce} after canonical-head change`);
+    }
     const result = await forge(python, {
-      op: 'multiSponsoredSpend', sponsorKey: sponsor.key, routes, confirmations,
+      op: 'multiSponsoredSpend', sponsorKey: sponsor.key, routes, confirmations, nonce: sponsorNonce,
+      receiptTimeoutSeconds: Math.ceil(waitTimeoutMs / 1_000),
     });
     if (result.status !== '0x1' || result.created.length !== targetUtxos) {
       throw new Error(`activity ${activityNumber + 1}: created ${result.created.length} UTXOs; expected ${targetUtxos}`);
     }
+    advanceNonce(nextNonces, sponsor, sponsorNonce);
     const actualUtxos = await countBlockUtxos(rpc, result.block);
     if (actualUtxos < minimumUtxos) throw new Error(`activity block ${result.block} contains only ${actualUtxos} UTXOs`);
 
@@ -362,7 +570,7 @@ async function main() {
       const change = created.at(-1);
       if (destinationCreated.length !== destinationCounts[sourceIndex]) throw new Error(`activity ${activityNumber + 1}: route ${sourceIndex} output mismatch`);
       if (change.recipient.toLowerCase() !== inspectors[sourceIndex].address) throw new Error(`activity ${activityNumber + 1}: route ${sourceIndex} change recipient mismatch`);
-      carriers[sourceIndex][carrierBank] = change;
+      carrierHistories[sourceIndex][carrierBank].push(change);
       routeRecords.push({
         source: inspectors[sourceIndex].name,
         sourceAddress: inspectors[sourceIndex].address,
@@ -371,7 +579,7 @@ async function main() {
         destinationUtxos: destinationCreated.length,
         changeIndex: change.index,
       });
-      if (!tracked && sourceIndex === 0) {
+      if (!tracked && result.block >= scanStartBlock && sourceIndex === 0) {
         const item = destinationCreated[0];
         tracked = {
           index: item.index,
@@ -394,7 +602,11 @@ async function main() {
       actualUtxos,
       txHash: result.txHash,
       sponsor: sponsor.name,
+      sponsorNonce,
       carrierBank,
+      carrierRecoveries: recoveredThisActivity,
+      nonceResynchronized: nonceState.changed,
+      preRange: result.block < scanStartBlock,
       gasUsed: result.gasUsed,
       forgeTotalMs: result.inclusionMs,
       firstCanonicalReceiptMs: result.confirmation?.firstCanonicalReceiptMs,
@@ -419,6 +631,9 @@ async function main() {
   }
   await measureCheckpoint(secondWindow, secondEndBlock);
 
+  const canonicalActivity = activity.filter((item) => (
+    !item.orphaned && item.block >= scanStartBlock && item.block <= secondEndBlock
+  ));
   const summary = {
     runId,
     startedAt: runStartedAt,
@@ -437,17 +652,24 @@ async function main() {
       discoveryRepetitions,
       discoveryConcurrency,
     },
+    recovery: {
+      carrierStateReferences: carrierRecoveryCount,
+      sponsorNonceResynchronizations: nonceResynchronizationCount,
+      orphanedActivityTransactions: [...orphanedActivityTransactions],
+    },
     scan: { firstBlock: scanStartBlock, firstEndBlock, secondEndBlock },
     tracked,
-    totalCreatedUtxos: activity.reduce((sum, item) => sum + item.actualUtxos, 0),
+    totalCreatedUtxos: canonicalActivity.reduce((sum, item) => sum + item.actualUtxos, 0),
     chainStability: {
-      reorgs: activity.reduce((sum, item) => sum + (item.confirmation?.reorgs || 0), 0),
-      resubmissions: activity.reduce((sum, item) => sum + (item.confirmation?.resubmissions || 0), 0),
+      reorgs: canonicalActivity.reduce((sum, item) => sum + (item.confirmation?.reorgs || 0), 0),
+      resubmissions: canonicalActivity.reduce((sum, item) => sum + (item.confirmation?.resubmissions || 0), 0),
     },
-    activity,
+    activity: canonicalActivity,
+    preRangeActivity: activity.filter((item) => !item.orphaned && item.block < scanStartBlock),
+    orphanedActivity: activity.filter((item) => item.orphaned),
     checkpoints,
   };
-  const csvRows = [['window_blocks', 'phase', 'iteration', 'order', 'method', 'specific_index', 'found', 'discovery_ms', 'provider_rpc_ms', 'rpc_calls', 'response_bytes', 'candidates', 'tables_loaded', 'table_sizes', 'table_load_us', 'query_us', 'entries_returned', 'full_table_entries', 'matched_positions', 'root_checks', 'query_cache_hits', 'root_cache_hits', 'proofs_verified', 'proof_bytes', 'proof_verification_ms', 'receipts_fetched', 'selected_logs_returned', 'log_payload_rpc_calls', 'same_results']];
+  const csvRows = [['window_blocks', 'phase', 'iteration', 'order', 'method', 'specific_index', 'found', 'discovery_ms', 'provider_rpc_ms', 'rpc_calls', 'response_bytes', 'candidates', 'tables_loaded', 'table_sizes', 'table_load_us', 'query_us', 'entries_returned', 'full_table_entries', 'matched_positions', 'root_checks', 'query_cache_hits', 'root_cache_hits', 'proofs_verified', 'proof_bytes', 'proof_verification_ms', 'receipts_fetched', 'upt_rpc_calls', 'upt_root_proof_rpc_calls', 'upt_blocks_returned', 'upt_records_returned', 'upt_proof_nodes', 'upt_proof_bytes', 'upt_cache_hits', 'same_results']];
   for (const checkpoint of checkpoints) {
     const runs = [
       { phase: 'cold', iteration: 0, order: 'logsFirst', receiptLogs: checkpoint.receiptLogs, eip8304Tables: checkpoint.eip8304Tables },
@@ -462,7 +684,9 @@ async function main() {
           result.providerQueryMicros, result.entriesExamined, result.fullTableEntries, result.matchedPositions,
           result.rootChecks, result.queryCacheHits, result.rootCacheHits, result.proofsVerified,
           result.proofBytes, result.proofVerificationMs, result.receiptsFetched,
-          result.selectedLogsReturned, result.logPayloadRpcCalls, checkpoint.sameResults,
+          result.uptRpcCalls, result.uptRootProofRpcCalls, result.uptBlocksReturned,
+          result.uptRecordsReturned, result.uptProofNodes, result.uptProofBytes,
+          result.uptCacheHits, checkpoint.sameResults,
         ]);
       }
     }

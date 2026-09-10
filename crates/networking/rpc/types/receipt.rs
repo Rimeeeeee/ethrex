@@ -223,6 +223,10 @@ impl RpcReceiptTxInfo {
                 Some(block_blob_gas_price),
                 Some(tx.blob_versioned_hashes.len() as u64 * GAS_PER_BLOB as u64),
             ),
+            Transaction::FrameTransaction(tx) if !tx.blob_versioned_hashes.is_empty() => (
+                Some(block_blob_gas_price),
+                Some(tx.blob_versioned_hashes.len() as u64 * GAS_PER_BLOB as u64),
+            ),
             _ => (None, None),
         };
         let (contract_address, to) = match transaction.to() {
@@ -248,7 +252,7 @@ mod tests {
     use super::*;
     use ethrex_common::{
         Bytes,
-        types::{Log, TxType},
+        types::{FrameTransaction, Log, TxType},
     };
     use hex_literal::hex;
 
@@ -288,5 +292,20 @@ mod tests {
         );
         let expected = r#"{"type":"0x3","status":"0x1","cumulativeGasUsed":"0x93","logsBloom":"0x00000000000000000080000000000000000000000000000000000000000000000000000000000000000000000000000200000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000100000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000","logs":[{"address":"0x0000000000000000000000000000000000000000","topics":[],"data":"0x73747261776265727279","logIndex":"0x0","removed":false,"transactionHash":"0x0000000000000000000000000000000000000000000000000000000000000000","transactionIndex":"0x1","blockHash":"0x0000000000000000000000000000000000000000000000000000000000000000","blockNumber":"0x3"}],"transactionHash":"0x0000000000000000000000000000000000000000000000000000000000000000","transactionIndex":"0x1","from":"0x0000000000000000000000000000000000000000","to":"0x7435ed30a8b4aeb0877cef0c6e8cffe834eb865f","contractAddress":null,"gasUsed":"0x93","effectiveGasPrice":"0x9d","blockHash":"0x0000000000000000000000000000000000000000000000000000000000000000","blockNumber":"0x3"}"#;
         assert_eq!(serde_json::to_string(&receipt).unwrap(), expected);
+    }
+
+    #[test]
+    fn frame_blob_receipt_reports_blob_gas_fields() {
+        let tx = Transaction::FrameTransaction(FrameTransaction {
+            sender: Address::from_low_u64_be(0x8141),
+            max_priority_fee_per_gas: 1,
+            max_fee_per_gas: 10,
+            blob_versioned_hashes: vec![H256::repeat_byte(0x01); 2],
+            ..Default::default()
+        });
+
+        let info = RpcReceiptTxInfo::from_transaction(tx, 0, 21_000, 7, Some(1)).unwrap();
+        assert_eq!(info.blob_gas_price, Some(7));
+        assert_eq!(info.blob_gas_used, Some(2 * GAS_PER_BLOB as u64));
     }
 }

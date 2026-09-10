@@ -24,12 +24,11 @@ function asBlock(value, name) {
 
 function parseOpening(log) {
   const data = String(log.data || '0x').slice(2);
-  if (data.length < 128 || !Array.isArray(log.topics) || log.topics.length < 3) return null;
-  const word = (offset) => BigInt(`0x${data.slice(offset, offset + 64)}`);
+  if (data.length !== 64 || !Array.isArray(log.topics) || log.topics.length !== 4) return null;
   const topicAddress = (topic) => `0x${String(topic).slice(-40)}`.toLowerCase();
   return {
-    index: Number(word(0)),
-    valueWei: word(64).toString(),
+    index: Number(BigInt(log.topics[3])),
+    valueWei: BigInt(`0x${data}`).toString(),
     source: topicAddress(log.topics[1]),
     recipient: topicAddress(log.topics[2]),
     creationBlock: Number.parseInt(log.blockNumber, 16),

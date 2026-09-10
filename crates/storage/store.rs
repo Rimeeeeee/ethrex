@@ -9,7 +9,7 @@ use crate::{
             BAD_BLOCKS, BLOCK_ACCESS_LISTS, BLOCK_NUMBERS, BODIES, CANONICAL_BLOCK_HASHES,
             CHAIN_DATA, EXECUTION_WITNESSES, FULLSYNC_HEADERS, HEADERS, INDEX_TABLES,
             INVALID_CHAINS, MISC_VALUES, PENDING_BLOCKS, RECEIPTS_V2, SNAP_STATE, STATE_HISTORY,
-            STORAGE_FLATKEYVALUE, STORAGE_TRIE_NODES, TRANSACTION_LOCATIONS,
+            STORAGE_FLATKEYVALUE, STORAGE_TRIE_NODES, TRANSACTION_LOCATIONS, UTXO_PROOF_TABLES,
         },
     },
     apply_prefix,
@@ -28,7 +28,7 @@ use ethrex_common::{
     types::{
         AccountInfo, AccountState, AccountUpdate, Block, BlockBody, BlockHash, BlockHeader,
         BlockNumber, ChainConfig, Code, CodeMetadata, ForkId, Genesis, GenesisAccount, Index,
-        Receipt, Transaction,
+        Receipt, Transaction, UtxoProofTable,
         block_access_list::BlockAccessList,
         block_execution_witness::{ExecutionWitness, RpcExecutionWitness},
         eip8304::{INDEX_CONTRACT_ADDRESS, IndexTable, TABLE_SIZES},
@@ -2675,6 +2675,35 @@ impl Store {
             .map_err(|error| StoreError::Custom(error.to_string()))?;
         let key = index_table_key(table.level(), end_block_number, end_block_hash)?;
         self.write(INDEX_TABLES, key, table.encode_storage())
+    }
+
+    /// Persist a fork-specific, block-scoped UTXO Proof Table. The table is an
+    /// availability object, not consensus state; its opening root is validated
+    /// again when it is decoded and by wallets against the vault commitment.
+    pub fn store_utxo_proof_table(&self, table: &UtxoProofTable) -> Result<(), StoreError> {
+        self.write(
+            UTXO_PROOF_TABLES,
+            table.block_hash().as_bytes().to_vec(),
+            table.encode_storage(),
+        )
+    }
+
+    /// Load and validate the UPT associated with an exact block hash.
+    pub fn get_utxo_proof_table(
+        &self,
+        block_hash: BlockHash,
+    ) -> Result<Option<UtxoProofTable>, StoreError> {
+        let Some(encoded) = self.read(UTXO_PROOF_TABLES, block_hash.as_bytes().to_vec())? else {
+            return Ok(None);
+        };
+        let table = UtxoProofTable::decode_storage(&encoded)
+            .map_err(|error| StoreError::Custom(error.to_string()))?;
+        if table.block_hash() != block_hash {
+            return Err(StoreError::Custom(
+                "Persisted UTXO proof table block hash does not match its key".to_owned(),
+            ));
+        }
+        Ok(Some(table))
     }
 
     /// Persist every EIP-8304 table committed by `block`, resolving each

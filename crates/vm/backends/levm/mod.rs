@@ -3812,39 +3812,26 @@ impl LEVM {
         block_number: u64,
     ) -> Result<(), EvmError> {
         use ethrex_common::types::{
-            UTXO_CREATED_TOPIC, merkle_root, opening_leaf, ring_slot, seals_batch, utxo_vault,
+            decode_utxo_created_log, merkle_root, opening_leaf, ring_slot, seals_batch,
         };
-
-        let vault = utxo_vault();
 
         // Collect this block's created UTXOs, ordered by index. Indices come from
         // one global counter, so ordering by index is ordering by creation.
         let mut created: Vec<(u64, H256)> = Vec::new();
         for receipt in receipts {
             for log in &receipt.logs {
-                // Emitter check first: a same-topic log from any other address is
-                // not a UTXO creation.
-                if log.address != vault {
-                    continue;
-                }
-                if log.topics.first() != Some(&UTXO_CREATED_TOPIC) || log.topics.len() != 3 {
-                    continue;
-                }
-                if log.data.len() != 64 {
-                    continue;
-                }
-                // topics[1] = source, topics[2] = recipient (both left-padded);
-                // data = index (32 bytes) ++ value (32 bytes).
-                let source = Address::from_slice(&log.topics[1].0[12..]);
-                let recipient = Address::from_slice(&log.topics[2].0[12..]);
-                let index_word = U256::from_big_endian(&log.data[..32]);
-                // The index space the leaf encoding and spent bitfield are defined
-                // over is u64; a wider value cannot be a real creation.
-                let Ok(index) = u64::try_from(index_word) else {
+                let Some(opening) = decode_utxo_created_log(log) else {
                     continue;
                 };
-                let value = U256::from_big_endian(&log.data[32..]);
-                created.push((index, opening_leaf(index, source, recipient, value)));
+                created.push((
+                    opening.index,
+                    opening_leaf(
+                        opening.index,
+                        opening.source,
+                        opening.recipient,
+                        opening.value,
+                    ),
+                ));
             }
         }
         created.sort_unstable_by_key(|(index, _)| *index);
@@ -3856,6 +3843,7 @@ impl LEVM {
         // window, and would diverge from any client that writes it — only visibly
         // after the first wrap, thousands of blocks later.
         let root = merkle_root(&leaves);
+        let vault = ethrex_common::types::utxo_vault();
         Self::write_vault_slot(db, vault, ring_slot(block_number), root)?;
 
         // At a batch boundary, seal the batch: its leaves are the openings roots of
