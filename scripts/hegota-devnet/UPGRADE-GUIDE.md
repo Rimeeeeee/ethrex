@@ -287,7 +287,7 @@ abort.
 
 ### At the boundary
 
-5. `eth_getCode` on `0x…8312` returns exactly **74 bytes**, and the account's
+5. `eth_getCode` on `0x…8312` returns exactly **76 bytes**, and the account's
    nonce is 1.
 6. The ring slot for the activation block, `1 + N % 8192`, is written — the
    all-zeros root of an empty block still counts and must be present.
