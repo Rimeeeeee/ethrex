@@ -30,7 +30,11 @@ use crate::{
     utils::keccak,
 };
 use libssz_merkle::{Sha2Hasher, Sha256Hasher};
-use std::collections::{BTreeMap, BTreeSet};
+use rustc_hash::FxHashMap;
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    sync::{Arc, OnceLock},
+};
 use thiserror::Error;
 
 /// Vault system contract address (`address(0x8312)`). Holds every unspent
@@ -762,17 +766,33 @@ pub struct UtxoProofNode {
 /// Block-scoped UTXO Proof Table retained outside Ethereum state.
 /// Its contents remain untrusted until a wallet verifies `openings_root`
 /// against the native vault and folds the selected records to that root.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug)]
 pub struct UtxoProofTable {
     chain_id: u64,
     vault: Address,
     block_number: u64,
     block_hash: H256,
     openings_root: H256,
-    records: Vec<UtxoProofRecord>,
-    internal_nodes: Vec<H256>,
-    event_position_index: BTreeMap<(u32, u32), usize>,
+    records: Arc<[UtxoProofRecord]>,
+    internal_nodes: Arc<[H256]>,
+    event_position_index: Arc<FxHashMap<(u32, u32), usize>>,
+    table_hash: Arc<OnceLock<H256>>,
 }
+
+impl PartialEq for UtxoProofTable {
+    fn eq(&self, other: &Self) -> bool {
+        self.chain_id == other.chain_id
+            && self.vault == other.vault
+            && self.block_number == other.block_number
+            && self.block_hash == other.block_hash
+            && self.openings_root == other.openings_root
+            && self.records == other.records
+            && self.internal_nodes == other.internal_nodes
+            && self.event_position_index == other.event_position_index
+    }
+}
+
+impl Eq for UtxoProofTable {}
 
 #[derive(Clone, Debug, Error, PartialEq, Eq)]
 pub enum UtxoProofTableError {
@@ -846,9 +866,10 @@ impl UtxoProofTable {
             block_number,
             block_hash,
             openings_root,
-            records,
-            internal_nodes,
-            event_position_index,
+            records: records.into(),
+            internal_nodes: internal_nodes.into(),
+            event_position_index: Arc::new(event_position_index),
+            table_hash: Arc::new(OnceLock::new()),
         })
     }
 
@@ -881,6 +902,10 @@ impl UtxoProofTable {
     }
 
     pub fn table_hash(&self) -> H256 {
+        *self.table_hash.get_or_init(|| self.calculate_table_hash())
+    }
+
+    fn calculate_table_hash(&self) -> H256 {
         let encoded = self.encode_canonical_ssz();
         let mut preimage = Vec::with_capacity(UTXO_PROOF_TABLE_HASH_DOMAIN.len() + encoded.len());
         preimage.extend_from_slice(UTXO_PROOF_TABLE_HASH_DOMAIN);
@@ -922,7 +947,7 @@ impl UtxoProofTable {
         encoded.extend_from_slice(self.openings_root.as_bytes());
         encoded.extend_from_slice(&records_offset.to_le_bytes());
         encoded.extend_from_slice(&internal_nodes_offset.to_le_bytes());
-        for record in &self.records {
+        for record in self.records.iter() {
             encoded.extend_from_slice(&record.index.to_le_bytes());
             encoded.extend_from_slice(record.source.as_bytes());
             encoded.extend_from_slice(record.recipient.as_bytes());
@@ -930,7 +955,7 @@ impl UtxoProofTable {
             encoded.extend_from_slice(&record.transaction_index.to_le_bytes());
             encoded.extend_from_slice(&record.transaction_log_index.to_le_bytes());
         }
-        for node in &self.internal_nodes {
+        for node in self.internal_nodes.iter() {
             encoded.extend_from_slice(node.as_bytes());
         }
         encoded
@@ -941,7 +966,7 @@ impl UtxoProofTable {
     pub fn select_by_event_positions(
         &self,
         positions: &BTreeSet<(u32, u32)>,
-    ) -> Result<(Vec<(usize, UtxoProofRecord)>, Vec<UtxoProofNode>), UtxoProofTableError> {
+    ) -> Result<UtxoProofSelection, UtxoProofTableError> {
         let mut selected = positions
             .iter()
             .map(|position| {
@@ -1024,10 +1049,10 @@ impl UtxoProofTable {
         encoded.extend_from_slice(self.openings_root.as_bytes());
         encoded.extend_from_slice(&(self.records.len() as u32).to_be_bytes());
         encoded.extend_from_slice(&(self.internal_nodes.len() as u32).to_be_bytes());
-        for record in &self.records {
+        for record in self.records.iter() {
             record.encode_into(&mut encoded);
         }
-        for node in &self.internal_nodes {
+        for node in self.internal_nodes.iter() {
             encoded.extend_from_slice(node.as_bytes());
         }
         encoded
@@ -1118,16 +1143,20 @@ impl UtxoProofTable {
             block_number,
             block_hash,
             openings_root,
-            records,
-            internal_nodes,
-            event_position_index,
+            records: records.into(),
+            internal_nodes: internal_nodes.into(),
+            event_position_index: Arc::new(event_position_index),
+            table_hash: Arc::new(OnceLock::new()),
         })
     }
 }
 
+/// Records selected from a UTXO proof table and their shared Merkle proof.
+pub type UtxoProofSelection = (Vec<(usize, UtxoProofRecord)>, Vec<UtxoProofNode>);
+
 fn validate_records(
     records: &[UtxoProofRecord],
-) -> Result<BTreeMap<(u32, u32), usize>, UtxoProofTableError> {
+) -> Result<FxHashMap<(u32, u32), usize>, UtxoProofTableError> {
     if records.windows(2).any(|pair| {
         pair[0]
             .index
@@ -1136,7 +1165,7 @@ fn validate_records(
     }) {
         return Err(UtxoProofTableError::NonConsecutiveIndexes);
     }
-    let mut positions = BTreeMap::new();
+    let mut positions = FxHashMap::default();
     for (index, record) in records.iter().enumerate() {
         if positions
             .insert(
@@ -1309,8 +1338,14 @@ mod proof_table_tests {
         );
 
         let encoded = table.encode_storage();
-        assert_eq!(UtxoProofTable::decode_storage(&encoded).unwrap(), table);
+        let decoded = UtxoProofTable::decode_storage(&encoded).unwrap();
+        assert_eq!(decoded, table);
+        assert_eq!(decoded.table_hash(), table.table_hash());
         assert_ne!(table.table_hash(), H256::zero());
+
+        let cloned = table.clone();
+        assert!(Arc::ptr_eq(&table.records, &cloned.records));
+        assert!(Arc::ptr_eq(&table.internal_nodes, &cloned.internal_nodes));
 
         let requested = BTreeSet::from([(0, 1), (1, 0)]);
         let (selected, proof) = table.select_by_event_positions(&requested).unwrap();

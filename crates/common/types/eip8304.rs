@@ -11,7 +11,11 @@ use crate::{
 };
 use ethrex_crypto::Crypto;
 use libssz_merkle::{Sha2Hasher, Sha256Hasher, merkleize, mix_in_length};
-use std::collections::{BTreeMap, BTreeSet};
+use rustc_hash::FxHashMap;
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    sync::{Arc, OnceLock},
+};
 
 /// Number of blocks covered by the index tables at each protocol level.
 pub const TABLE_SIZES: [u64; 5] = [1, 4, 16, 64, 256];
@@ -301,14 +305,43 @@ pub enum IndexTableError {
 }
 
 /// An EIP-8304 index table with canonical, lexicographically sorted entries.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug)]
 pub struct IndexTable {
     first_block: u64,
     table_size: u64,
-    encoded_entries: Vec<EncodedIndexEntry>,
+    encoded_entries: Arc<[EncodedIndexEntry]>,
     entry_count: u64,
     table_root: H256,
+    /// Query-only data is prepared lazily so consensus table construction does
+    /// not pay for RPC acceleration. Clones share the initialized value.
+    proof_data: Arc<OnceLock<IndexProofData>>,
 }
+
+#[derive(Debug)]
+struct IndexProofData {
+    internal_nodes: Arc<[H256]>,
+    /// Direct offsets for the five log posting types at an event position.
+    log_position_index: Arc<LogPositionIndex>,
+    /// Direct offset of each transaction entry.
+    transaction_position_index: Arc<TransactionPositionIndex>,
+}
+
+type LogPosition = (u64, u32, u32);
+type LogPositionIndex = FxHashMap<LogPosition, [Option<usize>; 5]>;
+type TransactionPosition = (u64, u32);
+type TransactionPositionIndex = FxHashMap<TransactionPosition, usize>;
+
+impl PartialEq for IndexTable {
+    fn eq(&self, other: &Self) -> bool {
+        self.first_block == other.first_block
+            && self.table_size == other.table_size
+            && self.encoded_entries == other.encoded_entries
+            && self.entry_count == other.entry_count
+            && self.table_root == other.table_root
+    }
+}
+
+impl Eq for IndexTable {}
 
 impl IndexTable {
     /// Generate the level-0 table after all transactions and receipts for a
@@ -513,9 +546,10 @@ impl IndexTable {
         Ok(Self {
             first_block,
             table_size,
-            encoded_entries,
+            encoded_entries: encoded_entries.into(),
             entry_count,
             table_root,
+            proof_data: Arc::new(OnceLock::new()),
         })
     }
 
@@ -537,6 +571,61 @@ impl IndexTable {
 
     pub const fn table_root(&self) -> H256 {
         self.table_root
+    }
+
+    /// Return the committed entry offset for one log posting type at an event
+    /// position. This derived index avoids scanning unrelated table entries;
+    /// callers still prove the returned entry against `table_root`.
+    pub fn log_entry_index(
+        &self,
+        block_number: u64,
+        transaction_index: u32,
+        log_index: u32,
+        type_id: u16,
+    ) -> Option<usize> {
+        let type_offset = usize::from(type_id.checked_sub(2)?);
+        self.proof_data()
+            .log_position_index
+            .get(&(block_number, transaction_index, log_index))?
+            .get(type_offset)
+            .copied()
+            .flatten()
+    }
+
+    /// Return the committed transaction-entry offset for a block/transaction.
+    pub fn transaction_entry_index(
+        &self,
+        block_number: u64,
+        transaction_index: u32,
+    ) -> Option<usize> {
+        self.proof_data()
+            .transaction_position_index
+            .get(&(block_number, transaction_index))
+            .copied()
+    }
+
+    /// Construct a minimal shared proof using Merkle nodes prepared once when
+    /// the table was built or validated, instead of rebuilding the tree for
+    /// every query.
+    pub fn multiproof(&self, indices: &[usize]) -> Option<Vec<TableProofNode>> {
+        table_multiproof_from_nodes(
+            &self.encoded_entries,
+            &self.proof_data().internal_nodes,
+            indices,
+        )
+    }
+
+    fn proof_data(&self) -> &IndexProofData {
+        self.proof_data.get_or_init(|| {
+            let internal_nodes = entry_internal_nodes(&self.encoded_entries);
+            let (log_position_index, transaction_position_index) =
+                build_position_indices(&self.encoded_entries);
+            IndexProofData {
+                internal_nodes: internal_nodes.into(),
+                log_position_index: Arc::new(log_position_index),
+                transaction_position_index: Arc::new(transaction_position_index),
+            }
+        })
     }
 
     /// Protocol level corresponding to this table's size.
@@ -570,7 +659,7 @@ impl IndexTable {
         encoded.extend_from_slice(&self.table_size.to_be_bytes());
         encoded.extend_from_slice(&self.entry_count.to_be_bytes());
         encoded.extend_from_slice(self.table_root.as_bytes());
-        for entry in &self.encoded_entries {
+        for entry in self.encoded_entries.iter() {
             let entry_len = u16::try_from(entry.as_bytes().len())
                 .expect("EIP-8304 entries are at most 50 bytes");
             encoded.extend_from_slice(&entry_len.to_be_bytes());
@@ -670,11 +759,60 @@ impl IndexTable {
         Ok(Self {
             first_block,
             table_size,
-            encoded_entries: entries,
+            encoded_entries: entries.into(),
             entry_count,
             table_root: calculated_root,
+            proof_data: Arc::new(OnceLock::new()),
         })
     }
+}
+
+fn build_position_indices(
+    entries: &[EncodedIndexEntry],
+) -> (LogPositionIndex, TransactionPositionIndex) {
+    let mut logs = LogPositionIndex::default();
+    let mut transactions = TransactionPositionIndex::default();
+    for (index, entry) in entries.iter().enumerate() {
+        let bytes = entry.as_bytes();
+        let type_id = u16::from_be_bytes([bytes[0], bytes[1]]);
+        match type_id {
+            1 => {
+                let block_number = u64::from_be_bytes(
+                    bytes[34..42]
+                        .try_into()
+                        .expect("validated transaction entry"),
+                );
+                let transaction_index = u32::from_be_bytes(
+                    bytes[42..46]
+                        .try_into()
+                        .expect("validated transaction entry"),
+                );
+                transactions.insert((block_number, transaction_index), index);
+            }
+            2..=6 => {
+                let position_offset = if type_id == 2 { 22 } else { 34 };
+                let block_number = u64::from_be_bytes(
+                    bytes[position_offset..position_offset + 8]
+                        .try_into()
+                        .expect("validated log entry"),
+                );
+                let transaction_index = u32::from_be_bytes(
+                    bytes[position_offset + 8..position_offset + 12]
+                        .try_into()
+                        .expect("validated log entry"),
+                );
+                let log_index = u32::from_be_bytes(
+                    bytes[position_offset + 12..position_offset + 16]
+                        .try_into()
+                        .expect("validated log entry"),
+                );
+                logs.entry((block_number, transaction_index, log_index))
+                    .or_default()[usize::from(type_id - 2)] = Some(index);
+            }
+            _ => {}
+        }
+    }
+    (logs, transactions)
 }
 
 fn validate_encoded_entry(encoded: &[u8]) -> Result<(), IndexTableError> {
@@ -806,11 +944,45 @@ pub struct TableProofNode {
     pub hash: H256,
 }
 
+/// Build the reusable heap-prefix internal-node representation of an index
+/// table. Leaf hashes are omitted because they are cheap to derive from the
+/// selected entry and would otherwise duplicate the entry array.
+fn entry_internal_nodes(entries: &[EncodedIndexEntry]) -> Vec<H256> {
+    if entries.len() <= 1 {
+        return Vec::new();
+    }
+    let width = entries.len().next_power_of_two();
+    let mut heap = vec![H256::zero(); width * 2 - 1];
+    for (slot, entry) in heap[width - 1..width - 1 + entries.len()]
+        .iter_mut()
+        .zip(entries)
+    {
+        *slot = H256(Sha2Hasher.hash(entry.as_bytes()));
+    }
+    for index in (0..width - 1).rev() {
+        let mut children = [0u8; 64];
+        children[..32].copy_from_slice(heap[index * 2 + 1].as_bytes());
+        children[32..].copy_from_slice(heap[index * 2 + 2].as_bytes());
+        heap[index] = H256(Sha2Hasher.hash(&children));
+    }
+    heap.truncate(width - 1);
+    heap
+}
+
 /// Construct a minimal shared proof for several entries under one EIP-8304
 /// table root. Selected sibling leaves are recomputed from their returned
 /// entries rather than repeated as proof hashes.
 pub fn table_multiproof(
     entries: &[EncodedIndexEntry],
+    indices: &[usize],
+) -> Option<Vec<TableProofNode>> {
+    let internal_nodes = entry_internal_nodes(entries);
+    table_multiproof_from_nodes(entries, &internal_nodes, indices)
+}
+
+fn table_multiproof_from_nodes(
+    entries: &[EncodedIndexEntry],
+    internal_nodes: &[H256],
     indices: &[usize],
 ) -> Option<Vec<TableProofNode>> {
     if indices.iter().any(|index| *index >= entries.len()) {
@@ -821,32 +993,24 @@ pub fn table_multiproof(
     }
 
     let width = entries.len().next_power_of_two();
-    let mut layer = entries
-        .iter()
-        .map(|entry| H256(Sha2Hasher.hash(entry.as_bytes())))
-        .collect::<Vec<_>>();
-    layer.resize(width, H256::zero());
-    let mut layers = vec![layer.clone()];
-    while layer.len() > 1 {
-        layer = layer
-            .chunks_exact(2)
-            .map(|pair| {
-                let mut children = [0u8; 64];
-                children[..32].copy_from_slice(pair[0].as_bytes());
-                children[32..].copy_from_slice(pair[1].as_bytes());
-                H256(Sha2Hasher.hash(&children))
-            })
-            .collect();
-        layers.push(layer.clone());
-    }
-
+    let height = width.trailing_zeros() as usize;
     let mut known = indices.iter().copied().collect::<BTreeSet<_>>();
     let mut proof = BTreeMap::new();
-    for (level, layer) in layers.iter().take(layers.len() - 1).enumerate() {
+    for level in 0..height {
         for index in &known {
             let sibling = *index ^ 1;
             if !known.contains(&sibling) {
-                proof.insert((level, sibling), layer[sibling]);
+                let hash = if level == 0 {
+                    entries
+                        .get(sibling)
+                        .map(|entry| H256(Sha2Hasher.hash(entry.as_bytes())))
+                        .unwrap_or_default()
+                } else {
+                    let depth = height - level;
+                    let heap_index = (1usize << depth) - 1 + sibling;
+                    *internal_nodes.get(heap_index)?
+                };
+                proof.insert((level, sibling), hash);
             }
         }
         known = known.into_iter().map(|index| index / 2).collect();
@@ -1541,6 +1705,13 @@ mod tests {
         assert_eq!(table.encoded_entries()[0].as_bytes()[..2], [0x00, 0x00]);
         assert_eq!(table.encoded_entries()[1].as_bytes()[..2], [0x00, 0x01]);
         assert_eq!(table.encoded_entries()[2].as_bytes()[..2], [0x00, 0x02]);
+        assert_eq!(table.transaction_entry_index(4, 0), Some(1));
+        assert_eq!(table.log_entry_index(4, 0, 0, 2), Some(2));
+        assert_eq!(table.log_entry_index(4, 0, 0, 3), None);
+
+        let cloned = table.clone();
+        assert!(Arc::ptr_eq(&table.encoded_entries, &cloned.encoded_entries));
+        assert!(Arc::ptr_eq(&table.proof_data, &cloned.proof_data));
     }
 
     #[test]
@@ -1605,9 +1776,11 @@ mod tests {
         .unwrap();
 
         let proof = table_multiproof(table.encoded_entries(), &[0, 1, 2, 3, 4, 5]).unwrap();
+        assert_eq!(table.multiproof(&[0, 1, 2, 3, 4, 5]), Some(proof.clone()));
         assert_eq!(proof.len(), 1);
         assert_eq!(proof[0].level, 1);
         assert_eq!(proof[0].node_index, 3);
         assert_eq!(table_multiproof(table.encoded_entries(), &[6]), None);
+        assert_eq!(table.multiproof(&[6]), None);
     }
 }

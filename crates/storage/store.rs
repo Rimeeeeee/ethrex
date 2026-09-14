@@ -50,6 +50,7 @@ use std::{
     collections::{BTreeMap, HashMap, HashSet, hash_map::Entry},
     fmt::Debug,
     io::Write,
+    num::NonZeroUsize,
     path::{Path, PathBuf},
     sync::{
         Arc, Condvar, Mutex, RwLock,
@@ -147,6 +148,16 @@ const BAD_BLOCKS_KEY: &[u8] = b"bad_blocks";
 /// Maximum number of bad blocks retained for `debug_getBadBlocks`.
 const MAX_BAD_BLOCKS: usize = 16;
 
+/// Validated immutable EIP-8304 tables retained for proof serving. Entries and
+/// derived proof data are Arc-backed, so cache hits return cheap clones.
+const INDEX_TABLE_CACHE_CAPACITY: usize = 128;
+/// Per-block UTXO proof tables are smaller and commonly revisited by wallets.
+const UTXO_PROOF_TABLE_CACHE_CAPACITY: usize = 1024;
+
+type IndexTableCacheKey = (usize, BlockNumber, BlockHash);
+type IndexTableCache = LruCache<IndexTableCacheKey, IndexTable, FxBuildHasher>;
+type UtxoProofTableCache = LruCache<BlockHash, UtxoProofTable, FxBuildHasher>;
+
 #[derive(Debug)]
 struct CodeCache {
     inner_cache: LruCache<H256, Code, FxBuildHasher>,
@@ -231,6 +242,11 @@ pub struct Store {
     /// Cache for code metadata (code length), keyed by the bytecode hash.
     /// Uses FxHashMap for efficient lookups, much smaller than code cache.
     code_metadata_cache: Arc<Mutex<rustc_hash::FxHashMap<H256, CodeMetadata>>>,
+
+    /// Fork-specific, fully validated TLI tables and their derived proof data.
+    index_table_cache: Arc<Mutex<IndexTableCache>>,
+    /// Block-hash-keyed, fully validated UPT objects and opening-tree nodes.
+    utxo_proof_table_cache: Arc<Mutex<UtxoProofTableCache>>,
 
     /// Serializes concurrent `forkchoice_update` callers so that the cache
     /// update and the DB write transaction remain mutually ordered.
@@ -1983,6 +1999,16 @@ impl Store {
             last_computed_flatkeyvalue: Arc::new(RwLock::new(last_written)),
             account_code_cache: Arc::new(Mutex::new(CodeCache::default())),
             code_metadata_cache: Arc::new(Mutex::new(rustc_hash::FxHashMap::default())),
+            index_table_cache: Arc::new(Mutex::new(LruCache::with_hasher(
+                NonZeroUsize::new(INDEX_TABLE_CACHE_CAPACITY)
+                    .expect("index table cache capacity is non-zero"),
+                FxBuildHasher,
+            ))),
+            utxo_proof_table_cache: Arc::new(Mutex::new(LruCache::with_hasher(
+                NonZeroUsize::new(UTXO_PROOF_TABLE_CACHE_CAPACITY)
+                    .expect("UTXO proof table cache capacity is non-zero"),
+                FxBuildHasher,
+            ))),
             fcu_lock: Arc::new(tokio::sync::Mutex::new(())),
             safe_commit_root,
             journal_pruning_paused: Arc::new(std::sync::atomic::AtomicBool::new(false)),
@@ -2673,8 +2699,14 @@ impl Store {
         let end_block_number = table
             .end_block()
             .map_err(|error| StoreError::Custom(error.to_string()))?;
-        let key = index_table_key(table.level(), end_block_number, end_block_hash)?;
-        self.write(INDEX_TABLES, key, table.encode_storage())
+        let level = table.level();
+        let key = index_table_key(level, end_block_number, end_block_hash)?;
+        self.write(INDEX_TABLES, key, table.encode_storage())?;
+        self.index_table_cache
+            .lock()
+            .map_err(|_| StoreError::Custom("EIP-8304 table cache lock poisoned".to_owned()))?
+            .put((level, end_block_number, end_block_hash), table.clone());
+        Ok(())
     }
 
     /// Persist a fork-specific, block-scoped UTXO Proof Table. The table is an
@@ -2685,7 +2717,12 @@ impl Store {
             UTXO_PROOF_TABLES,
             table.block_hash().as_bytes().to_vec(),
             table.encode_storage(),
-        )
+        )?;
+        self.utxo_proof_table_cache
+            .lock()
+            .map_err(|_| StoreError::Custom("UTXO proof table cache lock poisoned".to_owned()))?
+            .put(table.block_hash(), table.clone());
+        Ok(())
     }
 
     /// Load and validate the UPT associated with an exact block hash.
@@ -2693,6 +2730,15 @@ impl Store {
         &self,
         block_hash: BlockHash,
     ) -> Result<Option<UtxoProofTable>, StoreError> {
+        if let Some(table) = self
+            .utxo_proof_table_cache
+            .lock()
+            .map_err(|_| StoreError::Custom("UTXO proof table cache lock poisoned".to_owned()))?
+            .get(&block_hash)
+            .cloned()
+        {
+            return Ok(Some(table));
+        }
         let Some(encoded) = self.read(UTXO_PROOF_TABLES, block_hash.as_bytes().to_vec())? else {
             return Ok(None);
         };
@@ -2703,6 +2749,10 @@ impl Store {
                 "Persisted UTXO proof table block hash does not match its key".to_owned(),
             ));
         }
+        self.utxo_proof_table_cache
+            .lock()
+            .map_err(|_| StoreError::Custom("UTXO proof table cache lock poisoned".to_owned()))?
+            .put(block_hash, table.clone());
         Ok(Some(table))
     }
 
@@ -2741,6 +2791,16 @@ impl Store {
         end_block_number: BlockNumber,
         end_block_hash: BlockHash,
     ) -> Result<Option<IndexTable>, StoreError> {
+        let cache_key = (level, end_block_number, end_block_hash);
+        if let Some(table) = self
+            .index_table_cache
+            .lock()
+            .map_err(|_| StoreError::Custom("EIP-8304 table cache lock poisoned".to_owned()))?
+            .get(&cache_key)
+            .cloned()
+        {
+            return Ok(Some(table));
+        }
         let key = index_table_key(level, end_block_number, end_block_hash)?;
         let Some(encoded) = self.read(INDEX_TABLES, key)? else {
             return Ok(None);
@@ -2752,6 +2812,10 @@ impl Store {
                 "Persisted EIP-8304 table metadata does not match its key".to_string(),
             ));
         }
+        self.index_table_cache
+            .lock()
+            .map_err(|_| StoreError::Custom("EIP-8304 table cache lock poisoned".to_owned()))?
+            .put(cache_key, table.clone());
         Ok(Some(table))
     }
 

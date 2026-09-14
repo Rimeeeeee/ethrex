@@ -12,7 +12,7 @@ use ethrex_common::{
         BlockHeader, FRAME_RECEIPT_STATUS_SUCCESS, PrefixShape, RING_SIZE, Transaction,
         UTXO_PROOF_TABLE_FORMAT_VERSION, UtxoProofNode, UtxoProofRecord, UtxoProofTable,
         ValidationPrefix, calculate_base_fee_per_blob_gas,
-        eip8304::{EncodedIndexEntry, IndexTable, TABLE_SIZES, TABLES_PER_LEVEL, table_multiproof},
+        eip8304::{EncodedIndexEntry, IndexTable, TABLE_SIZES, TABLES_PER_LEVEL},
         ring_slot,
     },
 };
@@ -620,7 +620,7 @@ fn table_query_to_value(
         })
         .collect::<Vec<_>>();
 
-    let mut matched_positions: Option<HashSet<Vec<u8>>> = None;
+    let mut matched_positions: Option<HashSet<(u64, u32, u32)>> = None;
     for (_, first, end) in &ranges {
         let range_positions = entries[*first..*end]
             .iter()
@@ -632,31 +632,24 @@ fn table_query_to_value(
         });
     }
     let matched_positions = matched_positions.unwrap_or_default();
-    let target_transactions = matched_positions
-        .iter()
-        .map(|position| position[..12].to_vec())
-        .collect::<HashSet<_>>();
-    let transaction_indices = entries
-        .iter()
-        .enumerate()
-        .filter_map(|(index, entry)| {
-            (read_u16(entry.as_bytes(), 0).ok() == Some(1)
-                && block_transaction_key(entry)
-                    .is_some_and(|key| target_transactions.contains(&key)))
-            .then_some(index)
-        })
-        .collect::<Vec<_>>();
-    let candidate_indices = entries
-        .iter()
-        .enumerate()
-        .filter_map(|(index, entry)| {
-            (read_u16(entry.as_bytes(), 0)
-                .ok()
-                .is_some_and(|type_id| candidate_type_ids.contains(&type_id))
-                && entry_position_key(entry).is_some_and(|key| matched_positions.contains(&key)))
-            .then_some(index)
-        })
-        .collect::<Vec<_>>();
+    let mut transaction_indices = Vec::with_capacity(matched_positions.len());
+    let mut candidate_indices = Vec::with_capacity(
+        matched_positions
+            .len()
+            .saturating_mul(candidate_type_ids.len()),
+    );
+    for &(block_number, transaction_index, log_index) in &matched_positions {
+        if let Some(index) = table.transaction_entry_index(block_number, transaction_index) {
+            transaction_indices.push(index);
+        }
+        candidate_indices.extend(candidate_type_ids.iter().filter_map(|type_id| {
+            table.log_entry_index(block_number, transaction_index, log_index, *type_id)
+        }));
+    }
+    transaction_indices.sort_unstable();
+    transaction_indices.dedup();
+    candidate_indices.sort_unstable();
+    candidate_indices.dedup();
 
     let mut proof_indices = transaction_indices.clone();
     proof_indices.extend(candidate_indices.iter().copied());
@@ -671,7 +664,8 @@ fn table_query_to_value(
     }
     proof_indices.sort_unstable();
     proof_indices.dedup();
-    let proof_nodes = table_multiproof(entries, &proof_indices)
+    let proof_nodes = table
+        .multiproof(&proof_indices)
         .ok_or_else(|| RpcErr::Internal("could not construct EIP-8304 multiproof".to_owned()))?
         .into_iter()
         .map(|node| Eip8304ProofNode {
@@ -735,28 +729,17 @@ fn table_query_to_value(
     .map_err(|error| RpcErr::Internal(error.to_string()))
 }
 
-fn log_position_key(entry: &EncodedIndexEntry) -> Option<Vec<u8>> {
+fn log_position_key(entry: &EncodedIndexEntry) -> Option<(u64, u32, u32)> {
     let encoded = entry.as_bytes();
     if !matches!(read_u16(encoded, 0).ok(), Some(2..=6)) {
         return None;
     }
     let position_offset = encoded.len().checked_sub(16)?;
-    Some(encoded.get(position_offset..)?.to_vec())
-}
-
-fn entry_position_key(entry: &EncodedIndexEntry) -> Option<Vec<u8>> {
-    let encoded = entry.as_bytes();
-    if !matches!(read_u16(encoded, 0).ok(), Some(2..=6)) {
-        return None;
-    }
-    let position_offset = encoded.len().checked_sub(16)?;
-    Some(encoded.get(position_offset..)?.to_vec())
-}
-
-fn block_transaction_key(entry: &EncodedIndexEntry) -> Option<Vec<u8>> {
-    let encoded = entry.as_bytes();
-    let position = encoded.get(encoded.len().checked_sub(16)?..)?;
-    Some(position[..12].to_vec())
+    Some((
+        read_u64(encoded, position_offset).ok()?,
+        read_u32(encoded, position_offset + 8).ok()?,
+        read_u32(encoded, position_offset + 12).ok()?,
+    ))
 }
 
 fn proven_entry(entries: &[EncodedIndexEntry], index: usize) -> Result<Eip8304ProvenEntry, RpcErr> {
@@ -1267,6 +1250,10 @@ mod tests {
             4,
             1,
             vec![
+                IndexEntry::Block {
+                    block_hash: H256::from_low_u64_be(0xabcd),
+                    block_number: 3,
+                },
                 IndexEntry::Transaction {
                     transaction_hash,
                     block_number: 4,
@@ -1299,7 +1286,7 @@ mod tests {
             table_to_value(&table, H256::from_low_u64_be(0x44), 4, 9).expect("serializable table");
         assert_eq!(value["firstBlock"], "0x4");
         assert_eq!(value["storageSlot"], "0x404");
-        assert_eq!(value["entryCount"], "0x4");
+        assert_eq!(value["entryCount"], "0x5");
         assert_eq!(value["loadMicros"], 9);
 
         let entries = value["entries"].as_array().expect("entries array");
