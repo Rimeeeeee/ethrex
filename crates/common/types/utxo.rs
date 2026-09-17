@@ -811,6 +811,18 @@ pub enum UtxoProofTableError {
 }
 
 impl UtxoProofTable {
+    /// Conservative retained-memory charge, including the tree and index.
+    pub fn cache_weight_bytes(&self) -> usize {
+        512usize
+            .saturating_add(
+                self.records
+                    .len()
+                    .saturating_mul(std::mem::size_of::<UtxoProofRecord>()),
+            )
+            .saturating_add(self.internal_nodes.len().saturating_mul(32))
+            .saturating_add(self.event_position_index.capacity().saturating_mul(64))
+    }
+
     const STORAGE_HEADER_LEN: usize = 2 + 32 + 20 + 8 + 32 + 32 + 4 + 4;
 
     /// Build the block UPT from canonical receipts. This parser is shared with

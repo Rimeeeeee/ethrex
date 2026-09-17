@@ -1464,6 +1464,12 @@ pub async fn map_ethrex_requests(
             crate::ethrex::QueryEip8304TableRequest::call(req, context).await
         }
         "ethrex_getUtxoProofs" => crate::ethrex::GetUtxoProofsRequest::call(req, context).await,
+        "ethrex_queryEip8304Tables" => {
+            crate::ethrex::authenticated::QueryTablesRequest::call(req, context).await
+        }
+        "ethrex_getAuthenticatedUtxoProofs" => {
+            crate::ethrex::authenticated::AuthenticatedUtxoRequest::call(req, context).await
+        }
         unknown_ethrex_method => Err(RpcErr::MethodNotFound(unknown_ethrex_method.to_owned())),
     }
 }

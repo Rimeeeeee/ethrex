@@ -5,6 +5,8 @@
 //! so operators can enable them on a public endpoint (`--http.api ethrex`)
 //! without also exposing the whole `debug_` surface.
 
+pub(crate) mod authenticated;
+
 use ethrex_blockchain::vm::StoreVmDatabase;
 use ethrex_common::{
     Address, U256,

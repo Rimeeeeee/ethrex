@@ -18,6 +18,7 @@ use crate::{
     error::StoreError,
     journal::{FlatDiff, JournalEntry},
     layering::{Overlay, OverlayCf, TrieLayerCache, TrieWrapper},
+    proof_cache::ProofCache,
     rlp::{BlockBodyRLP, BlockHeaderRLP, BlockRLP},
     trie::{BackendTrieDB, BackendTrieDBLocked, classify_trie_key},
     utils::{ChainDataIndex, SnapStateIndex},
@@ -50,7 +51,6 @@ use std::{
     collections::{BTreeMap, HashMap, HashSet, hash_map::Entry},
     fmt::Debug,
     io::Write,
-    num::NonZeroUsize,
     path::{Path, PathBuf},
     sync::{
         Arc, Condvar, Mutex, RwLock,
@@ -150,13 +150,13 @@ const MAX_BAD_BLOCKS: usize = 16;
 
 /// Validated immutable EIP-8304 tables retained for proof serving. Entries and
 /// derived proof data are Arc-backed, so cache hits return cheap clones.
-const INDEX_TABLE_CACHE_CAPACITY: usize = 128;
+const INDEX_TABLE_CACHE_BYTES: usize = 64 * 1024 * 1024;
 /// Per-block UTXO proof tables are smaller and commonly revisited by wallets.
-const UTXO_PROOF_TABLE_CACHE_CAPACITY: usize = 1024;
+const UTXO_PROOF_TABLE_CACHE_BYTES: usize = 32 * 1024 * 1024;
 
 type IndexTableCacheKey = (usize, BlockNumber, BlockHash);
-type IndexTableCache = LruCache<IndexTableCacheKey, IndexTable, FxBuildHasher>;
-type UtxoProofTableCache = LruCache<BlockHash, UtxoProofTable, FxBuildHasher>;
+type IndexTableCache = ProofCache<IndexTableCacheKey, IndexTable>;
+type UtxoProofTableCache = ProofCache<BlockHash, UtxoProofTable>;
 
 #[derive(Debug)]
 struct CodeCache {
@@ -1999,15 +1999,9 @@ impl Store {
             last_computed_flatkeyvalue: Arc::new(RwLock::new(last_written)),
             account_code_cache: Arc::new(Mutex::new(CodeCache::default())),
             code_metadata_cache: Arc::new(Mutex::new(rustc_hash::FxHashMap::default())),
-            index_table_cache: Arc::new(Mutex::new(LruCache::with_hasher(
-                NonZeroUsize::new(INDEX_TABLE_CACHE_CAPACITY)
-                    .expect("index table cache capacity is non-zero"),
-                FxBuildHasher,
-            ))),
-            utxo_proof_table_cache: Arc::new(Mutex::new(LruCache::with_hasher(
-                NonZeroUsize::new(UTXO_PROOF_TABLE_CACHE_CAPACITY)
-                    .expect("UTXO proof table cache capacity is non-zero"),
-                FxBuildHasher,
+            index_table_cache: Arc::new(Mutex::new(ProofCache::new(INDEX_TABLE_CACHE_BYTES))),
+            utxo_proof_table_cache: Arc::new(Mutex::new(ProofCache::new(
+                UTXO_PROOF_TABLE_CACHE_BYTES,
             ))),
             fcu_lock: Arc::new(tokio::sync::Mutex::new(())),
             safe_commit_root,
@@ -2689,8 +2683,25 @@ impl Store {
         }
     }
 
-    /// Persist an EIP-8304 table under its level, covered end block, and that
-    /// block's hash. The hash component preserves tables for competing forks.
+    /// Set shared proof-cache byte budgets and evict immediately if necessary.
+    /// Zero disables retention. Active request clones may outlive eviction.
+    pub fn set_proof_cache_budgets(
+        &self,
+        index_bytes: usize,
+        utxo_bytes: usize,
+    ) -> Result<(), StoreError> {
+        self.index_table_cache
+            .lock()
+            .map_err(|_| StoreError::Custom("EIP-8304 table cache lock poisoned".to_owned()))?
+            .set_budget(index_bytes);
+        self.utxo_proof_table_cache
+            .lock()
+            .map_err(|_| StoreError::Custom("UTXO proof table cache lock poisoned".to_owned()))?
+            .set_budget(utxo_bytes);
+        Ok(())
+    }
+
+    /// Persist an immutable table on the specified fork.
     pub fn store_index_table(
         &self,
         end_block_hash: BlockHash,
@@ -2705,7 +2716,11 @@ impl Store {
         self.index_table_cache
             .lock()
             .map_err(|_| StoreError::Custom("EIP-8304 table cache lock poisoned".to_owned()))?
-            .put((level, end_block_number, end_block_hash), table.clone());
+            .put(
+                (level, end_block_number, end_block_hash),
+                table.clone(),
+                table.cache_weight_bytes(),
+            );
         Ok(())
     }
 
@@ -2721,7 +2736,11 @@ impl Store {
         self.utxo_proof_table_cache
             .lock()
             .map_err(|_| StoreError::Custom("UTXO proof table cache lock poisoned".to_owned()))?
-            .put(table.block_hash(), table.clone());
+            .put(
+                table.block_hash(),
+                table.clone(),
+                table.cache_weight_bytes(),
+            );
         Ok(())
     }
 
@@ -2752,7 +2771,7 @@ impl Store {
         self.utxo_proof_table_cache
             .lock()
             .map_err(|_| StoreError::Custom("UTXO proof table cache lock poisoned".to_owned()))?
-            .put(block_hash, table.clone());
+            .put(block_hash, table.clone(), table.cache_weight_bytes());
         Ok(Some(table))
     }
 
@@ -2815,7 +2834,7 @@ impl Store {
         self.index_table_cache
             .lock()
             .map_err(|_| StoreError::Custom("EIP-8304 table cache lock poisoned".to_owned()))?
-            .put(cache_key, table.clone());
+            .put(cache_key, table.clone(), table.cache_weight_bytes());
         Ok(Some(table))
     }
 

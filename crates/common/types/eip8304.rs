@@ -344,6 +344,17 @@ impl PartialEq for IndexTable {
 impl Eq for IndexTable {}
 
 impl IndexTable {
+    /// Conservative cache charge including both position maps and the Merkle
+    /// tree, even before lazy initialization. Allocator overhead is estimated;
+    /// this is a cache retention budget, not a process RSS limit.
+    pub fn cache_weight_bytes(&self) -> usize {
+        self.encoded_entries.iter().fold(512usize, |bytes, entry| {
+            // 512 per entry covers its descriptor, <=2 internal hashes and
+            // worst-case hash-map bucket slack for both position indexes.
+            bytes.saturating_add(512).saturating_add(entry.0.capacity())
+        })
+    }
+
     /// Generate the level-0 table after all transactions and receipts for a
     /// block have been produced.
     ///
