@@ -1,9 +1,10 @@
 #!/usr/bin/env node
 // Standalone EIP-8312 UTXO wallet. No npm dependencies.
-// Wallet keys are supplied per signing request and never shared between visitors.
+// The browser is watch-only by default. Sending is enabled only when the
+// operator explicitly imports a key into this local process or supplies
+// UTXO_WALLET_KEY at startup.
 
 import http from 'node:http';
-import { AsyncLocalStorage } from 'node:async_hooks';
 import { readFile } from 'node:fs/promises';
 import { existsSync } from 'node:fs';
 import { spawn } from 'node:child_process';
@@ -14,13 +15,11 @@ import { fileURLToPath } from 'node:url';
 const ROOT = dirname(fileURLToPath(import.meta.url));
 const PUBLIC = join(ROOT, 'public');
 const DEFAULT_RPC = 'https://rpc1.hegota.ethrex.xyz';
-const INITIAL_RPC = process.env.UTXO_RPC || DEFAULT_RPC;
-const requestContext = new AsyncLocalStorage();
-const rpcUrl = () => requestContext.getStore()?.rpc || INITIAL_RPC;
+let rpcUrl = process.env.UTXO_RPC || DEFAULT_RPC;
 const VAULT = '0x0000000000000000000000000000000000008312';
 const INDEX = '0x0000000000000000000000000000000000008304';
 const TOPIC = '0x3b19241465a47bc187f1d9c7db70834855a907183742a4b63aa824c576296f5e';
-
+let walletKey = process.env.UTXO_WALLET_KEY || null;
 const TXFORGE = process.env.UTXO_TXFORGE || join(ROOT, '..', 'utxo-demo', 'devnet', 'txforge.py');
 const DEFAULT_PYTHON = join(ROOT, '..', 'utxo-demo', '.venv', 'bin', 'python');
 const USE_WSL = process.platform === 'win32' && !process.env.UTXO_PYTHON;
@@ -40,17 +39,6 @@ const MIME = {
 };
 
 function isAddress(value) { return typeof value === 'string' && ADDRESS_RE.test(value); }
-
-function validateRpc(candidate) {
-  if (typeof candidate !== 'string' || !/^https?:\/\/[^\s]+$/i.test(candidate.trim())) throw new Error('RPC URL must start with http:// or https://');
-  return candidate.trim();
-}
-
-function signingKey(body) {
-  const candidate = body.key;
-  if (typeof candidate !== 'string' || !/^(0x)?[0-9a-fA-F]{64}$/.test(candidate)) throw new Error('private key must be exactly 32 bytes in hex; connect a wallet first');
-  return candidate.startsWith('0x') ? candidate : `0x${candidate}`;
-}
 
 function blockNumber(value, name) {
   if (typeof value === 'number' && Number.isSafeInteger(value) && value >= 0) return value;
@@ -73,7 +61,7 @@ function wslPath(value) {
 
 async function rpcMeasured(method, params) {
   const started = performance.now();
-  const response = await fetch(rpcUrl(), {
+  const response = await fetch(rpcUrl, {
     method: 'POST', headers: { 'content-type': 'application/json' },
     body: JSON.stringify({ jsonrpc: '2.0', id: Date.now(), method, params }),
   });
@@ -107,7 +95,7 @@ function forge(command) {
         resolveForge(result);
       } catch { rejectForge(new Error(`txforge returned invalid JSON: ${stderr || stdout}`)); }
     });
-    child.stdin.end(JSON.stringify({ rpc: rpcUrl(), ...command }));
+    child.stdin.end(JSON.stringify({ rpc: rpcUrl, ...command }));
   });
 }
 
@@ -574,7 +562,7 @@ function verifyTableQuery(table, filters, candidateTypeIds) {
 
 async function requestTableQuery(firstBlock, tableSize, filters, candidateTypeIds, useCache, limit) {
   const filterKey = filters.map((filter) => `${filter.typeId}:${filter.content.toLowerCase()}`).join('|');
-  const queryKey = `${rpcUrl()}|${firstBlock}|${tableSize}|${filterKey}|${candidateTypeIds.join(',')}`;
+  const queryKey = `${rpcUrl}|${firstBlock}|${tableSize}|${filterKey}|${candidateTypeIds.join(',')}`;
   let record = null;
   let queryCacheHit = false;
   let cacheValidationResponse = null;
@@ -613,7 +601,7 @@ async function requestTableQuery(firstBlock, tableSize, filters, candidateTypeId
   const table = record.response.result;
   if (!table) return { table: null, record, queryCacheHit, cacheValidationResponse, rootResponse: null, rootCacheHit: false };
 
-  const rootKey = `${rpcUrl()}|${table.endBlockHash.toLowerCase()}|${table.storageSlot}|${table.commitmentBlock}|${table.tableRoot.toLowerCase()}`;
+  const rootKey = `${rpcUrl}|${table.endBlockHash.toLowerCase()}|${table.storageSlot}|${table.commitmentBlock}|${table.tableRoot.toLowerCase()}`;
   const rootLoad = await cachedLoad(tableRootCache, rootKey, useCache, () => limit(() => rpcMeasured('eth_getStorageAt', [
     INDEX,
     table.storageSlot,
@@ -857,9 +845,9 @@ async function scanTables({ address, fromBlock = 0, toBlock, enrich = true, cach
   const uncachedPositions = new Map();
   let uptCacheHits = 0;
   for (const [key, position] of positions) {
-    const positionCacheKey = `${rpcUrl()}|${key}`;
+    const positionCacheKey = `${rpcUrl}|${key}`;
     const cachedBlockHash = cache ? utxoPositionCache.get(positionCacheKey) : null;
-    const cached = cachedBlockHash ? utxoRecordCache.get(`${rpcUrl()}|${cachedBlockHash}|${key}`) : null;
+    const cached = cachedBlockHash ? utxoRecordCache.get(`${rpcUrl}|${cachedBlockHash}|${key}`) : null;
     if (cached) {
       uptCacheHits += 1;
       utxos.push({ ...cached });
@@ -923,8 +911,8 @@ async function scanTables({ address, fromBlock = 0, toBlock, enrich = true, cach
         utxos.push(item);
         if (cache) {
           const blockHash = item.blockHash.toLowerCase();
-          utxoPositionCache.set(`${rpcUrl()}|${key}`, blockHash);
-          utxoRecordCache.set(`${rpcUrl()}|${blockHash}|${key}`, { ...item });
+          utxoPositionCache.set(`${rpcUrl}|${key}`, blockHash);
+          utxoRecordCache.set(`${rpcUrl}|${blockHash}|${key}`, { ...item });
         }
       }
     }
@@ -1099,7 +1087,8 @@ async function scanCreated({ address, fromBlock = 0, toBlock } = {}) {
   return { address: address.toLowerCase(), fromBlock: from, toBlock: to, head, utxos };
 }
 
-async function walletAddress(walletKey) {
+async function walletAddress() {
+  if (!walletKey) return null;
   return (await forge({ op: 'addressOf', key: walletKey })).address.toLowerCase();
 }
 
@@ -1134,11 +1123,11 @@ async function verifyInputs(inputs, owner) {
 }
 
 async function sendUtxo(body) {
-  const walletKey = signingKey(body);
+  if (!walletKey) throw new Error('sending is disabled; import a wallet or set UTXO_WALLET_KEY before starting the wallet');
   const inputs = checkInputs(body);
   if (!isAddress(body.recipient)) throw new Error('recipient must be a 20-byte hex address');
   const amount = positiveWei(body.valueWei);
-  const owner = await walletAddress(walletKey);
+  const owner = await walletAddress();
   const current = await verifyInputs(inputs, owner);
   const inputValue = current.reduce((sum, item) => sum + BigInt(item.valueWei), 0n);
   if (amount > inputValue) throw new Error('valueWei cannot exceed the selected UTXO value');
@@ -1151,10 +1140,10 @@ async function sendUtxo(body) {
 }
 
 async function createFreshUtxo(body) {
-  const walletKey = signingKey(body);
+  if (!walletKey) throw new Error('fresh UTXO creation is disabled; import a wallet first');
   if (!isAddress(body.recipient)) throw new Error('recipient must be a 20-byte hex address');
   const value = positiveWei(body.valueWei);
-  const owner = await walletAddress(walletKey);
+  const owner = await walletAddress();
   const beforeWei = await rpc('eth_getBalance', [owner, 'latest']);
   const result = await forge({ op: 'deposit', key: walletKey, recipient: body.recipient.toLowerCase(), valueWei: value.toString() });
   if (result.status !== '0x1') throw new Error(`fresh UTXO deposit reverted: ${result.txHash}`);
@@ -1163,9 +1152,9 @@ async function createFreshUtxo(body) {
 }
 
 async function redeemUtxo(body) {
-  const walletKey = signingKey(body);
+  if (!walletKey) throw new Error('redemption is disabled; import a wallet or set UTXO_WALLET_KEY before starting the wallet');
   const inputs = checkInputs(body);
-  const owner = await walletAddress(walletKey);
+  const owner = await walletAddress();
   const current = await verifyInputs(inputs, owner);
   const inputValue = current.reduce((sum, item) => sum + BigInt(item.valueWei), 0n);
   const feeReserve = await maxSelfFundedFee();
@@ -1209,40 +1198,49 @@ async function staticFile(res, pathname) {
   catch { return send(res, 404, 'not found', 'text/plain; charset=utf-8'); }
 }
 
-const server = http.createServer((req, res) => requestContext.run({ rpc: INITIAL_RPC }, async () => {
+const server = http.createServer(async (req, res) => {
   try {
     const url = new URL(req.url, 'http://localhost');
     if (API_TOKEN && url.pathname.startsWith('/api/') && req.headers['x-utxo-token'] !== API_TOKEN) {
       return send(res, 401, { error: 'unauthorized wallet backend request' });
     }
-    if (req.headers['x-utxo-rpc']) requestContext.getStore().rpc = validateRpc(req.headers['x-utxo-rpc']);
     if (url.pathname === '/api/status' && req.method === 'GET') {
-      const candidate = req.headers['x-wallet-address'];
-      if (candidate !== undefined && !isAddress(candidate)) throw new Error('address must be a 20-byte hex address');
-      const address = candidate?.toLowerCase() || null;
+      const address = await walletAddress();
       const accountBalanceWei = address ? BigInt(await rpc('eth_getBalance', [address, 'latest'])).toString() : '0';
-      return send(res, 200, { rpc: rpcUrl(), defaultRpc: DEFAULT_RPC, vault: VAULT, head: Number.parseInt(await rpc('eth_blockNumber', []), 16), configured: Boolean(address), address, accountBalanceWei });
+      return send(res, 200, { rpc: rpcUrl, defaultRpc: DEFAULT_RPC, vault: VAULT, head: Number.parseInt(await rpc('eth_blockNumber', []), 16), configured: Boolean(address), address, accountBalanceWei });
     }
     if (url.pathname === '/api/rpc' && req.method === 'POST') {
-      const candidate = validateRpc((await body(req)).url);
-      requestContext.getStore().rpc = candidate;
+      const candidate = (await body(req)).url;
+      if (typeof candidate !== 'string' || !/^https?:\/\/[^\s]+$/i.test(candidate)) return send(res, 400, { error: 'RPC URL must start with http:// or https://' });
+      const previous = rpcUrl;
+      rpcUrl = candidate.trim();
       try {
         await rpc('eth_chainId', []);
-        return send(res, 200, { rpc: rpcUrl() });
+        clearDiscoveryCaches();
+        return send(res, 200, { rpc: rpcUrl });
       } catch (error) {
+        rpcUrl = previous;
         return send(res, 400, { error: `RPC URL did not respond: ${error.message}` });
       }
     }
     if (url.pathname === '/api/import' && req.method === 'POST') {
-      const walletKey = signingKey(await body(req));
+      const candidate = (await body(req)).key;
+      if (typeof candidate !== 'string' || !/^(0x)?[0-9a-fA-F]{64}$/.test(candidate)) {
+        return send(res, 400, { error: 'private key must be exactly 32 bytes in hex' });
+      }
+      // Validate and derive before replacing the current in-memory wallet.
+      const previous = walletKey;
+      walletKey = candidate.startsWith('0x') ? candidate : `0x${candidate}`;
       try {
-        const address = await walletAddress(walletKey);
+        const address = await walletAddress();
         return send(res, 200, { configured: true, address });
       } catch (error) {
+        walletKey = previous;
         return send(res, 400, { error: `could not import wallet: ${error.message}` });
       }
     }
     if (url.pathname === '/api/lock' && req.method === 'POST') {
+      walletKey = null;
       return send(res, 200, { configured: false, address: null });
     }
     if (url.pathname === '/api/scan' && req.method === 'POST') return send(res, 200, await scan(await body(req)));
@@ -1261,15 +1259,14 @@ const server = http.createServer((req, res) => requestContext.run({ rpc: INITIAL
     if (url.pathname.startsWith('/api/')) return send(res, 404, { error: 'unknown endpoint' });
     return staticFile(res, url.pathname);
   } catch (error) { return send(res, 400, { error: error.message }); }
-}));
+});
 
 if (process.argv[1] && resolve(process.argv[1]) === fileURLToPath(import.meta.url)) {
   if (!existsSync(TXFORGE)) console.warn(`txforge not found at ${TXFORGE}; watch-only scanning still works`);
-  server.listen(PORT, HOST, () => console.log(`Standalone UTXO wallet â†’ http://${HOST}:${PORT} (${rpcUrl()})`));
+  server.listen(PORT, HOST, () => console.log(`Standalone UTXO wallet â†’ http://${HOST}:${PORT} (${rpcUrl})`));
 }
 
 export {
-  server,
   decodeTableEntry,
   verifyTableMultiproof,
   verifyUptBlock,
