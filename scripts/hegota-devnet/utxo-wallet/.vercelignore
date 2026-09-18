@@ -1,0 +1,8 @@
+.venv/
+node_modules/
+logs/
+*.key
+.env
+wallets.env
+server.mjs
+README.md
