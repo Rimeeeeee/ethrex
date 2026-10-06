@@ -35,10 +35,10 @@
             const path_to_root = "";
             const default_light_theme = "light";
             const default_dark_theme = "navy";
-            window.path_to_searchindex_js = "searchindex-3053871c.js";
+            window.path_to_searchindex_js = "searchindex-6e750a07.js";
         </script>
         <!-- Start loading toc.js asap -->
-        <script src="toc-ec0f4f2d.js"></script>
+        <script src="toc-f6d73635.js"></script>
     </head>
     <body>
     <div id="mdbook-help-container">
@@ -366,6 +366,79 @@ chmod +x ethrex
 </tbody>
 </table>
 </div>
+<p>These figures are for the <strong>default</strong> node profile, which keeps only block headers
+below the snap-sync pivot. Enabling historical chain backfill raises the disk
+requirement considerably — see below.</p>
+<hr>
+<h2 id="with-historical-chain-backfill-enabled"><a class="header" href="#with-historical-chain-backfill-enabled">With historical chain backfill enabled</a></h2>
+<p><a href="#historical-chain-backfill-1">Historical chain backfill</a>
+(<code>--history.chain</code>, off by default) additionally stores the block bodies and
+receipts for blocks below the sync pivot. This affects <strong>disk only</strong>; RAM and CPU
+requirements are unchanged, because backfill is a bounded, rate-limited
+background task that yields to chain-head following.</p>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th><code>--history.chain</code></th><th>Extra disk (history)</th><th>Total disk, Mainnet</th><th>Status</th></tr>
+</thead>
+<tbody>
+<tr><td><code>off</code> (default)</td><td>—</td><td>see table above</td><td>Measured</td></tr>
+<tr><td><code>postmerge</code></td><td>~1.0 TB</td><td><strong>2 TB minimum, 3 TB recommended</strong></td><td>Measured</td></tr>
+<tr><td><code>all</code></td><td>not measured</td><td>not measured</td><td>Bounded by the Byzantium block</td></tr>
+</tbody>
+</table>
+</div>
+<h3 id="measured--mainnet-postmerge-complete-run"><a class="header" href="#measured--mainnet-postmerge-complete-run">Measured — Mainnet, <code>postmerge</code>, complete run</a></h3>
+<p>A mainnet node backfilled the entire post-merge range, from its sync pivot down to
+the merge block, and stopped there:</p>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>Metric</th><th>Value</th></tr>
+</thead>
+<tbody>
+<tr><td>Blocks backfilled</td><td>9,993,456 (25,530,850 → 15,537,394)</td></tr>
+<tr><td>Wall-clock duration</td><td>~14 days</td></tr>
+<tr><td>Average cost per block</td><td>~105 KiB</td></tr>
+<tr><td>History on disk (<code>bodies</code> + <code>receipts_v2</code> + <code>transaction_locations</code> + <code>headers</code>)</td><td>~1,019 GB</td></tr>
+<tr><td>State on disk (unchanged by backfill)</td><td>~459 GB</td></tr>
+<tr><td><strong>Database total</strong></td><td><strong>1,490 GiB</strong></td></tr>
+</tbody>
+</table>
+</div>
+<p>Per column family, for sizing a disk:</p>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>Column family</th><th>Size</th><th></th></tr>
+</thead>
+<tbody>
+<tr><td><code>bodies</code></td><td>592 GB</td><td>history</td></tr>
+<tr><td><code>receipts_v2</code></td><td>265 GB</td><td>history</td></tr>
+<tr><td><code>transaction_locations</code></td><td>148 GB</td><td>history</td></tr>
+<tr><td><code>headers</code></td><td>12 GB</td><td>history</td></tr>
+<tr><td><code>storage_trie_nodes</code></td><td>190 GB</td><td>state</td></tr>
+<tr><td><code>storage_flatkeyvalue</code></td><td>141 GB</td><td>state</td></tr>
+<tr><td><code>account_trie_nodes</code></td><td>72 GB</td><td>state</td></tr>
+<tr><td><code>account_flatkeyvalue</code></td><td>56 GB</td><td>state</td></tr>
+</tbody>
+</table>
+</div>
+<p>Backfill inverts where the database spends its space. A headers-only node is
+roughly 82% state and 18% history; the same node fully backfilled is 31% state and
+69% history.</p>
+<p>Two things worth knowing when sizing from these numbers. The per-block cost is not
+uniform: recent blocks measured ~125 KiB each, while the full post-merge average
+came out ~105 KiB, because older post-merge blocks are smaller. And the figures
+above are a completed <code>postmerge</code> run, so a node also needs headroom for RocksDB
+compaction and for continued head-following growth; 2 TB is the point at which the
+run fits, not the point at which it is comfortable.</p>
+<blockquote>
+<p><code>all</code> has not been measured. It backfills further, down to the Byzantium block
+rather than genesis (pre-EIP-658 receipts use a format ethrex does not
+represent), and how far it actually gets depends on peer availability for
+pre-merge history, which is limited after the 2025 history expiry rollout.</p>
+</blockquote>
 <hr>
 <h2 id="l2"><a class="header" href="#l2">L2</a></h2>
 <p>TBD</p>
@@ -2124,18 +2197,19 @@ pub trait RLPDecode: Sized {
 │  6. Post-Osaka gas-limit cap (EIP-7825)              → TxMaxGasLimitExc…  │
 │  7. tx.gas_limit ≤ header.gas_limit                  → TxGasLimitExceeded │
 │  8. max_priority_fee ≤ max_fee_per_gas               → TxTipAboveFeeCap   │
-│  9. EIP-7702 pre-Prague / empty auth list            → Eip7702TxPreFork / │
+│  9. Minimum tip floor (raw gas_tip_cap)              → TipBelowMinimum    │
+│ 10. EIP-7702 pre-Prague / empty auth list            → Eip7702TxPreFork / │
 │                                                        EmptyAuthorization │
-│ 10. Intrinsic gas ≤ tx.gas_limit                     → TxIntrinsicGas…    │
-│ 11. max_fee_per_blob_gas ≥ MIN_BASE_FEE_PER_BLOB_GAS → TxBlobBaseFeeTooLow│
-│ 12. Nonce ≥ account.nonce  &amp;&amp;  nonce ≠ u64::MAX      → NonceTooLow        │
-│ 13. EIP-3607 contract-sender check (7702 exc.)       → SenderIsContract   │
-│ 14. Single-tx cost ≤ account.balance                 → NotEnoughBalance   │
-│ 15. RBF: find_tx_to_replace                          → UnderpricedRepl…   │
-│ 16. Cumulative pending cost ≤ balance                → InsufficientCumul… │
-│ 17. tx.chain_id matches config.chain_id (if set)     → InvalidChainId     │
-│ 18. Gapped-nonce rejection under pool pressure       → GapAdmissionDenied │
-│ 19. Frame-tx validation-prefix sim + paymaster       → FrameTx…           │
+│ 11. Intrinsic gas ≤ tx.gas_limit                     → TxIntrinsicGas…    │
+│ 12. max_fee_per_blob_gas ≥ MIN_BASE_FEE_PER_BLOB_GAS → TxBlobBaseFeeTooLow│
+│ 13. Nonce ≥ account.nonce  &amp;&amp;  nonce ≠ u64::MAX      → NonceTooLow        │
+│ 14. EIP-3607 contract-sender check (7702 exc.)       → SenderIsContract   │
+│ 15. Single-tx cost ≤ account.balance                 → NotEnoughBalance   │
+│ 16. RBF: find_tx_to_replace                          → UnderpricedRepl…   │
+│ 17. Cumulative pending cost ≤ balance                → InsufficientCumul… │
+│ 18. tx.chain_id matches config.chain_id (if set)     → InvalidChainId     │
+│ 19. Gapped-nonce rejection under pool pressure       → GapAdmissionDenied │
+│ 20. Frame-tx validation-prefix sim + paymaster       → FrameTx…           │
 │ (per-sender queued cap is enforced inside add_transaction, post-validate) │
 └──────────────────────────────────────────────────────────────────────────┘
 </code></pre>
@@ -2144,6 +2218,7 @@ pub trait RLPDecode: Sized {
 <p><strong>Privileged short-circuit.</strong> <code>Transaction::PrivilegedL2Transaction</code> returns early before pool admission; these are produced by the L2 sequencer.</p>
 <p><strong>Frame transactions (EIP-8141).</strong> Frame txs go through an extended set of gates — fork activation (<code>FrameTxPreFork</code>), expiry (<code>FrameTxExpired</code>), static structural validity (<code>InvalidFrameTransaction</code>), a no-blobs rule (<code>FrameTxBlobsUnsupported</code>), a signature-verification gas budget (<code>FrameTxVerifyGasExceeded</code> / <code>FrameTxVerifyGasBudgetExceeded</code>), signature authenticity and low-<code>s</code> malleability (<code>InvalidFrameSignature</code> / <code>FrameTxMalleableSignature</code>), and validation-prefix shape (<code>FrameTxUnrecognizedPrefix</code> / <code>FrameTxInvalidPrefixStructure</code>). The validation-prefix simulation and paymaster accounting run last (see <a href="#frame-transactions-eip-8141">Frame transactions</a>).</p>
 <p><strong>Per-tx wire-size cap.</strong> Non-blob transactions are bounded by <code>MAX_TX_SIZE = 128 KiB</code> against <code>Transaction::encode_canonical_len()</code>. Blob transactions are bounded by <code>MAX_BLOB_TX_SIZE</code> in <code>add_blob_transaction_to_pool</code> against the wire wrapper, since ethrex stores the core transaction and the sidecar in separate structs.</p>
+<p><strong>Minimum tip floor.</strong> A transaction whose tip cap is below <code>--mempool.min-tip</code> is rejected with <code>TipBelowMinimum { actual, limit }</code>. The comparison uses the <strong>raw tip cap</strong> — <code>max_priority_fee_per_gas</code> for typed transactions, <code>gas_price</code> for legacy — and deliberately <em>not</em> the base-fee-adjusted effective tip <code>min(tip_cap, fee_cap - base_fee)</code>. This matches geth’s <code>PriceLimit</code> check on <code>tx.GasTipCap()</code>; keying on the effective tip would make admission depend on the current base fee, so an identical transaction could be admitted at one block and rejected at the next as the base fee drifts. The default of 1 wei matches geth and in practice only rejects zero-tip transactions; a floor of 0 disables the check.</p>
 <p><strong>Init code size.</strong> Active from Shanghai. Limit is <code>MAX_INITCODE_SIZE = 48 KiB</code> (<code>2 × MAX_CODE_SIZE</code>); from Amsterdam onward (EIP-7954) it becomes <code>AMSTERDAM_MAX_INITCODE_SIZE = 128 KiB</code> (<code>2 × AMSTERDAM_MAX_CODE_SIZE</code>, i.e. 2 × 64 KiB).</p>
 <p><strong>Nonce lookup.</strong> Reads <code>account.nonce</code> from storage at the latest block. Rejects with <code>NonceTooLow</code> when <code>nonce &lt; account.nonce</code> or <code>nonce == u64::MAX</code>.</p>
 <p><strong>EIP-3607.</strong> Senders with non-empty <code>code_hash</code> are rejected with <code>SenderIsContract</code>, except when their code is a valid EIP-7702 delegation designation: exactly <code>EIP7702_DELEGATED_CODE_LEN = 23</code> bytes — the 3-byte <code>0xef0100</code> prefix followed by the 20-byte delegate address. A length-based fast path consults code-metadata length first and only fetches bytecode when the length matches the delegation shape. Skipped for frame txs.</p>
@@ -2252,6 +2327,7 @@ the node logs a warning rather than pretending otherwise.</p>
 <tr><td><code>--mempool.price-bump</code></td><td><code>ETHREX_MEMPOOL_PRICE_BUMP</code></td><td><code>10</code> (<code>DEFAULT_PRICE_BUMP_PERCENT</code>)</td><td>Minimum fee bump (percent) to replace a non-blob pooled tx at the same <code>(sender, nonce)</code>.</td></tr>
 <tr><td><code>--mempool.blob-price-bump</code></td><td><code>ETHREX_MEMPOOL_BLOB_PRICE_BUMP</code></td><td><code>100</code> (<code>DEFAULT_BLOB_PRICE_BUMP_PERCENT</code>)</td><td>Minimum fee bump (percent) to replace a blob-carrying pooled tx; higher because sidecars are costly to re-propagate.</td></tr>
 <tr><td><code>--mempool.max-queued-txs-per-account</code></td><td><code>ETHREX_MEMPOOL_MAX_QUEUED_TXS_PER_ACCOUNT</code></td><td><code>64</code> (<code>DEFAULT_MAX_QUEUED_TXS_PER_ACCOUNT</code>)</td><td>Per-sender cap on queued (future-nonce) transactions; executable txs are never capped.</td></tr>
+<tr><td><code>--mempool.min-tip</code></td><td><code>ETHREX_MEMPOOL_MIN_TIP</code></td><td><code>1</code> (<code>DEFAULT_MIN_TIP_WEI</code>)</td><td>Minimum raw tip cap (wei) for admission; matches geth’s <code>PriceLimit</code>. <code>0</code> disables the floor.</td></tr>
 <tr><td><code>--mempool.private</code></td><td><code>ETHREX_MEMPOOL_PRIVATE</code></td><td><code>false</code></td><td>Keep RPC-submitted txs out of P2P propagation; they still enter the pool and can be included in locally-built blocks.</td></tr>
 <tr><td><code>--mempool.gap-admit-occupancy-threshold</code></td><td><code>ETHREX_MEMPOOL_GAP_ADMIT_OCCUPANCY_THRESHOLD</code></td><td><code>90</code> (<code>DEFAULT_GAP_ADMIT_OCCUPANCY_THRESHOLD</code>)</td><td>Occupancy percentage (<code>0..=100</code>) at/above which gapped-nonce txs are rejected; <code>100</code> disables the gate.</td></tr>
 <tr><td><code>--p2p.tx-broadcasting-interval</code></td><td><code>ETHREX_P2P_TX_BROADCASTING_INTERVAL</code></td><td><code>1000</code> ms (<code>BROADCAST_INTERVAL_MS</code>)</td><td>Period of the <code>TxBroadcaster</code> actor tick.</td></tr>
@@ -2272,6 +2348,7 @@ the node logs a warning rather than pretending otherwise.</p>
 <tr><td><code>TxMaxGasLimitExceededError(hash, limit)</code></td><td>EIP-7825: <code>tx.gas_limit</code> exceeds the post-Osaka cap.</td></tr>
 <tr><td><code>TxGasLimitExceededError</code></td><td><code>tx.gas_limit &gt; header.gas_limit</code>.</td></tr>
 <tr><td><code>TxTipAboveFeeCapError</code></td><td><code>max_priority_fee_per_gas &gt; max_fee_per_gas</code>.</td></tr>
+<tr><td><code>TipBelowMinimum { actual, limit }</code></td><td>Raw tip cap below the configured <code>--mempool.min-tip</code> floor.</td></tr>
 <tr><td><code>Eip7702TxPreFork</code> / <code>EmptyAuthorizationList</code></td><td>Type-4 tx before Prague / with an empty authorization list.</td></tr>
 <tr><td><code>TxIntrinsicGasCostAboveLimitError</code> / <code>TxGasOverflowError</code> / <code>IntrinsicGasError(_)</code></td><td>Intrinsic gas exceeds the limit / overflow / computation error.</td></tr>
 <tr><td><code>TxBlobBaseFeeTooLowError</code></td><td><code>max_fee_per_blob_gas &lt; MIN_BASE_FEE_PER_BLOB_GAS</code>.</td></tr>
@@ -2295,7 +2372,6 @@ the node logs a warning rather than pretending otherwise.</p>
 <p>The mempool today is a single combined pool with FIFO regular eviction and the admission checks above. Areas with hardening work in flight or planned (tracked in their own PRs, which carry their own documentation):</p>
 <ul>
 <li><strong>Tip-aware regular eviction.</strong> Regular eviction is arrival-order FIFO; a high-tip transaction can be evicted for a low-tip one. Heap/tip-aware eviction is in flight (#6607).</li>
-<li><strong>Minimum priority-fee floor at admission</strong> (#6604).</li>
 <li><strong>Local-vs-P2P origin threading</strong> through admission (#6608).</li>
 <li><strong>Periodic re-validation / sweep</strong> of stale or dormant pending transactions (#6610).</li>
 <li><strong>Single combined pool.</strong> Blob and non-blob transactions share <code>transaction_pool</code> with separate caps and eviction, but there is no full pending/queued sub-pool separation.</li>
@@ -2315,6 +2391,15 @@ the node logs a warning rather than pretending otherwise.</p>
 <div style="break-before: page; page-break-before: always;"></div><link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/katex@0.16.4/dist/katex.min.css">
 <h1 id="databases"><a class="header" href="#databases">Databases</a></h1>
 <p>Ethrex uses a versioning system to ensure we don’t run on invalid data if we restart the node after a breaking change to the DB structure. This system consists of a <code>STORE_SCHEMA_VERSION</code> constant, defined in <code>crates/storage/lib.rs</code> that must be increased after any breaking change and that is checked every time we start the node.</p>
+<h2 id="schema-version-checks-at-startup"><a class="header" href="#schema-version-checks-at-startup">Schema version checks at startup</a></h2>
+<p>The version is stored in <code>metadata.json</code> inside the datadir and compared with the binary’s <code>STORE_SCHEMA_VERSION</code> before the database is opened:</p>
+<ul>
+<li><strong>Same version</strong>: the node starts normally.</li>
+<li><strong>Database older than the binary</strong>: the pending migrations run automatically, one version at a time, and <code>metadata.json</code> is updated after each step. Migrations are forward-only.</li>
+<li><strong>Database newer than the binary</strong>: the node refuses to start with an <code>Incompatible DB Version</code> error and leaves the database untouched. There is no downgrade path, but nothing needs to be erased: start an ethrex build that supports the database’s schema version (the one that wrote it, or newer) and the node resumes where it left off. <code>ethrex removedb</code> is only needed if you intend to abandon the database and resync from scratch.</li>
+<li><strong>No version file next to an existing database</strong>: the database predates versioning and cannot be migrated; a resync (<code>ethrex removedb</code>) is required.</li>
+</ul>
+<p>The newer-database case is easy to reach when the same datadir is shared by binaries built from different branches (for example, an image built from <code>main</code> and one built from a devnet branch): the first newer binary that opens the datadir stamps its own version, and the older one then refuses to open it.</p>
 <div style="break-before: page; page-break-before: always;"></div><link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/katex@0.16.4/dist/katex.min.css">
 <h1 id="networking"><a class="header" href="#networking">Networking</a></h1>
 <p>The network crate handles the ethereum networking protocols. This involves:</p>
@@ -2444,6 +2529,282 @@ Finally, with <code>node_c</code> we connect to <code>node_b</code>. When the lo
 <p>Full syncing works by downloading and executing every block from genesis. This means that full syncing will only work for networks that started after <a href="https://ethereum.org/en/roadmap/merge/">The Merge</a>, as ethrex only supports post merge execution.</p>
 <h2 id="snap-sync-1"><a class="header" href="#snap-sync-1">Snap sync</a></h2>
 <p>For snap sync, you can view the <a href="#snap-sync-2">main document here</a>.</p>
+<h3 id="snap2-eip-8189"><a class="header" href="#snap2-eip-8189">snap/2 (EIP-8189)</a></h3>
+<p>ethrex advertises <code>snap/2</code> alongside <code>snap/1</code> unless its own state sync still
+depends on <code>GetTrieNodes</code>, which snap/2 removes; the version is negotiated
+per-peer at handshake.</p>
+<p>On a post-Amsterdam chain with a <code>snap/2</code> peer available, state sync downloads
+flat key-value state, patches it with the block access lists of the blocks that
+passed while it downloaded, then rebuilds every trie locally and verifies the
+result against the pivot’s state root. There is no trie healing at all.</p>
+<p>It falls back to <code>snap/1</code> when no <code>snap/2</code> peer is available, when the pivot is
+pre-Amsterdam, or when BAL validation fails.</p>
+<p>Implementation notes and known gaps are in
+<a href="#snap2-eip-8189-internals">snap/2 internals</a>.</p>
+<h2 id="historical-chain-backfill"><a class="header" href="#historical-chain-backfill">Historical chain backfill</a></h2>
+<p>A snap-synced node keeps only block <strong>headers</strong> below the sync pivot, so
+historical RPC queries for pre-pivot blocks (<code>eth_getBlockByNumber</code>,
+<code>eth_getBlockReceipts</code>, <code>eth_getTransactionByHash</code>, <code>eth_getLogs</code>, …) return
+empty. Historical chain backfill is an <strong>opt-in</strong> background process
+(<code>--history.chain postmerge</code>) that downloads and validates the missing bodies and
+receipts after snap sync completes, so the node can serve those queries.</p>
+<p>See <a href="#historical-chain-backfill-1">Historical chain backfill</a> for the flags, how it
+works, durability across restarts, and its limitations.</p>
+<div style="break-before: page; page-break-before: always;"></div><link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/katex@0.16.4/dist/katex.min.css">
+<h1 id="historical-chain-backfill-1"><a class="header" href="#historical-chain-backfill-1">Historical chain backfill</a></h1>
+<p>A snap-synced node backfills only block <strong>headers</strong> below the sync pivot; it does
+not download the block bodies or receipts for pre-pivot blocks. As a result,
+historical RPC queries for those blocks return empty:
+<code>eth_getBlockByNumber</code>/<code>ByHash</code>, <code>eth_getBlockReceipts</code>,
+<code>eth_getTransactionByHash</code>, and <code>eth_getTransactionReceipt</code> return <code>null</code>, and
+<code>eth_getLogs</code> over a pre-pivot range fails.</p>
+<p>Historical chain backfill is an <strong>opt-in</strong> background process that downloads and
+validates the missing bodies and receipts after snap sync completes, so the node
+can serve historical block, transaction, receipt, and log queries. It is off by
+default, so a default node keeps its compact, headers-only footprint below the
+pivot.</p>
+<h2 id="enabling-it"><a class="header" href="#enabling-it">Enabling it</a></h2>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>Flag</th><th>Env</th><th>Values</th><th>Default</th></tr>
+</thead>
+<tbody>
+<tr><td><code>--history.chain</code></td><td><code>ETHREX_HISTORY_CHAIN</code></td><td><code>off</code>, <code>postmerge</code>, <code>all</code>, or a block number</td><td><code>off</code></td></tr>
+<tr><td><code>--history.transactions</code></td><td><code>ETHREX_HISTORY_TRANSACTIONS</code></td><td>number of blocks (<code>0</code> = whole backfilled range)</td><td><code>0</code></td></tr>
+</tbody>
+</table>
+</div>
+<ul>
+<li><strong><code>off</code></strong> (default): headers-only below the pivot — current behavior.</li>
+<li><strong><code>postmerge</code></strong>: backfill down to the network’s merge (Paris) activation block.
+This is the recommended value: post-merge history is what the peer set reliably
+serves, and it is what most applications need.</li>
+<li><strong><code>all</code></strong>: backfill as far back as receipts exist in a decodable form, i.e.
+down to the <strong>Byzantium</strong> block (mainnet <code>4,370,000</code>), not genesis. Before
+Byzantium (EIP-658) a receipt’s first field is a post-state root rather than a
+status flag, a form ethrex does not represent, so those receipts can never be
+fetched. <strong>Best-effort</strong> — after the 2025 history expiry rollout many peers no
+longer serve pre-merge bodies/receipts, so this can stall at a block it cannot
+fetch (it reports the stall rather than failing the node).</li>
+<li><strong>a block number</strong> (e.g. <code>22000000</code>): backfill down to exactly that block and
+stop there. Use this to keep a recent slice of history instead of the whole
+post-merge range — far less disk and far less time than <code>postmerge</code>, which on
+mainnet is ~10M blocks. A value between the merge and Byzantium blocks is
+honoured on the same best-effort basis as <code>all</code>; anything below Byzantium is
+clamped up to it, with a warning, for the reason given above.</li>
+</ul>
+<p><code>--history.transactions</code> controls how far back the transaction-lookup index
+(<code>eth_getTransactionByHash</code>) is kept, independently of the block/receipt data,
+mirroring geth’s flag of the same name. <code>0</code> (the default) indexes the entire
+backfilled range; a non-zero <code>N</code> indexes only blocks within <code>N</code> of the chain head
+as it stood when the run started, and stores bodies/receipts for the rest without a
+tx-hash index.</p>
+<p>Two differences from geth’s flag are worth knowing. It only governs what backfill
+<em>writes</em>: nothing already indexed is ever un-indexed, and blocks above the sync
+pivot are indexed unconditionally by normal block import, so an <code>N</code> smaller than
+<code>head - pivot</code> has no effect on the range where the index is actually large. And
+the window is pinned to the head at task start rather than tracking the live head,
+so the boundary stays put over a run that can take weeks.</p>
+<h3 id="example-1"><a class="header" href="#example-1">Example</a></h3>
+<p>Run a node that serves post-merge history, keeping the transaction index for the
+whole backfilled range:</p>
+<pre><code class="language-sh">ethrex \
+  --authrpc.jwtsecret ./secrets/jwt.hex \
+  --network mainnet \
+  --history.chain postmerge
+</code></pre>
+<p>Backfill starts on its own once initial sync finishes — no restart or second
+command is needed.</p>
+<h3 id="upgrading-an-existing-node"><a class="header" href="#upgrading-an-existing-node">Upgrading an existing node</a></h3>
+<p><strong>An already-synced node does not need to resync.</strong> Add <code>--history.chain</code> and
+restart: backfill starts from the history the node already has and fills
+downward. There is no migration and no reindex — the feature writes to existing
+column families and does not change the store schema version, so an existing
+database opens unchanged.</p>
+<p>On the first startup after the upgrade, a one-time reconciliation corrects
+<code>earliest_block_number</code>, which on a node synced before this feature existed was
+left at genesis. Without it, backfill would compare that stale value against the
+floor and conclude there was nothing to do, so the correction runs <em>before</em> that
+check:</p>
+<pre><code>INFO Historical chain backfill enabled mode=PostMerge horizon=0
+INFO Reconciled backfill frontier to the lowest block with full chain data recorded=0 actual=25530850
+DEBUG History backfill advanced
+</code></pre>
+<p>The reconciliation bisects the database for the lowest block with a contiguous
+body (~25 reads on mainnet), which is the node’s original snap pivot. A node that
+full-synced from genesis reconciles to <code>0</code> and completes immediately, since it
+already holds all history.</p>
+<p>Note that the reconciliation only runs when backfill is enabled. An upgraded node
+left at <code>--history.chain off</code> keeps the stale <code>earliest_block_number</code>, so the
+<code>earliest</code> block tag still reports genesis even though pre-pivot bodies are
+absent. Enabling backfill (or a fresh snap sync) sets it correctly.</p>
+<h2 id="how-it-works"><a class="header" href="#how-it-works">How it works</a></h2>
+<p>Backfill fills in reverse — from the pivot downward toward a floor — one bounded
+batch (64 blocks) at a time. It runs at lower priority than following the chain
+head: it fills only while the node is synced to the tip, sleeps between batches,
+and never lets the tip fall behind. A node that restarts behind the head finishes
+catching up first, so backfill never competes with a catch-up for peers.</p>
+<pre class="mermaid">flowchart TD
+    spawned([Backfill task spawned]) --&gt; gate{"Initial sync finished?"}
+    gate -- no --&gt; wait["Idle 10s"] --&gt; gate
+    gate -- yes --&gt; reconcile["One-time: reconcile frontier to lowest full-data block"]
+    reconcile --&gt; floor{"Resolve floor for mode"}
+    floor --&gt; done0{"frontier ≤ floor?"}
+    done0 -- yes --&gt; complete([Complete])
+    done0 -- no --&gt; read["Read 64 canonical headers just below the frontier"]
+    read --&gt; fetch["Request receipts + bodies from an eth peer (form per negotiated version)"]
+    fetch --&gt; validate["Validate tx and receipts roots vs. headers; rebuild logs bloom"]
+    validate --&gt; commit["Atomic write: bodies + receipts + tx index + new frontier"]
+    commit --&gt; done0
+</pre>
+
+<p><strong>Floor.</strong> <code>postmerge</code> resolves the floor to the network’s Paris activation
+block — <code>merge_netsplit_block</code> when the chain config sets one, otherwise the
+first proof-of-stake block found by difficulty bisection (block <code>15,537,394</code> on
+mainnet). <code>all</code> uses the Byzantium block, and an explicit block number is used as
+the floor directly. Every mode is clamped so the floor never falls below Byzantium.
+If the chain never merged there is no post-merge segment, so <code>postmerge</code> keeps
+idling until it does.</p>
+<p>The floor is resolved once per run, not per batch, since neither the merge nor the
+Byzantium block moves. Changing it therefore takes a restart: lowering it resumes
+filling from wherever the frontier now sits, and raising it stops further filling
+while keeping everything already stored. Backfill stops as soon as the frontier
+reaches the floor, so a block number at or above the current frontier completes
+with nothing to do.</p>
+<p><strong>Frontier.</strong> Progress is tracked in <code>earliest_block_number</code> (the lowest block
+with full data). Each batch reads the canonical headers just below the frontier,
+fetches their bodies and receipts, and — on success — lowers the frontier.</p>
+<p><strong>Validation.</strong> Bodies and receipts are validated against the already-synced
+header chain (transactions root and receipts root) before being stored. A
+receipt’s logs bloom is recomputed from its logs, which reconstructs the bloom
+that eth/69 onward omits, so backfill works with peers on any supported eth
+version. The request form follows the version the connection negotiated: eth/68
+and eth/69 take the original <code>GetReceipts</code>, while eth/70 (EIP-7975) replaced it
+with a paginated form that eth/71 (EIP-8159, <code>requires: [7928, 7975]</code>) also uses.
+When a paginated response ends in a partial block, that trailing block is dropped
+and the response treated as a shorter prefix, so every stored block stays
+root-verified.</p>
+<p>Backfill throughput is bounded by how fast peers serve historical bodies and
+receipts. After the 2025 history-expiry rollout only a subset of peers still
+serve pre-merge/pre-pivot data, so on mainnet a full post-merge backfill runs on
+the order of weeks.</p>
+<h2 id="durability-and-restarts"><a class="header" href="#durability-and-restarts">Durability and restarts</a></h2>
+<p>Backfill is crash-safe by construction: a node shutdown mid-backfill never
+corrupts the database and always resumes exactly where it left off.</p>
+<ul>
+<li><strong>Each batch is one atomic write.</strong> A batch’s block bodies, receipts,
+transaction-index entries, <strong>and</strong> the updated frontier
+(<code>earliest_block_number</code>) are committed in a single RocksDB write batch. The
+frontier can never advance without its block data landing, or vice versa — so
+there is no ordering in which the on-disk state is left torn.</li>
+<li><strong>The frontier is the durable resume cursor.</strong> On restart the task re-reads
+<code>earliest_block_number</code> and continues from there. The invariant <em>“every block in
+<code>[frontier, head]</code> has full bodies and receipts”</em> holds across any restart. The
+first batch of a run deliberately includes the frontier block itself: on a
+snap-synced node that block is the pivot, and snap stored only its body, so its
+receipts need filling before the invariant is true.</li>
+<li><strong>Worst case after an abrupt kill</strong> (e.g. <code>docker restart -t 0</code>, power loss) is
+re-fetching the single most-recent batch: an un-fsynced write-ahead-log tail is
+discarded on RocksDB recovery, and because the frontier and its data share one
+atomic batch, they are lost together — never half-applied. A graceful shutdown
+fsyncs the database, so nothing is re-fetched.</li>
+<li><strong>Self-healing on startup.</strong> A one-time reconciliation bisects the database for
+the true lowest full-data block and corrects <code>earliest_block_number</code> if it
+drifted — for example a node that snap-synced before this feature existed and
+left the value at genesis. This runs before filling resumes.</li>
+</ul>
+<p>Because the only persistent effect of a batch is that atomic commit, the task is
+simply dropped on shutdown rather than drained; there is nothing to clean up.</p>
+<h2 id="observing-progress"><a class="header" href="#observing-progress">Observing progress</a></h2>
+<p>Per-batch advances are logged at <code>debug</code> level, so at the default <code>info</code> level a
+healthy backfill is quiet between the start and completion messages:</p>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>Message</th><th>Level</th><th>When</th></tr>
+</thead>
+<tbody>
+<tr><td><code>Historical chain backfill enabled</code></td><td>info</td><td>task starts</td></tr>
+<tr><td><code>Reconciled backfill frontier ...</code></td><td>info</td><td>startup, only if the frontier drifted</td></tr>
+<tr><td><code>History backfill advanced</code></td><td>debug</td><td>each batch</td></tr>
+<tr><td><code>Historical chain backfill complete</code></td><td>info</td><td>frontier reaches the floor</td></tr>
+<tr><td><code>History backfill step failed (will retry)</code></td><td>warn</td><td>a batch failed; it retries</td></tr>
+<tr><td><code>History backfill is not advancing</code></td><td>warn</td><td>no peer served the needed range for several minutes; also sets <code>backfill_stalled</code> in the sync diagnostics</td></tr>
+<tr><td><code>History backfill resumed</code></td><td>info</td><td>progress returned after a stall</td></tr>
+</tbody>
+</table>
+</div>
+<p>For continuous, log-level-independent visibility, enable metrics
+(<code>--metrics</code>) and watch the <code>ethrex_db_backfill_frontier_block</code> gauge descend
+toward the floor. See <a href="#db-observability">DB observability</a>
+for the metric and its Grafana panel.</p>
+<h3 id="verifying-it-worked"><a class="header" href="#verifying-it-worked">Verifying it worked</a></h3>
+<p>Pick a post-merge block below your original sync pivot and confirm its body and
+receipts are now present (replace the block number with one in your backfilled
+range):</p>
+<pre><code class="language-sh"># Full block with transactions — returns the block instead of null once backfilled
+curl -s http://localhost:8545 -H 'content-type: application/json' \
+  -d '{"jsonrpc":"2.0","id":1,"method":"eth_getBlockByNumber","params":["0x1000000", true]}'
+
+# Receipts for the same block
+curl -s http://localhost:8545 -H 'content-type: application/json' \
+  -d '{"jsonrpc":"2.0","id":1,"method":"eth_getBlockReceipts","params":["0x1000000"]}'
+</code></pre>
+<p>Before backfill reaches that height both return <code>null</code>/empty; afterward they
+return the full block and its receipts.</p>
+<h2 id="limitations"><a class="header" href="#limitations">Limitations</a></h2>
+<ul>
+<li><strong>Not an archive node.</strong> Backfill restores historical <em>chain</em> data (blocks,
+transactions, receipts, logs); it does not restore historical <em>state</em>.
+<code>eth_call</code>, <code>eth_getBalance</code>, and tracing at old block heights remain bounded to
+the recent in-memory state window regardless of this setting.</li>
+<li><strong><code>eth_getLogs</code> becomes correct, not fast.</strong> Backfill lets historical log
+queries return results instead of failing, but there is no log/bloom index, so
+wide historical ranges are still served by a linear per-block bloom scan.</li>
+<li><strong><code>all</code> is best-effort, and stops at Byzantium.</strong> Pre-Byzantium receipts use the
+pre-EIP-658 post-state-root form, which ethrex cannot represent, so no mode
+descends below that block. Above it, many peers no longer serve pre-merge
+bodies/receipts, so <code>all</code> can stall at a block it cannot fetch; it reports the
+stall and keeps retrying rather than failing the node.</li>
+<li><strong>A single block whose receipts exceed 10 MiB cannot be fetched.</strong> Requests ask
+for receipt index <code>0</code> and drop an incomplete trailing block, so backfill never
+paginates within a block. Such a block would stall the run rather than being
+skipped. Not reachable at today’s gas limits, but it is the case EIP-7975’s
+<code>firstBlockReceiptIndex</code> exists for.</li>
+<li><strong><code>--history.transactions</code> does not prune.</strong> It bounds what backfill indexes, but
+never removes existing index entries, and blocks above the sync pivot are always
+indexed by normal import. Shrinking it on an already-indexed node frees nothing.</li>
+</ul>
+<h2 id="cost"><a class="header" href="#cost">Cost</a></h2>
+<p>Enabling backfill adds a substantial amount of disk usage, since it stores the
+bodies and receipts a headers-only node omits. A complete <code>postmerge</code> run measured
+on mainnet filled 9,993,456 blocks in about 14 days and added <strong>~1.0 TB of history
+on top of state</strong>, averaging <strong>~105 KiB per block</strong>. See
+<a href="#with-historical-chain-backfill-enabled">Hardware requirements</a>
+for the per-column-family breakdown and recommended disk sizes.</p>
+<p>Because backfill walks from the pivot downward, the first blocks it fills are the
+most recent and largest. Per-block cost drops as it reaches older blocks (recent
+blocks measured ~125 KiB against the ~105 KiB full-range average), so throughput in
+blocks/day rises over the course of a run and an early sample overestimates the
+final total.</p>
+<p>The <a href="#db-observability">DB observability</a> dashboard breaks
+this growth down per column family (<code>bodies</code>, <code>receipts_v2</code>,
+<code>transaction_locations</code>). While filling, it uses spare network and CPU in the
+background; it is rate-limited and yields to chain-head following, so it does not
+slow down block processing.</p>
+<p>State size is unaffected: backfill adds chain history only, and does not change
+how much state the node keeps.</p>
+<h2 id="references"><a class="header" href="#references">References</a></h2>
+<ul>
+<li><a href="#sync-modes-2">Sync modes</a> — full vs. snap sync and where backfill fits.</li>
+<li><a href="#snap-sync-2">Snap sync internals</a> — why a snap-synced node is headers-only below the pivot.</li>
+<li><a href="#databases">Databases</a> — store schema versioning.</li>
+<li><a href="#db-observability">DB observability</a> — the backfill-frontier metric and dashboard.</li>
+<li><a href="#cli-commands">CLI reference</a> — full flag documentation.</li>
+<li>geth’s <a href="https://geth.ethereum.org/docs/fundamentals/command-line-options"><code>--history.chain</code> / <code>--history.transactions</code></a> flags, whose semantics this mirrors.</li>
+<li><a href="https://eips.ethereum.org/EIPS/eip-8159">EIP-8159</a> — the eth/71 receipts format backfill accepts.</li>
+</ul>
 <div style="break-before: page; page-break-before: always;"></div><link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/katex@0.16.4/dist/katex.min.css">
 <h1 id="snap-sync-2"><a class="header" href="#snap-sync-2">Snap Sync</a></h1>
 <p>API reference: https://github.com/ethereum/devp2p/blob/master/caps/snap.md</p>
@@ -2737,6 +3098,405 @@ struct StorageTaskResult {
 <p>10_000 slots is a number chosen without hard data, we should review that number. <a href="#fr-6-1">↩</a></p>
 </li>
 </ol>
+<div style="break-before: page; page-break-before: always;"></div><link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/katex@0.16.4/dist/katex.min.css">
+<h1 id="snap2-eip-8189-internals"><a class="header" href="#snap2-eip-8189-internals">snap/2 (EIP-8189) internals</a></h1>
+<p>snap/2 replaces the iterative <code>GetTrieNodes</code> / <code>TrieNodes</code> round-trips of the
+snap/1 healing phase with Block Access List (EIP-7928) replay. Instead of
+repairing a range download by asking peers for the individual trie nodes that
+disagree, a snap/2 sync downloads flat key-value state, patches it with the
+access lists of the blocks that passed while it downloaded, and rebuilds every
+trie locally from the result.</p>
+<p>Implements <a href="https://eips.ethereum.org/EIPS/eip-8189">EIP-8189</a> and depends on
+EIP-7928 for the <code>block_access_list_hash</code> header field.</p>
+<p>The client-side algorithm is normative and is specified in devp2p
+<code>caps/snap.md</code>, “Synchronization algorithm”, not in EIP-8189, which only
+sketches it. Concurrent account and storage fetch, a monotonic cursor across
+pivot moves, and one final root check are all requirements from that text
+rather than implementation choices.</p>
+<h2 id="capability-negotiation"><a class="header" href="#capability-negotiation">Capability negotiation</a></h2>
+<p>What a connection advertises depends on whether this node’s own state sync still
+depends on trie nodes, via <code>advertised_snap_capabilities(needs_trie_nodes)</code>.
+EIP-8189 (“Backwards Compatibility”) says a node synchronizing data should use
+one snap version for state sync and serve both only once synchronization is
+complete. A snap/1 state sync reconciles the trie with <code>GetTrieNodes</code>, which
+snap/2 removes, so a node that offered snap/2 while depending on them would
+negotiate away its only healing mechanism and then find no peer able to serve
+it; <code>heal_state_trie</code> would re-queue its batch and spin.</p>
+<p>The flag is set in <code>SyncManager::new</code> from “a snap sync is running <strong>and</strong> the
+chain has no Amsterdam”, since snap/2 reconciles with access lists that do not
+exist before that fork. It is cleared as soon as the sync commits to the snap/2
+path.</p>
+<p>Keying it on “a snap sync is running” alone is circular and strands the snap/2
+client permanently: withholding snap/2 means never negotiating it, which means
+never finding a snap/2 peer, which means always falling back to snap/1, which
+never clears the flag. The fallback leaves a correctly synced node behind, so
+this reads as success from the outside.</p>
+<p>The Hello exchange picks the highest snap version common to the peer’s list and
+the set this connection advertised, matching against the advertised set rather
+than <code>SUPPORTED_SNAP_CAPABILITIES</code>, so a version withheld by the gate above is
+not negotiated back. The result lives on <code>Established.negotiated_snap_capability</code>
+and is mirrored into the codec via
+<code>RLPxCodec.snap_version: Arc&lt;RwLock&lt;Option&lt;SnapCapVersion&gt;&gt;&gt;</code> so cross-version
+codes are rejected at decode time. <code>SnapCapVersion::V1</code> accepts codes
+<code>0x00..=0x07</code>; <code>V2</code> accepts <code>0x00..=0x05</code> plus <code>0x08</code>, <code>0x09</code>.</p>
+<p><code>GetTrieNodes</code> / <code>TrieNodes</code> are absent from snap/2, so any healing code path
+that sends them must restrict peer selection to snap/1 via
+<code>SNAP1_ONLY_CAPABILITIES</code> in <code>rlpx/p2p.rs</code>.</p>
+<p>That restriction only works because peer selection filters on
+<code>PeerData.negotiated_capabilities</code> rather than on the advertised
+<code>supported_capabilities</code>. A peer advertising both snap/1 and snap/2 negotiates
+snap/2 and would reject <code>GetTrieNodes</code>, so matching the advertised list would
+route trie-node healing straight into a protocol error. <code>supported_capabilities</code>
+remains the full advertised list because <code>admin_peers</code> reports it, which makes
+the two easy to confuse when reading a live node.</p>
+<h2 id="wire-format"><a class="header" href="#wire-format">Wire format</a></h2>
+<p><code>Snap2GetBlockAccessLists</code> carries <code>[id, [hashes...], response_bytes]</code>.
+<code>response_bytes</code> is a soft cap; <code>0</code> means “use the default” (2 MiB).</p>
+<p><code>Snap2BlockAccessLists</code> carries <code>[id, [entries...]]</code> with one entry per
+requested hash, in order. An unavailable BAL is encoded as the RLP empty
+string <code>0x80</code> (NOT the empty list <code>0xc0</code> — that is eth/71’s <code>OptionalBal</code>
+convention, a different protocol). The codec test
+<code>snap2_bal_none_uses_0x80_sentinel</code> locks the sentinel byte against
+regressions.</p>
+<pre class="playground"><code class="language-rust edition2024"><span class="boring">#![allow(unused)]
+</span><span class="boring">fn main() {
+</span>pub struct Snap2GetBlockAccessLists {
+    pub id: u64,
+    pub block_hashes: Vec&lt;H256&gt;,
+    pub response_bytes: u64,
+}
+
+pub struct Snap2BlockAccessLists {
+    pub id: u64,
+    pub bals: Vec&lt;Option&lt;BlockAccessList&gt;&gt;,
+}
+<span class="boring">}</span></code></pre>
+<p><code>caps/snap.md</code> writes the response body as <code>bals: [bal1: B, …]</code>, which reads
+like each entry is wrapped. It is not: entries are the BAL’s own RLP list
+spliced in raw, with <code>0x80</code> for an absent one. That is a spec bug, and ethrex
+follows the wire behaviour rather than the notation.</p>
+<h2 id="server-handler"><a class="header" href="#server-handler">Server handler</a></h2>
+<p><code>build_snap2_bal_response</code> in <code>rlpx/connection/server.rs</code> builds the response
+from a batched <code>Store::iter_block_access_lists_by_hashes</code>. No per-hash header
+lookup is needed: BAL storage is gated on the Amsterdam fork, so a stored BAL
+implies a post-Amsterdam block and is served directly, while a pre-Amsterdam,
+pruned, or unknown block has nothing stored and yields <code>None</code>.</p>
+<p>The byte budget is tracked via <code>bal.length()</code> (the zero-allocation
+<code>RLPEncode</code> trait method) and capped at <code>min(response_bytes, 2 MiB)</code>. When
+the cap is exceeded the loop breaks, preserving order up to the cutoff and
+keeping at least one entry. The handler always returns a response, never
+drops the request, and serves orphaned (non-canonical) blocks the same as
+canonical ones because the storage is keyed by hash.</p>
+<p>A defensive check rejects snap/2 messages received over a snap/1 connection
+by sending <code>DisconnectReason::ProtocolError</code>. The codec already rejects
+cross-version codes at decode time, so this only catches misconfigurations.</p>
+<h2 id="client-request"><a class="header" href="#client-request">Client request</a></h2>
+<p><code>PeerHandler::request_snap2_bals</code> filters on <code>Capability::snap(2)</code> so the
+request only goes to a peer that can serve it. <code>Ok(None)</code> signals “no
+snap/2 peer available” and the caller falls back to snap/1 healing. A peer
+that returns a mismatched <code>id</code> or a non-<code>Snap2BlockAccessLists</code> reply is
+recorded as a failure.</p>
+<p>The capability list it takes is <em>required</em>, not excluded. The “excluding” in
+<code>get_best_peer_excluding</code> refers to <code>failed_peers</code>, which is a separate
+argument.</p>
+<h2 id="the-state-sync-pipeline"><a class="header" href="#the-state-sync-pipeline">The state sync pipeline</a></h2>
+<p><code>sync/snap2/</code> holds the client half. <code>snap2_sync</code> in <code>snap_sync.rs</code> runs four
+stages in order: download, catch-up (interleaved with the download on every
+pivot move), reconstruction, then the root check.</p>
+<h3 id="range-download"><a class="header" href="#range-download">Range download</a></h3>
+<p><code>download.rs</code> splits the account hash space into <code>ACCOUNT_RANGE_CHUNK_COUNT</code>
+(800) ranges and works them concurrently. Each range owns a <code>next</code> cursor and a
+<code>last</code> bound; a range retires when <code>next</code> passes <code>last</code>.</p>
+<p><code>worker.rs</code> issues the individual requests and verifies each response against
+the root the request named before returning it. For storage that root is the
+account’s own, which is only correct while the account leaf that carried it came
+from the same pivot; the driver guarantees that, the worker does not check it.</p>
+<p>Accounts and storage are fetched <strong>concurrently</strong>, which is what keeps the
+result honest. snap/1 downloads every account first and every storage
+afterwards, closing the gap by healing the account trie back to the current
+pivot before each storage pass. snap/2 cannot make that repair, because it
+removes <code>GetTrieNodes</code>. So a range advances only once its accounts <em>and</em> their
+storage are in, in batches of <code>STORAGE_BATCH_SIZE</code> (300) accounts per storage
+request. Work still inside a pending range is dropped and re-requested when the
+pivot moves.</p>
+<p>Two peer-level guards, both of which exist because a peer that cannot serve
+still looks perfectly healthy from the outside:</p>
+<ul>
+<li>Every response scores its peer via <code>record_success</code> / <code>record_failure</code>.
+Without this, a peer stalled behind a fork it could not follow keeps full
+score, wins selection forever, and the download retries it indefinitely.</li>
+<li>The stall guard is measured against <strong>frontier movement</strong>, not request
+dispatch. A download feeding a dead peer is busy by every local measure and
+getting nowhere. <code>STALL_TIMEOUT</code> is 300s, generous because a thin or busy
+peer set can go quiet without anything being wrong.</li>
+</ul>
+<p>Two response shapes are not failures and must retire their range, or it is
+rescheduled forever while every response still verifies:</p>
+<ul>
+<li>Accounts returned but all beyond the range’s limit. <code>caps/snap.md</code> has a peer
+fall back to the first account past <code>limit_hash</code> when the range itself is
+empty, so this is the answer for an empty span. The range is served through to
+<code>last</code>.</li>
+<li>No accounts at all, <strong>with</strong> a proof. Past the last account of the trie there
+is no account in range and none after the limit either, so an edge proof of
+absence is the only available answer. <code>verify_range</code> checks it. Only an empty
+answer with <em>no</em> proof means the peer does not hold the root, and that is a
+genuine failure.</li>
+</ul>
+<h3 id="the-download-cursor-and-the-frontier"><a class="header" href="#the-download-cursor-and-the-frontier">The download cursor and the frontier</a></h3>
+<p><code>cursor.rs</code> tracks how far the download has advanced through the key space. The
+flat state it produces mixes leaves from roots <code>R₀ … Rₙ</code>, and is patched back
+into consistency by access lists. A patch is only correct for a key the download
+has already passed: a key still ahead of the cursor will be served later, at a
+newer root, and already carries the change the access list describes. Applying
+it twice, or applying it to a key that is not there yet, corrupts the flat
+state, so every BAL write is gated on the cursor’s predicates.</p>
+<p>The invariant the whole design rests on:</p>
+<blockquote>
+<p>An account below the frontier has been served <strong>together with its storage</strong>.
+An account above it has not been served at all. Nothing may sit in between.</p>
+</blockquote>
+<p>The frontier therefore commits per response batch (accounts plus their storage),
+never per range. Committing per range leaves accounts served between the two
+positions invisible to catch-up: the frontier has moved past them, so the access
+lists that changed them are never applied again, and no later check catches it.
+The frontier and the request cursor must never disagree.</p>
+<h3 id="flat-state"><a class="header" href="#flat-state">Flat state</a></h3>
+<p><code>flat.rs</code> holds the download’s output. Patching means reading a leaf the
+download already produced, changing it, and writing it back, so the output has
+to stay addressable for the whole sync rather than being consumed once at the
+end. Range responses arrive as sorted chunk files (<code>RANGE_FILE_CHUNK_SIZE</code>,
+64 MiB) and are absorbed in bulk; access-list diffs are applied on top as
+individual writes.</p>
+<p>Absorbing a chunk cannot clobber a diff already written, because a chunk only
+ever covers keys the download had not reached, and the cursor refuses to patch
+exactly those.</p>
+<h3 id="pivot-moves-and-access-list-catch-up"><a class="header" href="#pivot-moves-and-access-list-catch-up">Pivot moves and access-list catch-up</a></h3>
+<p><code>catchup.rs</code> implements steps 3 and 4 of the algorithm: as the chain advances
+from <code>P</code> to <code>P+K</code>, fetch the BALs for <code>P+1..P+K</code>, verify each against its
+header’s <code>block_access_list_hash</code>, and apply the diff to the partial flat state.
+<code>P+K</code> is then the target for the remaining range requests. This runs on every
+pivot move before the download resumes against the new root, so the flat state
+is never more than one pivot behind the range requests.</p>
+<p><code>MAX_CATCH_UP_BLOCKS</code> is <code>3533 * 32</code>: EIP-7928 obliges the execution layer to
+retain access lists for at least the weak subjectivity period, so that is the
+largest gap a peer can be expected to serve. Past it a catch-up would stall
+partway through, and <code>caps/snap.md</code> has the node discard its partial state and
+resync instead.</p>
+<p>The span to catch up is walked back along parent hashes from the target, not
+read from the canonical index. <code>Store::add_block_headers</code> writes HEADERS and
+BLOCK_NUMBERS but <strong>not</strong> the canonical-block-hash table, which stays empty
+until the sync commits, so the canonical index reads as empty mid-sync. Walking
+parent hashes is also the reorg check.</p>
+<h3 id="reconstruction-and-the-root-check"><a class="header" href="#reconstruction-and-the-root-check">Reconstruction and the root check</a></h3>
+<p><code>generate.rs</code> rebuilds every trie from the flat state and compares the resulting
+root against the pivot header. This is the only place a snap/2 sync checks its
+work. snap/1 gets the check for free, because healing walks down from the
+pivot’s root and cannot finish unless the trie reaches it; snap/2 removes
+healing, so this comparison is what stands between a corrupt download and a
+corrupt chain.</p>
+<p>Each account is written with the root its storage trie actually hashes to, not
+the one served with it. Served roots come from whichever pivot answered that
+account’s range and disagree with the slots on disk as soon as the pivot moves.</p>
+<p>Storage tries take one of two builders, chosen by slot count. At or above
+<code>BULK_STORAGE_TRIE_SLOTS</code> a contract goes through <code>trie_from_sorted_accounts</code>,
+the same bulk builder the account trie uses, which constructs bottom-up from
+sorted leaves and writes through the trie’s own db. Below it the contract is
+built slot by slot and its node changes are buffered, because the bulk builder
+spawns a writer pool per call and most contracts hold a handful of slots. The
+buffered changes are flushed every <code>STORAGE_WRITE_BATCH_NODES</code> nodes; writing
+each contract as it is built would open one write transaction per contract.</p>
+<p>Both builders must agree on the root, since a real state exercises both and only
+the combined state root would show a disagreement, far from the contract that
+caused it. <code>a_bulk_built_storage_trie_matches_a_slot_by_slot_one</code> pins that.</p>
+<p>Measured on the devnet at ~201,500 storage slots, one contract holding 98,871 of
+them, three interleaved runs per side against the same chain: reconstruction went
+from 854 ms to 293 ms, roughly 2.9x. Both sides reconstruct to the same roots, so
+this is a like-for-like comparison and not a behaviour change.</p>
+<p>Do not measure this by comparing runs at different state sizes. The per-contract
+costs are fixed costs, so they amortize as the state grows, and a comparison that
+lets the state grow between the two sides credits that amortization to the code.
+Doing exactly that overstated the gain here as 4.9x.</p>
+<p>On success the sync latches <code>snap2_reconstructed_block</code> in the diagnostics.
+That is the terminal evidence the snap/2 path ran to completion, and it is what
+test harnesses should assert on.</p>
+<h3 id="failure-discard-and-restart"><a class="header" href="#failure-discard-and-restart">Failure: discard and restart</a></h3>
+<p>Any error in the download or reconstruction runs <code>discard_partial_state</code>, and
+the discard has to be real. <code>caps/snap.md</code> leaves one remedy for a sync that
+cannot be made consistent, “discard partial state and restart synchronization”.
+Leaving the flat state behind would let the next attempt reuse leaves for
+accounts that no longer exist, which no later check would catch: the frontier
+would have moved past them, so the access lists that deleted them are never
+applied again.</p>
+<h2 id="bal-replay-on-the-snap1-path"><a class="header" href="#bal-replay-on-the-snap1-path">BAL replay on the snap/1 path</a></h2>
+<p><code>sync/bal_healing/</code> is a separate, older use of the same messages: it
+accelerates the snap/1 post-download healing loop with BAL replay. It is not
+part of the snap/2 pipeline above and remains in use whenever the sync falls
+back to snap/1.</p>
+<h3 id="applier"><a class="header" href="#applier">Applier</a></h3>
+<p><code>sync/bal_healing/apply.rs::apply_bal(store, parent_state_root, bal, header)</code>:</p>
+<ol>
+<li>Empty-BAL short-circuit — <code>bal.is_empty()</code> returns <code>parent_state_root</code>
+directly.</li>
+<li>Hash validation — <code>bal.compute_hash()</code> must equal
+<code>header.block_access_list_hash.unwrap_or(EMPTY_BLOCK_ACCESS_LIST_HASH)</code>.</li>
+<li><code>bal.validate_ordering()</code> — defense against malicious peers reordering
+entries to forge a different post-state with the same RLP encoding.</li>
+<li>Apply balance, nonce, code, and storage diffs derivable from the BAL.
+Trie writes go via <code>write_batch(STORAGE_TRIE_NODES, …)</code> which bypasses
+<code>TrieLayerCache</code> cleanly: the cache reads, batch writes go to the
+backend directly, no invalidation needed.</li>
+<li>Persist the BAL via <code>Store::store_block_access_list</code> so this node can
+serve it onward (the heal path never goes through <code>store_block</code>).</li>
+<li>Return the post-block state root.</li>
+</ol>
+<p>A wrong-state-root return triggers <code>SyncError::StateRootMismatch</code>, which is
+classified as recoverable so the outer loop can retry with a different peer.</p>
+<p>Only the post-block value of each entry matters, so the last change recorded for
+a key wins and intermediate ones are ignored. Each account’s <code>storage_root</code> is
+left as served: it is wrong in general, and it is recomputed from the
+reconstructed storage tries, so writing anything there would be discarded.</p>
+<p>Correctness rests on the access list enumerating every storage change as an
+individual slot write, a premise carried from go-ethereum’s
+<code>eth/protocols/snap/bal_apply.go</code>. This holds post
+<a href="https://eips.ethereum.org/EIPS/eip-6780">EIP-6780</a>: pre-existing contracts can
+no longer be destructed, so storage only changes via SSTOREs, all of which are
+recorded. <strong>Networks with the legacy SELFDESTRUCT break this premise</strong>, since
+wholesale storage wipes carry no per-slot writes and leave already-downloaded
+slots stale.</p>
+<h3 id="driver"><a class="header" href="#driver">Driver</a></h3>
+<p><code>advance_state_via_bals</code> in <code>sync/bal_healing/mod.rs</code> loads canonical
+headers from <code>start_block.number + 1</code> to the target, then requests BALs in
+batches of <code>BAL_REQUEST_BATCH_SIZE</code> — derived from the response soft cap and
+EIP-7928’s average BAL size so a typical response is not truncated — retrying
+each block up to <code>BAL_MAX_RETRIES_PER_BLOCK</code> (3) times. Strict in-batch
+ordering: a slot is only applied once all prior slots in the batch have been
+applied. A parent-hash check before each apply returns
+<code>SyncError::ChainReorgDetected</code> (non-recoverable) on mismatch.</p>
+<p>A response covering no slot at all is charged to the first pending slot’s retry
+budget, so a peer that truncates everything cannot stall the driver. Once any
+slot exhausts its retries the driver returns the partial state root reached so
+far; the caller in <code>snap_sync.rs</code> compares it against the target and runs
+snap/1 healing for the remainder.</p>
+<h3 id="snap-sync-integration"><a class="header" href="#snap-sync-integration">Snap-sync integration</a></h3>
+<p>This replay implements EIP-8189 steps 5 and 7 and runs only in the
+post-bulk-download healing loop. The healing pass inside the storage-ranges
+download loop stays on snap/1: a BAL carries state changes, not the state trie,
+so a diff like <code>balance(X): a→b</code> needs an existing local value to apply to, and
+during bulk download most accounts do not have one yet.</p>
+<p>The loop tracks <code>completed_pivot</code> — the pivot whose state a healing pass
+verified in full. That is the only valid starting point for a replay, because
+the diffs are applied on top of it. Replaying from the <em>current</em> pivot instead
+would apply a span of changes to a state that does not correspond to its first
+block, and the resulting root would be wrong in a way the per-block check
+cannot attribute.</p>
+<p>While <code>completed_pivot</code> is <code>None</code> — the first pass, and after any reorg — the
+loop heals. Once a pass sets it and the chain advances, a later pivot is reached
+by replaying the span between them and checking the result against
+<code>pivot_header.state_root</code> (step 7). A short root, a peer failure, or an
+unavailable BAL falls back to healing for that pass; <code>SyncError::ChainReorgDetected</code>
+additionally clears the anchor, since a reorg past the pivot means the state it
+names belongs to an abandoned fork.</p>
+<p>Note that a BAL cannot supply an account’s <code>storage_root</code>: EIP-7928’s
+<code>AccountChanges</code> is <code>[address, storage_changes, storage_reads, balance_changes, nonce_changes, code_changes]</code>, with no root. A root is only re-derivable by
+re-hashing the storage trie, which is why replay is placed after the storage
+download rather than before it.</p>
+<h2 id="pre-amsterdam-handling"><a class="header" href="#pre-amsterdam-handling">Pre-Amsterdam handling</a></h2>
+<p><code>block_access_list_hash</code> is absent in pre-Amsterdam headers, so snap/2 is
+functionally dormant before the fork: the server returns <code>None</code> for every
+pre-Amsterdam hash, and the catch-up requires the anchoring pivot to carry a
+<code>block_access_list_hash</code>, so the driver never starts. A peer returning
+<code>Some(bal)</code> for a header whose <code>block_access_list_hash</code> is <code>None</code> is a protocol
+violation; the hash check against <code>EMPTY_BLOCK_ACCESS_LIST_HASH</code> catches it.</p>
+<p>Because a pre-Amsterdam pivot still needs <code>GetTrieNodes</code>, the capability gate
+cannot become unconditional and snap/1 has to stay as the fallback path.</p>
+<h2 id="errors"><a class="header" href="#errors">Errors</a></h2>
+<p><code>SyncError</code> gains four variants in <code>sync.rs</code>:</p>
+<ul>
+<li><code>StateRootMismatch(expected, got)</code> — applied BAL produced a different
+state root from <code>header.state_root</code>. Recoverable.</li>
+<li><code>MissingHeaderForBal(BlockHash)</code> — local header missing for a BAL we
+need to apply. Non-recoverable (DB inconsistency).</li>
+<li><code>MissingCanonicalBlock(number)</code> — no canonical hash recorded at a block
+number in the replay range. Non-recoverable (DB inconsistency).</li>
+<li><code>ChainReorgDetected { expected_parent, actual_parent }</code> — peer’s BAL
+chain doesn’t connect to our local view. Non-recoverable; the caller
+falls back to snap/1.</li>
+</ul>
+<h2 id="diagnostics"><a class="header" href="#diagnostics">Diagnostics</a></h2>
+<p><code>SyncDiagnostics</code> is served by <code>admin_syncStatus</code>. Replay counters:
+<code>snap2_bal_requests_sent</code>, <code>snap2_blocks_replayed</code>, <code>snap2_bals_unavailable</code>,
+<code>snap2_validation_failures</code>, <code>snap2_peer_failures</code>.</p>
+<p>Download counters: <code>snap2_ranges_served</code>, <code>snap2_ranges_unverified</code>,
+<code>snap2_storage_requeued</code>, <code>snap2_storage_partial</code>, plus
+<code>snap2_ranges_remaining</code> in <code>phase_progress</code>. A high served count against a
+flat remaining count is the signature of a range that verifies every response
+and retires nothing.</p>
+<p><code>snap2_reconstructed_block</code> is latched, not sampled, and carries the pivot whose
+root reconstruction reproduced. Use it, not <code>current_phase</code>, to decide which
+path a sync took: the phase fields describe the sync only while it runs, and a
+small state downloads between two polls.</p>
+<h2 id="testing"><a class="header" href="#testing">Testing</a></h2>
+<p>Unit and integration coverage lives in <code>test/tests/p2p/</code>: codec round-trips,
+server responses, <code>apply_bal</code>, the cursor predicates, flat state, and
+reconstruction. Hive covers the serving side.</p>
+<p><code>scripts/snap2-devnet/join.py</code> covers the client side against real peers. It
+joins a fresh ethrex node to a running kurtosis enclave, drives it with
+<code>engine_forkchoiceUpdatedV4</code>, and asserts on which path the sync took.</p>
+<p>Devnet requirements, all load-bearing:</p>
+<ul>
+<li><strong>Mainnet preset, not <code>minimal</code>.</strong> Minimal reaches Amsterdam sooner but block
+production dies at the Gloas transition: <code>payload_attestation_data</code> 404s,
+builder registration 500s, every slot empty.</li>
+<li><strong><code>gloas_fork_epoch &gt;= 1</code>.</strong> At 0 the beacon genesis state is a Gloas state
+and lighthouse cannot decode it.</li>
+<li><strong>EIP-8282 builder predeploys preloaded.</strong> The genesis generator omits them
+and their empty code invalidates any Amsterdam+ block.</li>
+<li><strong>EIP-7997 deterministic factory in genesis</strong> (nonce 1). Without it, a geth
+peer that injects the factory at the fork boundary produces a block-access
+index 0 nonce change ethrex never makes, and the two clients reject each
+other’s transition block.</li>
+<li>Forkchoice must send <strong>zero</strong> safe and finalized hashes. A non-zero hash the
+node has never seen is looked up and order-checked, which errors instead of
+returning SYNCING, so the sync never starts.</li>
+<li>Under the <code>sync-test</code> feature, <code>MIN_FULL_BLOCKS</code>, <code>SNAP_LIMIT</code> and
+<code>SECONDS_PER_BLOCK</code> are overridable, since production values need a chain
+10k blocks deep and a 25-minute pivot lifetime. <code>SECONDS_PER_BLOCK</code> must match
+the real slot time or <code>update_pivot</code> mis-estimates and pivots arrive stale.</li>
+</ul>
+<p>The trap the harness exists to avoid: <strong>a snap/1 fallback also ends with a
+correctly synced node</strong>, so “the node synced” is not evidence that snap/2 ran.
+Assert on the latched reconstruction.</p>
+<h2 id="known-gaps"><a class="header" href="#known-gaps">Known gaps</a></h2>
+<ul>
+<li><strong>Access-list catch-up is not exercised on every run.</strong> A state small enough
+to download inside a single pivot never makes the pivot go stale, so catch-up
+correctly has nothing to do. It has been verified on a slower run (48 blocks
+over 4 rounds, 0 validation failures); the harness reports when a run leaves
+it untested rather than passing silently. Covering it deliberately needs real
+state on the devnet, not a lower <code>SNAP_LIMIT</code>.</li>
+<li><strong>Reorg past the pivot is unimplemented.</strong> The sync takes the
+discard-and-restart escape hatch <code>caps/snap.md</code> permits, rather than
+recovering.</li>
+<li><strong>Reconstruction does not fan out across accounts</strong>, where snap/1’s storage
+insert runs them through rayon. The per-contract costs it used to pay (a write
+transaction each, and a root-down descent per slot) are gone, but the account
+loop itself is still serial. Sharding it needs a range-bounded account
+iterator on <code>FlatState</code>; the underlying RocksDB handle is <code>Sync</code> and already
+hands out independent iterators, so nothing structural blocks it. Unmeasured
+at mainnet scale, which is the reason it has not been done.</li>
+<li><strong><code>STORAGE_BATCH_SIZE</code> is a fixed count of 300 accounts</strong> against a 512 KB
+response cap, where geth sizes the batch by response budget
+(<code>storageSets := cap / 1024</code>). Not currently implicated in truncation, but
+untested under real load.</li>
+<li><strong><code>ChunkWriter::is_full</code> sizes buffers with <code>size_of::&lt;AccountState&gt;()</code></strong>,
+which under-counts the RLP. Inherited from snap/1.</li>
+<li><strong>No hive snap/2 simulator.</strong> <code>test/tests/p2p/</code> has no multi-node RLPx
+harness, and the existing hive devp2p snap simulator calls the external Go
+<code>devp2p</code> CLI. The devnet harness covers the same ground manually.</li>
+<li><strong>Legacy-SELFDESTRUCT networks are out of scope</strong>, per the applier’s
+correctness premise above.</li>
+</ul>
 <div style="break-before: page; page-break-before: always;"></div>
 <h1 id="can-an-account-disappear-from-ethereums-state-trie"><a href="#can-an-account-disappear-from-ethereums-state-trie" class="header">Can an account disappear from Ethereum's state trie?</a></h1>
 <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/katex@0.16.4/dist/katex.min.css">
@@ -4169,7 +4929,7 @@ cargo run --release -- deposit \
 </table>
 </div>
 <hr>
-<h2 id="references"><a class="header" href="#references">References</a></h2>
+<h2 id="references-1"><a class="header" href="#references-1">References</a></h2>
 <ul>
 <li><a href="#ethrex-l2-integration-with-aligned-layer">Aligned Layer Integration</a></li>
 <li><a href="#running-ethrex-in-aligned-mode">Running Ethrex in Aligned Mode</a></li>
@@ -5039,7 +5799,7 @@ cd ethrex/metrics
 </tbody>
 </table>
 </div>
-<h2 id="references-1"><a class="header" href="#references-1">References</a></h2>
+<h2 id="references-2"><a class="header" href="#references-2">References</a></h2>
 <h3 id="l2beat-resources"><a class="header" href="#l2beat-resources">L2Beat Resources</a></h3>
 <ul>
 <li><a href="https://l2beat.com/stages">L2Beat Stages Framework</a></li>
@@ -5316,7 +6076,7 @@ In this section we talk a bit about them, first going through the more specific 
 </tbody>
 </table>
 </div>
-<h2 id="references-2"><a class="header" href="#references-2">References</a></h2>
+<h2 id="references-3"><a class="header" href="#references-3">References</a></h2>
 <p>For running the prover, see <a href="#deploying-an-ethrex-l2">Deploy an L2</a>.
 For developer-focused setup and run instructions, see <a href="#running-the-prover">Running the Prover</a>.
 For comprehensive details on the internals of the prover, see <a href="#ethrex-prover-1">ethrex-prover</a>.</p>
@@ -7165,7 +7925,7 @@ sequenceDiagram
     OnChainProposer -&gt;&gt; Sequencer: OK
 </pre>
 
-<h2 id="limitations"><a class="header" href="#limitations">Limitations</a></h2>
+<h2 id="limitations-1"><a class="header" href="#limitations-1">Limitations</a></h2>
 <p>Due to the gas cost of computing rolling hashes, there is a limit to how many deposits can be handled in a single batch.<br>To prevent the creation of invalid batches, we enforce a maximum cap on deposits per batch in the <code>l1_committer</code>.<br>We also enforce the same maximum cap per block in the <code>block_producer</code>, to avoid situations where the <code>l1_committer</code> could get stuck if a single block contains more deposits than the configured batch cap.</p>
 <div style="break-before: page; page-break-before: always;"></div><link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/katex@0.16.4/dist/katex.min.css">
 <h1 id="withdrawals-1"><a class="header" href="#withdrawals-1">Withdrawals</a></h1>
@@ -8857,7 +9617,7 @@ INFO ethrex_l2::sequencer::l1_proof_sender: Submitted proof to Aligned prover_ty
 INFO ethrex_l2::sequencer::l1_proof_verifier: Batches verified in OnChainProposer, with transaction hash 0x...
 </code></pre>
 <hr>
-<h2 id="references-3"><a class="header" href="#references-3">References</a></h2>
+<h2 id="references-4"><a class="header" href="#references-4">References</a></h2>
 <ul>
 <li><a href="https://docs.alignedlayer.com/">Aligned Layer Documentation</a></li>
 <li><a href="https://docs.alignedlayer.com/guides/1.2_sdk_api_reference">Aligned SDK API Reference</a></li>
@@ -9424,6 +10184,109 @@ docker compose -f docker-compose-metrics.yaml -f docker-compose-metrics-l1.overr
 <p>This collapsed row offers a combined view of the block building base fee, gigagas per second during payload construction, and the time the builder spends assembling blocks. These panels are works in progress, collapsed by default, and may be refined over time.</p>
 <p><img src="developers/l1/img/block_building_wip.png" alt="Block building wip"></p>
 <div style="break-before: page; page-break-before: always;"></div><link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/katex@0.16.4/dist/katex.min.css">
+<h1 id="db-observability"><a class="header" href="#db-observability">DB observability</a></h1>
+<p>Ethrex exports granular RocksDB metrics so you can see, continuously and per
+column family, what the on-disk database is made of, how it grows, how the block
+cache and compactions behave, and how far the <a href="#historical-chain-backfill-1">historical chain
+backfill</a> has progressed.</p>
+<p>The metrics are named <code>ethrex_db_*</code> and are published to the same Prometheus
+endpoint as the rest of ethrex’s metrics, so they need no extra wiring — a
+pre-built Grafana dashboard renders them out of the box.</p>
+<h2 id="enabling-it-1"><a class="header" href="#enabling-it-1">Enabling it</a></h2>
+<ol>
+<li>Build with the <code>metrics</code> feature and start the node with <code>--metrics</code> (see
+<a href="#monitoring-and-metrics">Monitoring and metrics</a>). A collector then
+samples the database every 15 s and updates the gauges. It is a no-op for the
+in-memory backend.</li>
+<li><em>(Optional)</em> Set <code>ETHREX_ROCKSDB_STATISTICS=1</code> to enable RocksDB’s internal
+statistics, which populate the block-cache <strong>hit/miss</strong> counters
+(<code>ethrex_db_block_cache_hits_total</code> / <code>_misses_total</code>). This adds a small
+(~1–2%) overhead and is off by default; every other metric works without it.</li>
+</ol>
+<p>The <code>ethrex DB Observability</code> dashboard is provisioned automatically from
+<code>metrics/provisioning/grafana/dashboards/common_dashboards/db_dashboard.json</code>
+alongside the other <a href="#ethrex-l1-performance-dashboard-dec-2025">dashboards</a>.</p>
+<h2 id="metrics-2"><a class="header" href="#metrics-2">Metrics</a></h2>
+<p>All gauges carry the Prometheus <code>instance</code> label; per-column-family gauges also
+carry a <code>cf</code> label (<code>bodies</code>, <code>receipts_v2</code>, <code>transaction_locations</code>, <code>headers</code>,
+<code>account_trie_nodes</code>, <code>storage_trie_nodes</code>, <code>account_flatkeyvalue</code>,
+<code>storage_flatkeyvalue</code>, <code>account_codes</code>, …).</p>
+<h3 id="per-column-family"><a class="header" href="#per-column-family">Per column family</a></h3>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>Metric</th><th>Meaning</th></tr>
+</thead>
+<tbody>
+<tr><td><code>ethrex_db_cf_size_bytes</code></td><td>Live SST bytes on disk</td></tr>
+<tr><td><code>ethrex_db_cf_total_sst_bytes</code></td><td>Total SST bytes including not-yet-compacted (space amplification)</td></tr>
+<tr><td><code>ethrex_db_cf_live_data_bytes</code></td><td>Estimated live (logical) data bytes</td></tr>
+<tr><td><code>ethrex_db_cf_num_keys</code></td><td>Estimated number of keys</td></tr>
+<tr><td><code>ethrex_db_cf_num_files</code></td><td>Live SST file count</td></tr>
+<tr><td><code>ethrex_db_cf_blob_bytes</code></td><td>Live blob-file bytes (used by <code>account_codes</code>)</td></tr>
+<tr><td><code>ethrex_db_cf_pending_compaction_bytes</code></td><td>Estimated pending-compaction bytes (write debt)</td></tr>
+<tr><td><code>ethrex_db_cf_memtable_bytes</code></td><td>Current memtable bytes</td></tr>
+</tbody>
+</table>
+</div>
+<h3 id="database-wide"><a class="header" href="#database-wide">Database-wide</a></h3>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>Metric</th><th>Meaning</th></tr>
+</thead>
+<tbody>
+<tr><td><code>ethrex_db_total_live_sst_bytes</code></td><td>Total live SST bytes across all column families</td></tr>
+<tr><td><code>ethrex_db_block_cache_usage_bytes</code></td><td>Shared block-cache bytes in use</td></tr>
+<tr><td><code>ethrex_db_block_cache_capacity_bytes</code></td><td>Shared block-cache capacity</td></tr>
+<tr><td><code>ethrex_db_block_cache_pinned_bytes</code></td><td>Block-cache bytes pinned (index/filter blocks)</td></tr>
+<tr><td><code>ethrex_db_running_compactions</code></td><td>Currently running compactions</td></tr>
+<tr><td><code>ethrex_db_block_cache_hits_total</code></td><td>Cumulative block-cache hits (requires <code>ETHREX_ROCKSDB_STATISTICS</code>)</td></tr>
+<tr><td><code>ethrex_db_block_cache_misses_total</code></td><td>Cumulative block-cache misses (requires <code>ETHREX_ROCKSDB_STATISTICS</code>)</td></tr>
+<tr><td><code>ethrex_db_backfill_frontier_block</code></td><td>Lowest block with full chain data on disk (the backfill frontier / <code>earliest_block_number</code>)</td></tr>
+</tbody>
+</table>
+</div>
+<h2 id="the-dashboard"><a class="header" href="#the-dashboard">The dashboard</a></h2>
+<p><code>ethrex DB Observability</code> is organized into five rows:</p>
+<ul>
+<li><strong>Overview</strong> — total DB size, backfill frontier, blocks still above the merge
+floor, running compactions, and total size over time.</li>
+<li><strong>Per-Column-Family Sizes</strong> — stacked composition over time, current size by
+column family, and a per-CF detail table (size, live data, keys, files,
+pending compaction, blob bytes).</li>
+<li><strong>Growth / Deltas Over Time</strong> — total and per-CF growth rate (30 m derivative)
+plus 1 h / 6 h / 24 h size deltas.</li>
+<li><strong>Historical Chain Backfill</strong> — the frontier descending toward the merge floor,
+and the growth of the column families backfill writes into (<code>bodies</code>,
+<code>receipts_v2</code>, <code>transaction_locations</code>).</li>
+<li><strong>Read / Performance Internals</strong> — block-cache usage vs. capacity, hit ratio
+(needs statistics enabled), pending-compaction debt, SST file counts, memtable
+bytes, and running compactions.</li>
+</ul>
+<h2 id="how-it-fits-together"><a class="header" href="#how-it-fits-together">How it fits together</a></h2>
+<pre class="mermaid">flowchart LR
+    rocksdb[(RocksDB)] -- "property reads" --&gt; stats["Store::rocksdb_stats()"]
+    frontier["earliest_block_number"] --&gt; collector
+    stats --&gt; collector["metrics collector&lt;br/&gt;(every 15s)"]
+    collector -- "sets gauges" --&gt; registry["ethrex_db_* gauges"]
+    registry --&gt; endpoint["/metrics endpoint"]
+    endpoint --&gt; prometheus[Prometheus] --&gt; grafana[Grafana dashboard]
+</pre>
+
+<p>The collector reads cheap RocksDB properties (per-column-family sizes/keys/files,
+block cache, compaction counters) via <code>Store::rocksdb_stats()</code> and the backfill
+frontier via <code>earliest_block_number</code>, then updates the <code>ethrex_db_*</code> gauges. The
+gauges register into the Prometheus default registry, so the existing metrics API
+exposes them with no further changes.</p>
+<h2 id="references-5"><a class="header" href="#references-5">References</a></h2>
+<ul>
+<li><a href="#monitoring-and-metrics">Monitoring and metrics</a> — enabling metrics and the Docker monitoring stack.</li>
+<li><a href="#metrics-1">Metrics</a> and <a href="#ethrex-l1-performance-dashboard-dec-2025">Dashboards</a> — the rest of ethrex’s metrics and Grafana dashboards.</li>
+<li><a href="#historical-chain-backfill-1">Historical chain backfill</a> — the feature the frontier metric tracks.</li>
+<li><a href="#databases">Databases</a> — store schema versioning.</li>
+</ul>
+<div style="break-before: page; page-break-before: always;"></div><link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/katex@0.16.4/dist/katex.min.css">
 <h1 id="profiling"><a class="header" href="#profiling">Profiling</a></h1>
 <p>This guide covers the profiling tools available for ethrex developers, including CPU profiling and memory profiling.</p>
 <h2 id="cpu-profiling-with-pprof"><a class="header" href="#cpu-profiling-with-pprof">CPU Profiling with <code>pprof</code></a></h2>
@@ -9554,7 +10417,7 @@ This eliminates code duplication and makes adding new database backends trivial.
 <li>Locked views <code>StorageLockedView</code>: read-only views of a point in time (snapshots), right now it’s only used during snap-sync.</li>
 </ul>
 <div style="break-before: page; page-break-before: always;"></div><link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/katex@0.16.4/dist/katex.min.css">
-<h1 id="testing"><a class="header" href="#testing">Testing</a></h1>
+<h1 id="testing-1"><a class="header" href="#testing-1">Testing</a></h1>
 <p>The ethrex project runs several suites of tests to ensure proper protocol implementation</p>
 <h2 id="table-of-contents-3"><a class="header" href="#table-of-contents-3">Table of contents</a></h2>
 <ul>
@@ -9570,7 +10433,7 @@ This eliminates code duplication and makes adding new database backends trivial.
 <p>These are the official execution spec tests. There are two kinds: <code>state tests</code> and <code>blockchain tests</code>, you can execute them with:</p>
 <h3 id="state-tests"><a class="header" href="#state-tests">State tests</a></h3>
 <p>The state tests are individual transactions not related one to each other that test particular behavior of the EVM. Tests are usually run for multiple forks and the result of execution may vary between forks.
-See <a href="https://steel.ethereum.foundation/docs/execution-specs/mainnet/running_tests/test_formats/state_test/">docs</a>.</p>
+See <a href="https://steel.ethereum.foundation/docs/execution-specs/running_tests/test_formats/state_test/">docs</a>.</p>
 <p>To run the test first:</p>
 <pre><code class="language-sh">cd tooling/ef_tests/state
 </code></pre>
@@ -9582,7 +10445,7 @@ See <a href="https://steel.ethereum.foundation/docs/execution-specs/mainnet/runn
 </code></pre>
 <h3 id="blockchain-tests"><a class="header" href="#blockchain-tests">Blockchain tests</a></h3>
 <p>The blockchain tests test block validation and the consensus rules of the Ethereum blockchain. Tests are usually run for multiple forks.
-See <a href="https://steel.ethereum.foundation/docs/execution-specs/mainnet/running_tests/test_formats/blockchain_test/">docs</a>.</p>
+See <a href="https://steel.ethereum.foundation/docs/execution-specs/running_tests/test_formats/blockchain_test/">docs</a>.</p>
 <p>To run the tests first:</p>
 <pre><code class="language-sh">cd tooling/ef_tests/blockchain
 </code></pre>
@@ -9602,7 +10465,7 @@ See <a href="https://steel.ethereum.foundation/docs/execution-specs/mainnet/runn
 </li>
 <li><strong><a href="https://github.com/ethereum/execution-specs">ethereum/execution-specs</a></strong> - Test fixtures and vectors (the former <code>ethereum/execution-spec-tests</code> repo is archived)
 <ul>
-<li>Mainnet: <code>tests@v20.0.0</code> (Osaka + BPO1 + BPO2); Amsterdam: <code>tests-glamsterdam-devnet@v7.2.0</code></li>
+<li>Mainnet: <code>tests@v20.0.1</code> (Osaka + BPO1 + BPO2); Amsterdam: <code>tests-glamsterdam-devnet@v8.0.0</code></li>
 </ul>
 </li>
 <li><strong><a href="https://github.com/ethereum/execution-specs">ethereum/execution-specs</a></strong> - Fork specifications
@@ -9780,7 +10643,7 @@ HIVE_BRANCH ?= master
 </code></pre>
 <h3 id="workflow-configuration-githubworkflowsdaily_hive_reportyaml"><a class="header" href="#workflow-configuration-githubworkflowsdaily_hive_reportyaml">Workflow Configuration (.github/workflows/daily_hive_report.yaml)</a></h3>
 <p>Fixtures come from <a href="https://github.com/ethereum/execution-specs">ethereum/execution-specs</a> (the archived <code>ethereum/execution-spec-tests</code> repo is no longer used). The workflow uses fork-specific fixtures to ensure comprehensive test coverage, pinned via config files under <code>.github/config/hive/</code>:</p>
-<pre><code class="language-yaml"># Amsterdam tests use the glamsterdam-devnet bundle (.github/config/hive/amsterdam.yaml)
+<pre><code class="language-yaml"># Amsterdam tests read their pin from .github/config/hive/amsterdam.yaml
 if [[ "$SIM_LIMIT" == *"fork_Amsterdam"* ]]; then
   FLAGS+=" --sim.buildarg fixtures=$AMSTERDAM_FIXTURES"
   FLAGS+=" --sim.buildarg branch=$AMSTERDAM_EELS_COMMIT"
@@ -9794,16 +10657,13 @@ fi
 <h3 id="fixtures-url-files"><a class="header" href="#fixtures-url-files">Fixtures URL Files</a></h3>
 <p>Local ef_tests runners (blockchain, state, engine) share one set of fixture URL files under <code>tooling/ef_tests/</code>:</p>
 <ul>
-<li><code>tooling/ef_tests/.fixtures_url</code> — mainnet bundle</li>
-<li><code>tooling/ef_tests/.fixtures_url_amsterdam</code> — Amsterdam (glamsterdam-devnet) fixtures with BAL support</li>
+<li><code>tooling/ef_tests/.fixtures_url</code> — mainnet bundle, which from <code>tests@v21.0.0</code> on also carries the Amsterdam and BAL fixtures</li>
 <li><code>tooling/ef_tests/.fixtures_url_zkevm</code> — zkEVM (EIP-8025 stateless) fixtures</li>
 </ul>
+<p>There is no separate Amsterdam file any more. The mainnet bundle absorbed the <code>tests-glamsterdam-devnet</code> series and ships more Amsterdam fixtures than it did, so overlaying the devnet bundle on top would replace the richer subtrees with poorer ones.</p>
 <p>Contents:</p>
 <pre><code># .fixtures_url
-https://github.com/ethereum/execution-specs/releases/download/tests%40v20.0.0/fixtures.tar.gz
-
-# .fixtures_url_amsterdam
-https://github.com/ethereum/execution-specs/releases/download/tests-glamsterdam-devnet%40v7.2.0/fixtures_glamsterdam-devnet.tar.gz
+https://github.com/ethereum/execution-specs/releases/download/tests%40v21.0.0/fixtures.tar.gz
 </code></pre>
 <p>The CI hive config lives in <code>.github/config/hive/{mainnet,amsterdam}.yaml</code>, each pinning a <code>fixtures</code> URL and an <code>eels_commit</code> (the execution-specs commit used to build the hive consumer).</p>
 <h2 id="updating-repository-versions"><a class="header" href="#updating-repository-versions">Updating Repository Versions</a></h2>
@@ -9820,14 +10680,14 @@ https://github.com/ethereum/execution-specs/releases/download/tests-glamsterdam-
 <pre><code class="language-yaml">fixtures: https://github.com/ethereum/execution-specs/releases/download/tests%40&lt;version&gt;/fixtures.tar.gz
 eels_commit: &lt;execution-specs-commit&gt;
 </code></pre>
-<p>For Amsterdam, edit <code>.github/config/hive/amsterdam.yaml</code> the same way with the glamsterdam-devnet bundle.</p>
+<p>Edit <code>.github/config/hive/amsterdam.yaml</code> the same way. It takes the same <code>tests@</code> bundle as mainnet, kept on its own file because the Amsterdam sims may need to run against a different release while a fork is in flight. The local <code>run-hive-eels-amsterdam</code> and <code>run-hive-build-block</code> targets read this file too, so a bump here reaches both CI and local runs.</p>
 </li>
 <li>
 <p><strong>Update fixtures URL files</strong> shared by the local runners (blockchain / state / engine):</p>
-<pre><code class="language-bash"># Mainnet fixtures
+<pre><code class="language-bash"># Mainnet fixtures (Amsterdam included)
 echo "https://github.com/ethereum/execution-specs/releases/download/tests%40&lt;version&gt;/fixtures.tar.gz" &gt; tooling/ef_tests/.fixtures_url
-# Amsterdam fixtures
-echo "https://github.com/ethereum/execution-specs/releases/download/tests-glamsterdam-devnet%40&lt;version&gt;/fixtures_glamsterdam-devnet.tar.gz" &gt; tooling/ef_tests/.fixtures_url_amsterdam
+# zkEVM (EIP-8025 stateless) fixtures, which share the mainnet release numbering
+echo "https://github.com/ethereum/execution-specs/releases/download/tests-zkevm%40&lt;version&gt;/fixtures_zkevm.tar.gz" &gt; tooling/ef_tests/.fixtures_url_zkevm
 </code></pre>
 </li>
 <li>
@@ -10324,6 +11184,20 @@ set -a; source cmd/.env; set +a
 <pre><code class="language-bash">curl -sf -X GET http://localhost:5555/committer/stop
 </code></pre>
 <p>No new batches will be committed from this point on. Already-committed batches will still get proved and verified by the running prover.</p>
+<p>The sequencer keeps producing blocks while the committer is stopped, and those
+blocks are what make the rest of this test worth running: they are written by
+<code>$VERSION_FROM</code> but will be committed by <code>$VERSION_TO</code>, which is the only
+situation where a batch mixes an old body encoding with a new committer. Leave a
+few of them behind deliberately and record where they start:</p>
+<pre><code class="language-bash">FIRST_UNCOMMITTED=$(( $(rex call "$ETHREX_COMMITTER_ON_CHAIN_PROPOSER_ADDRESS" 'lastCommittedBatch()' --rpc-url http://localhost:8545) ))
+echo "last batch committed by $VERSION_FROM: $FIRST_UNCOMMITTED"
+# Give the block producer a few more blocks, then note the L2 head.
+sleep 30
+LEGACY_HEAD=$(rex block-number --rpc-url http://localhost:1729)
+echo "L2 head left uncommitted: $LEGACY_HEAD"
+</code></pre>
+<p>Keep <code>LEGACY_HEAD</code> — step 4.3 checks that the batch covering it is not just
+committed but <em>verified</em>.</p>
 <h3 id="22-wait-until-all-committed-batches-are-verified"><a class="header" href="#22-wait-until-all-committed-batches-are-verified">2.2 Wait until all committed batches are verified</a></h3>
 <pre><code class="language-bash">while :; do
   COMMITTED=$(rex call "$ETHREX_COMMITTER_ON_CHAIN_PROPOSER_ADDRESS" 'lastCommittedBatch()' --rpc-url http://localhost:8545)
@@ -10477,6 +11351,27 @@ set -a; source cmd/.env; set +a
 ./ethrex l2 prover --proof-coordinators tcp://127.0.0.1:3900 --backend exec
 </code></pre>
 <hr>
+<h3 id="43-check-the-first-version_to-batch-over-version_from-blocks-gets-verified"><a class="header" href="#43-check-the-first-version_to-batch-over-version_from-blocks-gets-verified">4.3 Check the first <code>$VERSION_TO</code> batch over <code>$VERSION_FROM</code> blocks gets verified</a></h3>
+<p>The blocks left uncommitted in step 2.1 are now committed by <code>$VERSION_TO</code>.
+Committing them only proves the sequencer accepted them; the encoding they end up
+with is checked by the prover, because the guest re-encodes the blocks it is
+given and KZG-checks the result against the committed blob. A body read on one
+path with the legacy <code>withdrawals</code> field omitted and on another with it present
+as an empty list differs by a single RLP byte, and that mismatch only ever
+surfaces here, as a proof failure inside the zkVM.</p>
+<p>So wait for verification, not just commitment:</p>
+<pre><code class="language-bash">while :; do
+  COMMITTED=$(rex call "$ETHREX_COMMITTER_ON_CHAIN_PROPOSER_ADDRESS" 'lastCommittedBatch()' --rpc-url http://localhost:8545)
+  VERIFIED=$(rex call  "$ETHREX_COMMITTER_ON_CHAIN_PROPOSER_ADDRESS" 'lastVerifiedBatch()'  --rpc-url http://localhost:8545)
+  echo "committed=$COMMITTED verified=$VERIFIED (need a verified batch covering L2 block $LEGACY_HEAD)"
+  [ "$VERIFIED" -gt "$FIRST_UNCOMMITTED" ] &amp;&amp; break
+  sleep 10
+done
+</code></pre>
+<p>If the prover rejects the batch with <code>InvalidBlobProof</code>, the blob path and the
+prover-input path disagreed about the body encoding; both read stored blocks
+through <code>read_trusted_block</code> (<code>crates/l2/sequencer/utils.rs</code>) for exactly this
+reason, so start there.</p>
 <h2 id="step-5--acceptance-check-run-the-integration-tests-against-the-upgraded-l2"><a class="header" href="#step-5--acceptance-check-run-the-integration-tests-against-the-upgraded-l2">Step 5 — Acceptance check: run the integration tests against the upgraded L2</a></h2>
 <p>The simplest and strongest acceptance check is the standard L2 integration test suite (see <a href="#running-integration-tests">Integration tests</a>), pointed at the <strong>already-running</strong> <code>$VERSION_TO</code> sequencer + prover from Step 4. The suite covers deposits, withdrawals, batch commit/verify, gas pricing and several other surfaces, so a green run subsumes the per-check list we used to have here.</p>
 <p>Run it from the <code>$VERSION_TO</code> source tree so the tests match the binary you just upgraded to:</p>
@@ -11178,7 +12073,7 @@ You can find the solidity code in the <a href="https://github.com/lambdaclass/et
   5. Execute block via LEVM
   6. Return StatelessValidationResult (SSZ)
         |
-  Returns SSZ-encoded (new_payload_request_root, successful_validation, chain_config) or reverts
+  Returns SSZ-encoded (new_payload_request_root, successful_validation, chain_id, schema_id) or reverts
 </code></pre>
 <h2 id="execute-precompile"><a class="header" href="#execute-precompile">EXECUTE Precompile</a></h2>
 <p>The core logic lives in <code>execute_precompile.rs</code>. It parses SSZ-encoded <code>StatelessInput</code> once, validates L2-specific constraints, charges gas (<code>gas_limit + calldata_len · EXECUTE_GAS_PER_WITNESS_BYTE</code>), and delegates the already-decoded input to <code>verify_stateless_new_payload</code> via the <code>StatelessValidator</code> trait. Gas is charged on <code>gas_limit</code> (the true upper bound on re-execution), never on the attacker-controlled <code>gas_used</code>.</p>
@@ -11189,8 +12084,7 @@ You can find the solidity code in the <a href="https://github.com/lambdaclass/et
 </span>pub struct SszStatelessInput {
     pub new_payload_request: NewPayloadRequest,  // Full block as SSZ
     pub witness: SszExecutionWitness,            // State trie, storage tries, codes
-    pub chain_config: SszChainConfig,            // chain_id
-    pub public_keys: SszList&lt;...&gt;,               // Pre-recovered tx public keys (stub)
+    pub chain_id: u64,                           // #3278: the only config on the wire
 }
 <span class="boring">}</span></code></pre>
 <p>The <code>NewPayloadRequest</code> contains:</p>
@@ -11204,10 +12098,11 @@ You can find the solidity code in the <a href="https://github.com/lambdaclass/et
 <p>SSZ-encoded <code>StatelessValidationResult</code>:</p>
 <pre class="playground"><code class="language-rust edition2024"><span class="boring">#![allow(unused)]
 </span><span class="boring">fn main() {
-</span>pub struct StatelessValidationResult {
+</span>pub struct SszStatelessValidationResult {
     pub new_payload_request_root: [u8; 32],  // hash_tree_root of NewPayloadRequest
     pub successful_validation: bool,          // Whether execution was valid
-    pub chain_config: SszChainConfig,         // chain_id (echo back)
+    pub chain_id: u64,                        // echoed from the input
+    pub schema_id: u16,                       // fork/encoding the guest decoded
 }
 <span class="boring">}</span></code></pre>
 <p>The contract checks <code>successful_validation == true</code> at byte 32 of the result.</p>
@@ -11217,9 +12112,18 @@ You can find the solidity code in the <a href="https://github.com/lambdaclass/et
 <li><code>blob_gas_used == 0</code> — no blob data on L2</li>
 <li><code>excess_blob_gas == 0</code> — no blob fee market on L2</li>
 <li><code>withdrawals</code> is empty — L2 doesn’t have consensus-layer withdrawals</li>
-<li><code>execution_requests</code> is empty — no deposit/withdrawal/consolidation requests</li>
-<li>No type-3 (blob) transactions in the transaction list</li>
+<li><code>execution_requests</code> is empty — no deposit, withdrawal, consolidation, builder-deposit or builder-exit requests</li>
+<li>No type-<code>0x03</code> (blob), <code>0x06</code> (frame) or <code>0x7e</code> (privileged) transactions in the transaction list</li>
 </ul>
+<p>The two signature-less types are rejected for a structural reason, not a policy
+one: they carry an explicit sender and no signature, so no public key can be
+recovered for them, while <code>StatelessInput</code> commits exactly one key per
+transaction. Native rollups do not need them — L1→L2 messages are relayed as
+signed EIP-1559 transactions — so rejecting them makes “every transaction in the
+payload is signature-bearing” an invariant the producer can rely on.</p>
+<p>The 2-byte schema-id prefix is also required, and only <code>0x1501</code> is accepted:
+since execution-specs #3278 no chain configuration crosses the wire, so the
+prefix is the sole carrier of the fork.</p>
 <h3 id="gas-charging"><a class="header" href="#gas-charging">Gas Charging</a></h3>
 <p>Gas is charged as:</p>
 <pre><code>charge = gas_limit + calldata_len · EXECUTE_GAS_PER_WITNESS_BYTE
@@ -11275,9 +12179,13 @@ L1: User calls NativeRollup.claimWithdrawal(from, receiver, amount, messageId, b
 <li>Validates block headers from the witness</li>
 <li>Builds <code>GuestProgramState</code> from the witness</li>
 <li>Converts the SSZ <code>NewPayloadRequest</code> → ethrex <code>Block</code></li>
+<li>Checks each supplied public key derives to that transaction’s recovered sender</li>
 <li>Executes the block via LEVM</li>
-<li>Returns <code>StatelessValidationResult</code> with the hash tree root and a <code>successful_validation</code> flag</li>
+<li>Returns <code>StatelessValidationResult</code> with the hash tree root, <code>chain_id</code>, <code>schema_id</code> and a <code>successful_validation</code> flag</li>
 </ol>
+<p>Steps 4–7 live in <code>verify_stateless_block</code> (<code>crates/guest-program/src/l1/program.rs</code>),
+which is the single point both this path and the zkVM guests pass through — so
+neither can enforce a different set of checks than the other.</p>
 <p>The state root check implicitly guarantees both correct L1 message processing and correct L2→L1 withdrawal recording.</p>
 <h2 id="contracts-1"><a class="header" href="#contracts-1">Contracts</a></h2>
 <h3 id="nativerollupsol"><a class="header" href="#nativerollupsol">NativeRollup.sol</a></h3>
@@ -11330,33 +12238,21 @@ L1: User calls NativeRollup.claimWithdrawal(from, receiver, amount, messageId, b
 <h2 id="compilation-and-feature-flags"><a class="header" href="#compilation-and-feature-flags">Compilation and Feature Flags</a></h2>
 <p>The native-rollup EXECUTE precompile, the stateless-validation pipeline, and all SSZ types are <strong>always-compiled</strong> — there is no cargo feature that gates them out. (The old unified devnet feature flag was removed.)</p>
 <p><strong>Runtime gate:</strong> the EXECUTE precompile body executes only when <code>fork &gt;= Fork::LStar &amp;&amp; vm_type == VMType::L1</code>. On any other fork or VM type the precompile is a no-op CALL.</p>
-<p>The only remaining cargo feature is <strong><code>eip-8025</code></strong>, which controls the guest-program input/output format. The SSZ dep chain is:</p>
-<pre><code class="language-toml"># crates/guest-program/Cargo.toml  (guest only — not the host)
-eip-8025 = [
-    "ethrex-common/eip-8025",
-    "ethrex-vm/eip-8025",
-    "dep:libssz",
-    "dep:libssz-merkle",
-    "dep:libssz-types",
-    "dep:libssz-derive",
-]
-
-# crates/blockchain/Cargo.toml
-eip-8025 = ["ethrex-common/eip-8025", "ethrex-vm/eip-8025"]
-
-# crates/common/Cargo.toml
-eip-8025 = ["ethrex-trie/eip-8025"]   # guest-only trie SSZ support; the always-compiled stateless SSZ types do not need it
-</code></pre>
-<p>When <code>eip-8025</code> is compiled into the guest program:</p>
+<p>There is no longer an <code>eip-8025</code> cargo feature. It was removed along with the legacy guest path, so
+<code>libssz</code> and the SSZ types are unconditional dependencies of <code>ethrex-common</code>, and the guest has a
+single wire format rather than one per feature setting. A <code>grep eip-8025 -- '*.toml'</code> returns no
+feature declarations.</p>
+<p>The guest input/output format is now fixed:</p>
 <ul>
-<li>Input format: <code>NewPayloadRequest</code> (SSZ) + <code>ExecutionWitness</code> (rkyv) — the EIP-8025 wire format</li>
-<li>Output format: <code>ProgramOutput { new_payload_request_root: [u8; 32], valid: bool }</code> — 33 bytes</li>
+<li><strong>Input:</strong> a 2-byte big-endian schema-id prefix (<code>STATELESS_INPUT_SCHEMA_ID</code>, currently <code>0x1501</code>)
+followed by the SSZ-encoded <code>SszStatelessInput</code>. A wrong or missing prefix is rejected before the
+body is parsed.</li>
+<li><strong>Output:</strong> 43 bytes, laid out as
+<code>new_payload_request_root (32) || successful_validation (1) || chain_id (8) || schema_id (2)</code>,
+with <code>schema_id</code> little-endian at offset 41.</li>
 </ul>
-<p>Without <code>eip-8025</code>:</p>
-<ul>
-<li>Input/output use the legacy rkyv <code>ProgramInput</code>/<code>ProgramOutput</code> format</li>
-<li>The host (node) always has the SSZ types compiled in for the EXECUTE precompile</li>
-</ul>
+<p>The 43-byte layout is pinned against <code>NativeRollup.sol</code> by
+<code>test/tests/l2/native_rollup_sol_offsets.rs</code>.</p>
 <h2 id="summary-table-vs-l2beat-native-rollups-spec-see-divergences-note-above"><a class="header" href="#summary-table-vs-l2beat-native-rollups-spec-see-divergences-note-above">Summary Table (vs l2beat native-rollups spec; see divergences note above)</a></h2>
 <div class="table-wrapper">
 <table>
@@ -11384,7 +12280,6 @@ eip-8025 = ["ethrex-trie/eip-8025"]   # guest-only trie SSZ support; the always-
 <tr><td>ZK variant</td><td>Specified (proof-carrying tx + PROOFROOT)</td><td>Not implemented (re-execution only)</td><td><strong>Gap (by design)</strong></td></tr>
 <tr><td>Forced transactions</td><td>WIP (FOCIL)</td><td>Not implemented</td><td><strong>Gap</strong></td></tr>
 <tr><td>DA cost pricing</td><td>WIP</td><td>Not implemented</td><td><strong>Both WIP</strong></td></tr>
-<tr><td><code>public_keys</code></td><td>Pre-recovered tx keys</td><td>Empty tuple (stub)</td><td><strong>Stub</strong></td></tr>
 </tbody>
 </table>
 </div>
@@ -11401,7 +12296,7 @@ eip-8025 = ["ethrex-trie/eip-8025"]   # guest-only trie SSZ support; the always-
 </tbody>
 </table>
 </div>
-<h2 id="limitations-1"><a class="header" href="#limitations-1">Limitations</a></h2>
+<h2 id="limitations-2"><a class="header" href="#limitations-2">Limitations</a></h2>
 <p>This PoC intentionally omits several things that would be needed for production:</p>
 <ul>
 <li><strong>ZK variant</strong> — Only the re-execution variant is implemented. The ZK variant (proof-carrying transactions + PROOFROOT opcode) requires L1 consensus changes not yet available.</li>
@@ -11409,7 +12304,6 @@ eip-8025 = ["ethrex-trie/eip-8025"]   # guest-only trie SSZ support; the always-
 <li><strong>No L1 message inclusion deadline</strong> — <code>pendingL1Messages</code> have no per-message deadline, so the advancer can defer processing them indefinitely without on-chain consequence. <code>OnChainProposer.sol</code> enforces this for privileged transactions via <code>PRIVILEGED_TX_MAX_WAIT_BEFORE_INCLUSION</code> + <code>hasExpiredPrivilegedTransactions()</code>; the analogous mechanism for <code>NativeRollup.sol</code> is a TODO.</li>
 <li><strong>L2 ETH supply drain</strong> — Base fees are burned but not credited back on L2. A production solution would use a <code>BaseFeeVault</code> pattern.</li>
 <li><strong>No blob data support</strong> — Only calldata-based input (spec proposes blob references via EIP-8142)</li>
-<li><strong><code>public_keys</code> empty</strong> — Pre-recovered transaction public keys are not populated yet</li>
 </ul>
 <div style="break-before: page; page-break-before: always;"></div><link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/katex@0.16.4/dist/katex.min.css">
 <h1 id="ethrex-replay"><a class="header" href="#ethrex-replay">ethrex-replay</a></h1>
@@ -11871,7 +12765,7 @@ Options:
 
 Node options:
       --network &lt;GENESIS_FILE_PATH&gt;
-          Alternatively, the name of a known network can be provided instead to use its preset genesis file and include its preset bootnodes. The networks currently supported include sepolia, hoodi and mainnet. If not specified, defaults to mainnet.
+          Alternatively, the name of a known network can be provided instead to use its preset genesis file and include its preset bootnodes. The networks currently supported include sepolia, hoodi, plataberget and mainnet. If not specified, defaults to mainnet.
           
           [env: ETHREX_NETWORK=]
 
@@ -11926,22 +12820,22 @@ Node options:
 
       --no-precompile-cache
           Disable the per-block precompile result cache (benchmarking only).
-          
+
           [env: ETHREX_NO_PRECOMPILE_CACHE=]
 
       --no-bal-parallel-exec
           Disable BAL-driven parallel transaction execution on Amsterdam+ blocks (falls back to sequential).
-          
+
           [env: ETHREX_NO_BAL_PARALLEL_EXEC=]
 
       --no-bal-prefetch
           Disable the BAL-driven state prefetch warmer thread on Amsterdam+ blocks.
-          
+
           [env: ETHREX_NO_BAL_PREFETCH=]
 
       --no-bal-parallel-trie
           Disable BAL-driven optimistic trie merkleization on Amsterdam+ blocks (falls back to streaming AccountUpdates from the executor).
-          
+
           [env: ETHREX_NO_BAL_PARALLEL_TRIE=]
 
       --log.dir &lt;LOG_DIR&gt;
@@ -11955,6 +12849,11 @@ Node options:
           [env: ETHREX_MEMPOOL_MAX_SIZE=]
           [default: 10000]
 
+      --mempool.min-tip &lt;MIN_TIP_WEI&gt;
+          Minimum priority-fee cap (in wei) required for a transaction to be admitted into the mempool. Compared against the raw tip cap: `max_priority_fee_per_gas` for typed transactions, `gas_price` for legacy transactions (independent of current base fee, so admission stays stable as base fee oscillates). Set to 0 to disable the floor.
+
+          [env: ETHREX_MEMPOOL_MIN_TIP=]
+          [default: 1]
       --mempool.private
           Node-level config (not a protocol/EIP behavior): keep RPC-submitted transactions private. They enter the mempool and may be included in blocks built locally, but are not propagated to peers. P2P-received transactions are unaffected.
 
@@ -12004,6 +12903,18 @@ P2P options:
           
           [env: ETHREX_SYNCMODE=]
           [default: snap]
+
+      --history.chain &lt;HISTORY_CHAIN&gt;
+          Optionally backfill historical block bodies and receipts after snap sync so the node can serve historical block, transaction, receipt and log queries. One of "off" (default: headers-only below the pivot), "postmerge" (backfill down to the merge block), "all" (as far back as receipts are decodable — down to the Byzantium block, not genesis — best-effort as many peers no longer serve pre-merge history), or an explicit BLOCK NUMBER to backfill down to only that block — use this to keep a recent slice of history instead of everything back to the merge. A block number below the merge block is honoured but is best-effort like "all", and anything below Byzantium is clamped up to it. Enabling this adds substantial disk usage. It does not enable historical state queries (this is not an archive node).
+          
+          [env: ETHREX_HISTORY_CHAIN=]
+          [default: off]
+
+      --history.transactions &lt;BLOCKS&gt;
+          Blocks of backfilled history to keep the transaction index for (0 = the entire backfilled range).
+          
+          [env: ETHREX_HISTORY_TRANSACTIONS=]
+          [default: 0]
 
       --p2p.disabled
           [env: ETHREX_P2P_DISABLED=]
@@ -12055,21 +12966,31 @@ P2P options:
           [default: 100]
 
       --p2p.lookup-interval &lt;INITIAL_LOOKUP_INTERVAL&gt;
-          Initial Lookup Time Interval (ms) to trigger each Discovery lookup message and RLPx connection attempt.
+          Initial time interval (ms) between RLPx connection attempts. Widens towards 600ms as the target peer count is approached.
           
           [env: ETHREX_P2P_LOOKUP_INTERVAL=]
           [default: 100]
 
+      --blob-sampling
+          Enable EIP-8070 PeerDAS blob sampling (sampler/provider state machine). Disabled by default; when off the node always acts as provider (p=1.0).
+
+          [env: ETHREX_BLOB_SAMPLING=]
+
+      --blob-eager-provider
+          EIP-8070: always act as provider (p=1.0) for every blob tx, bypassing the pseudo-random role decision. Implies --blob-sampling. Not needed for validators: eager mode latches on permanently the first time the CL requests a payload build.
+
+          [env: ETHREX_BLOB_EAGER_PROVIDER=]
+
 Storage options:
       --rocksdb.block-cache-size &lt;BYTES&gt;
-          RocksDB shared block cache size in bytes. With cache_index_and_filter_blocks enabled it holds data blocks plus the per-SST index and bloom-filter blocks, so it is the effective ceiling on RocksDB's resident memory.
-          
-          Default 12 GiB keeps the filter/index working set resident plus hot EVM state. A sweep on a synced mainnet node (32 GiB cap) found 8-16 GiB all keep up with head-following (filters resident, disk near-idle, no slow blocks); larger gives no gain because the OS page cache backstops the uncompressed state CFs, and ~8 GiB is the floor where the filter set starts to thrash.
-          
-          Lower only on memory-constrained hosts, accepting reduced throughput. ETHREX_ROCKSDB_BLOCK_CACHE_SIZE sets the same value.
+          RocksDB shared block cache size in bytes, the effective ceiling on RocksDB's resident memory. Defaults to 40% of the memory available to the process (physical or cgroup limit, whichever is lower), clamped to 512 MiB..=12 GiB; where no limit can be detected (no readable /proc, e.g. outside Linux) it defaults to the 12 GiB ceiling.
           
           [env: ETHREX_ROCKSDB_BLOCK_CACHE_SIZE=]
-          [default: 12884901888]
+
+      --code-cache-size &lt;BYTES&gt;
+          Byte budget of the in-memory bytecode cache. Defaults to 2 GiB, which holds ~29k max-size contracts; the cache only grows with code that blocks actually load. Lower it on memory-constrained hosts, or raise it for workloads that keep reusing more distinct contracts than that.
+          
+          [env: ETHREX_CODE_CACHE_SIZE=]
 
 RPC options:
       --http.addr &lt;ADDRESS&gt;
@@ -12128,7 +13049,7 @@ Block building options:
           Block extra data message.
           
           [env: ETHREX_BUILDER_EXTRA_DATA=]
-          [default: "ethrex 23.0.0"]
+          [default: "ethrex 29.0.1"]
 
       --builder.gas-limit &lt;GAS_LIMIT&gt;
           Target block gas limit.
@@ -12176,7 +13097,7 @@ Options:
 
 Node options:
       --network &lt;GENESIS_FILE_PATH&gt;
-          Alternatively, the name of a known network can be provided instead to use its preset genesis file and include its preset bootnodes. The networks currently supported include sepolia, hoodi and mainnet. If not specified, defaults to mainnet.
+          Alternatively, the name of a known network can be provided instead to use its preset genesis file and include its preset bootnodes. The networks currently supported include sepolia, hoodi, plataberget and mainnet. If not specified, defaults to mainnet.
 
           [env: ETHREX_NETWORK=]
 
@@ -12338,7 +13259,7 @@ Block building options:
           Block extra data message.
 
           [env: ETHREX_BUILDER_EXTRA_DATA=]
-          [default: "ethrex 23.0.0"]
+          [default: "ethrex 29.0.1"]
 
       --builder.gas-limit &lt;GAS_LIMIT&gt;
           Target block gas limit.

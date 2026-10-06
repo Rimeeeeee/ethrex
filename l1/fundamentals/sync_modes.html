@@ -34,10 +34,10 @@
             const path_to_root = "../../";
             const default_light_theme = "light";
             const default_dark_theme = "navy";
-            window.path_to_searchindex_js = "../../searchindex-3053871c.js";
+            window.path_to_searchindex_js = "../../searchindex-6e750a07.js";
         </script>
         <!-- Start loading toc.js asap -->
-        <script src="../../toc-ec0f4f2d.js"></script>
+        <script src="../../toc-f6d73635.js"></script>
     </head>
     <body>
     <div id="mdbook-help-container">
@@ -182,6 +182,27 @@
 <p>Full syncing works by downloading and executing every block from genesis. This means that full syncing will only work for networks that started after <a href="https://ethereum.org/en/roadmap/merge/">The Merge</a>, as ethrex only supports post merge execution.</p>
 <h2 id="snap-sync"><a class="header" href="#snap-sync">Snap sync</a></h2>
 <p>For snap sync, you can view the <a href="./snap_sync.html">main document here</a>.</p>
+<h3 id="snap2-eip-8189"><a class="header" href="#snap2-eip-8189">snap/2 (EIP-8189)</a></h3>
+<p>ethrex advertises <code>snap/2</code> alongside <code>snap/1</code> unless its own state sync still
+depends on <code>GetTrieNodes</code>, which snap/2 removes; the version is negotiated
+per-peer at handshake.</p>
+<p>On a post-Amsterdam chain with a <code>snap/2</code> peer available, state sync downloads
+flat key-value state, patches it with the block access lists of the blocks that
+passed while it downloaded, then rebuilds every trie locally and verifies the
+result against the pivot’s state root. There is no trie healing at all.</p>
+<p>It falls back to <code>snap/1</code> when no <code>snap/2</code> peer is available, when the pivot is
+pre-Amsterdam, or when BAL validation fails.</p>
+<p>Implementation notes and known gaps are in
+<a href="../../internal/l1/snap_v2.html">snap/2 internals</a>.</p>
+<h2 id="historical-chain-backfill"><a class="header" href="#historical-chain-backfill">Historical chain backfill</a></h2>
+<p>A snap-synced node keeps only block <strong>headers</strong> below the sync pivot, so
+historical RPC queries for pre-pivot blocks (<code>eth_getBlockByNumber</code>,
+<code>eth_getBlockReceipts</code>, <code>eth_getTransactionByHash</code>, <code>eth_getLogs</code>, …) return
+empty. Historical chain backfill is an <strong>opt-in</strong> background process
+(<code>--history.chain postmerge</code>) that downloads and validates the missing bodies and
+receipts after snap sync completes, so the node can serve those queries.</p>
+<p>See <a href="./history_backfill.html">Historical chain backfill</a> for the flags, how it
+works, durability across restarts, and its limitations.</p>
 
                     </main>
 
@@ -191,7 +212,7 @@
                                 <span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 320 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M41.4 233.4c-12.5 12.5-12.5 32.8 0 45.3l160 160c12.5 12.5 32.8 12.5 45.3 0s12.5-32.8 0-45.3L109.3 256 246.6 118.6c12.5-12.5 12.5-32.8 0-45.3s-32.8-12.5-45.3 0l-160 160z"/></svg></span>
                             </a>
 
-                            <a rel="next prefetch" href="../../l1/fundamentals/snap_sync.html" class="mobile-nav-chapters next" title="Next chapter" aria-label="Next chapter" aria-keyshortcuts="Right">
+                            <a rel="next prefetch" href="../../l1/fundamentals/history_backfill.html" class="mobile-nav-chapters next" title="Next chapter" aria-label="Next chapter" aria-keyshortcuts="Right">
                                 <span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 320 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M278.6 233.4c12.5 12.5 12.5 32.8 0 45.3l-160 160c-12.5 12.5-32.8 12.5-45.3 0s-12.5-32.8 0-45.3L210.7 256 73.4 118.6c-12.5-12.5-12.5-32.8 0-45.3s32.8-12.5 45.3 0l160 160z"/></svg></span>
                             </a>
 
@@ -205,7 +226,7 @@
                         <span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 320 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M41.4 233.4c-12.5 12.5-12.5 32.8 0 45.3l160 160c12.5 12.5 32.8 12.5 45.3 0s12.5-32.8 0-45.3L109.3 256 246.6 118.6c12.5-12.5 12.5-32.8 0-45.3s-32.8-12.5-45.3 0l-160 160z"/></svg></span>
                     </a>
 
-                    <a rel="next prefetch" href="../../l1/fundamentals/snap_sync.html" class="nav-chapters next" title="Next chapter" aria-label="Next chapter" aria-keyshortcuts="Right">
+                    <a rel="next prefetch" href="../../l1/fundamentals/history_backfill.html" class="nav-chapters next" title="Next chapter" aria-label="Next chapter" aria-keyshortcuts="Right">
                         <span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 320 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M278.6 233.4c12.5 12.5 12.5 32.8 0 45.3l-160 160c-12.5 12.5-32.8 12.5-45.3 0s-12.5-32.8 0-45.3L210.7 256 73.4 118.6c-12.5-12.5-12.5-32.8 0-45.3s32.8-12.5 45.3 0l160 160z"/></svg></span>
                     </a>
             </nav>

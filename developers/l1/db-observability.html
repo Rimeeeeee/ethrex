@@ -3,7 +3,7 @@
     <head>
         <!-- Book generated using mdBook -->
         <meta charset="UTF-8">
-        <title>Withdrawals - Ethrex</title>
+        <title>DB observability - Ethrex</title>
 
 
         <!-- Custom HTML head -->
@@ -177,233 +177,118 @@
                 <div id="mdbook-content" class="content">
                     <main>
                         <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/katex@0.16.4/dist/katex.min.css">
-<h1 id="withdrawals"><a class="header" href="#withdrawals">Withdrawals</a></h1>
-<p>This document contains a detailed explanation of how asset withdrawals work.</p>
-<h2 id="native-eth-withdrawals"><a class="header" href="#native-eth-withdrawals">Native ETH withdrawals</a></h2>
-<p>This section explains step by step how native ETH withdrawals work.</p>
-<p>On L2:</p>
+<h1 id="db-observability"><a class="header" href="#db-observability">DB observability</a></h1>
+<p>Ethrex exports granular RocksDB metrics so you can see, continuously and per
+column family, what the on-disk database is made of, how it grows, how the block
+cache and compactions behave, and how far the <a href="../../l1/fundamentals/history_backfill.html">historical chain
+backfill</a> has progressed.</p>
+<p>The metrics are named <code>ethrex_db_*</code> and are published to the same Prometheus
+endpoint as the rest of ethrex’s metrics, so they need no extra wiring — a
+pre-built Grafana dashboard renders them out of the box.</p>
+<h2 id="enabling-it"><a class="header" href="#enabling-it">Enabling it</a></h2>
 <ol>
-<li>
-<p>The user sends a transaction calling <code>withdraw(address _receiverOnL1)</code> on the <code>CommonBridgeL2</code> contract, along with the amount of ETH to be withdrawn.</p>
-</li>
-<li>
-<p>The bridge sends the withdrawn amount to the burn address.</p>
-</li>
-<li>
-<p>The bridge calls <code>sendMessageToL1(bytes32 data)</code> on the <code>Messenger</code> contract, with <code>data</code> being:</p>
-<pre><code class="language-solidity">bytes32 data = keccak256(abi.encodePacked(ETH_ADDRESS, ETH_ADDRESS, _receiverOnL1, msg.value))
-</code></pre>
-<p>The <code>ETH_ADDRESS</code> is an arbitrary address we use, meaning the “token” to transfer is ETH.</p>
-</li>
-<li>
-<p><code>Messenger</code> emits an <code>L1Message</code> event, with the address of the L2 bridge contract and <code>data</code> as topics, along with a unique message ID.</p>
-</li>
+<li>Build with the <code>metrics</code> feature and start the node with <code>--metrics</code> (see
+<a href="../../l1/running/monitoring.html">Monitoring and metrics</a>). A collector then
+samples the database every 15 s and updates the gauges. It is a no-op for the
+in-memory backend.</li>
+<li><em>(Optional)</em> Set <code>ETHREX_ROCKSDB_STATISTICS=1</code> to enable RocksDB’s internal
+statistics, which populate the block-cache <strong>hit/miss</strong> counters
+(<code>ethrex_db_block_cache_hits_total</code> / <code>_misses_total</code>). This adds a small
+(~1–2%) overhead and is off by default; every other metric works without it.</li>
 </ol>
-<p>Off-chain:</p>
-<ol>
-<li>On each L2 node, the L1 watcher extracts <code>L1Message</code> events, generating a merkle tree with the hashed messages as leaves.
-The merkle tree format is explained in the <a href="#l1message-merkle-tree">“<code>L1Message</code> Merkle tree”</a> section below.</li>
-</ol>
-<p>On L1:</p>
-<ol>
-<li>A sequencer commits the batch on L1, publishing the merkle tree’s root with <code>publishWithdrawals</code> on the L1 <code>CommonBridge</code>.</li>
-<li>The user submits a withdrawal proof when calling <code>claimWithdrawal</code> on the L1 <code>CommonBridge</code>.
-The proof can be obtained by calling <code>ethrex_getWithdrawalProof</code> in any L2 node, after the batch containing the withdrawal transaction was verified in the L1.</li>
-<li>The bridge asserts the proof is valid and wasn’t previously claimed.</li>
-<li>The bridge sends the locked funds specified in the <code>L1Message</code> to the user.</li>
-</ol>
-<pre class="mermaid">---
-title: User makes an ETH withdrawal
----
-sequenceDiagram
-    box rgb(139, 63, 63) L2
-        actor L2Alice as Alice
-        participant CommonBridgeL2
-        participant Messenger
-    end
-
-    actor Sequencer
-
-    box rgb(33,66,99) L1
-        participant OnChainProposer
-        participant CommonBridge
-        actor L1Alice as Alice
-    end
-
-    L2Alice-&gt;&gt;CommonBridgeL2: withdraws 42 ETH
-    CommonBridgeL2-&gt;&gt;CommonBridgeL2: burns 42 ETH
-    CommonBridgeL2-&gt;&gt;Messenger: calls sendMessageToL1
-    Messenger-&gt;&gt;Messenger: emits L1Message event
-
-    Messenger--&gt;&gt;Sequencer: receives event
-
-    Sequencer-&gt;&gt;OnChainProposer: publishes batch
-    OnChainProposer-&gt;&gt;CommonBridge: publishes L1 message root
-
-    L1Alice-&gt;&gt;CommonBridge: submits withdrawal proof
-    CommonBridge--&gt;&gt;CommonBridge: asserts proof is valid
-    CommonBridge-&gt;&gt;L1Alice: sends 42 ETH
-</pre>
-
-<h2 id="erc20-withdrawals-through-the-native-bridge"><a class="header" href="#erc20-withdrawals-through-the-native-bridge">ERC20 withdrawals through the native bridge</a></h2>
-<p>This section explains step by step how native ERC20 withdrawals work.</p>
-<p>On L2:</p>
-<ol>
-<li>
-<p>The user calls <code>approve</code> on the L2 tokens to allow the bridge to transfer the asset.</p>
-</li>
-<li>
-<p>The user sends a transaction calling <code>withdrawERC20(address _token, address _receiverOnL1, uint256 _value)</code> on the <code>CommonBridgeL2</code> contract.</p>
-</li>
-<li>
-<p>The bridge calls <code>crosschainBurn</code> on the L2 token, burning the amount to be withdrawn by the user.</p>
-</li>
-<li>
-<p>The bridge fetches the address of the L1 token by calling <code>l1Address()</code> on the L2 token contract.</p>
-</li>
-<li>
-<p>The bridge calls <code>sendMessageToL1(bytes32 data)</code> on the <code>Messenger</code> contract, with <code>data</code> being:</p>
-<pre><code class="language-solidity">bytes32 data = keccak256(abi.encodePacked(_token.l1Address(), _token, _receiverOnL1, _value))
-</code></pre>
-</li>
-<li>
-<p><code>Messenger</code> emits an <code>L1Message</code> event, with the address of the L2 bridge contract and <code>data</code> as topics, along with a unique message ID.</p>
-</li>
-</ol>
-<p>Off-chain:</p>
-<ol>
-<li>On each L2 node, the L1 watcher extracts <code>L1Message</code> events, generating a merkle tree with the hashed messages as leaves.
-The merkle tree format is explained in the <a href="#l1message-merkle-tree">“<code>L1Message</code> Merkle tree”</a> section below.</li>
-</ol>
-<p>On L1:</p>
-<ol>
-<li>A sequencer commits the batch on L1, publishing the <code>L1Message</code> with <code>publishWithdrawals</code> on the L1 <code>CommonBridge</code>.</li>
-<li>The user submits a withdrawal proof when calling <code>claimWithdrawalERC20</code> on the L1 <code>CommonBridge</code>.
-The proof can be obtained by calling <code>ethrex_getWithdrawalProof</code> in any L2 node, after the batch containing the withdrawal transaction was verified in the L1.</li>
-<li>The bridge asserts the proof is valid and wasn’t previously claimed, and that the locked tokens mapping contains enough balance for the L1 and L2 token pair to cover the transfer.</li>
-<li>The bridge transfers the locked tokens specified in the <code>L1Message</code> to the user and discounts the transferred amount from the L1 and L2 token pair in the mapping.</li>
-</ol>
-<pre class="mermaid">---
-title: User makes an ERC20 withdrawal
----
-sequenceDiagram
-    box rgb(139, 63, 63) L2
-        actor L2Alice as Alice
-        participant L2Token
-        participant CommonBridgeL2
-        participant Messenger
-    end
-
-    actor Sequencer
-
-    box rgb(33,66,99) L1
-        participant OnChainProposer
-        participant CommonBridge
-        participant L1Token
-        actor L1Alice as Alice
-    end
-
-    L2Alice-&gt;&gt;L2Token: approves token transfer
-    L2Alice-&gt;&gt;CommonBridgeL2: withdraws 42 of L2Token
-    CommonBridgeL2-&gt;&gt;L2Token: burns the 42 tokens
-    CommonBridgeL2-&gt;&gt;Messenger: calls sendMessageToL1
-    Messenger-&gt;&gt;Messenger: emits L1Message event
-
-    Messenger--&gt;&gt;Sequencer: receives event
-
-    Sequencer-&gt;&gt;OnChainProposer: publishes batch
-    OnChainProposer-&gt;&gt;CommonBridge: publishes L1 message root
-
-    L1Alice-&gt;&gt;CommonBridge: submits withdrawal proof
-    CommonBridge-&gt;&gt;L1Token: transfers tokens
-    L1Token--&gt;&gt;L1Alice: sends 42 tokens
-</pre>
-
-<h2 id="generic-l2-l1-messaging"><a class="header" href="#generic-l2-l1-messaging">Generic L2-&gt;L1 messaging</a></h2>
-<p>First, we need to understand the generic mechanism behind it:</p>
-<h3 id="l1message"><a class="header" href="#l1message"><code>L1Message</code></a></h3>
-<p>To allow generic L2-&gt;L1 messages, a system contract is added which allows sending arbitrary data. This data is emitted as <code>L1Message</code> events, which nodes automatically extract from blocks.</p>
-<pre class="playground"><code class="language-rust edition2024"><span class="boring">#![allow(unused)]
-</span><span class="boring">fn main() {
-</span>struct L1Message {
-    tx_hash: H256,    // L2 transaction where it was included
-    from: Address,    // Who sent the message in L2
-    data_hash: H256,  // Hashed payload
-    message_id: U256, // Unique message ID
-}
-<span class="boring">}</span></code></pre>
-<h3 id="l1message-merkle-tree"><a class="header" href="#l1message-merkle-tree"><code>L1Message</code> Merkle tree</a></h3>
-<p>When sequencers commit a new batch, they include the merkle root of all the <code>L1Message</code>s inside the batch.
-That way, L1 contracts can verify some data was sent from a specific L2 sender.</p>
-<pre class="mermaid">---
-title: L1Message Merkle tree
----
-flowchart TD
-    
-    Msg2[L1Message&lt;sub&gt;2&lt;/sub&gt;]
-    Root([Root])
-    Node1([Node&lt;sub&gt;1&lt;/sub&gt;])
-    Node2([Node&lt;sub&gt;2&lt;/sub&gt;])
-
-    Root --- Node1
-    Root --- Node2
-
-    subgraph Msg1["L1Message&lt;sub&gt;1&lt;/sub&gt;"]
-        direction LR
-
-        txHash1["txHash&lt;sub&gt;1&lt;/sub&gt;"]
-        from1["from&lt;sub&gt;1&lt;/sub&gt;"]
-        dataHash1["hash(data&lt;sub&gt;1&lt;/sub&gt;)"]
-        messageId1["messageId&lt;sub&gt;1&lt;/sub&gt;"]
-
-        txHash1 --- from1
-        from1 --- dataHash1
-        dataHash1 --- messageId1
-    end
-
-    Node1 --- Msg1
-    Node2 --- Msg2
-</pre>
-
-<p>As shown in the diagram, the leaves of the tree are the hash of each encoded <code>L1Message</code>.
-Messages are encoded by packing, in order:</p>
+<p>The <code>ethrex DB Observability</code> dashboard is provisioned automatically from
+<code>metrics/provisioning/grafana/dashboards/common_dashboards/db_dashboard.json</code>
+alongside the other <a href="./dashboards.html">dashboards</a>.</p>
+<h2 id="metrics"><a class="header" href="#metrics">Metrics</a></h2>
+<p>All gauges carry the Prometheus <code>instance</code> label; per-column-family gauges also
+carry a <code>cf</code> label (<code>bodies</code>, <code>receipts_v2</code>, <code>transaction_locations</code>, <code>headers</code>,
+<code>account_trie_nodes</code>, <code>storage_trie_nodes</code>, <code>account_flatkeyvalue</code>,
+<code>storage_flatkeyvalue</code>, <code>account_codes</code>, …).</p>
+<h3 id="per-column-family"><a class="header" href="#per-column-family">Per column family</a></h3>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>Metric</th><th>Meaning</th></tr>
+</thead>
+<tbody>
+<tr><td><code>ethrex_db_cf_size_bytes</code></td><td>Live SST bytes on disk</td></tr>
+<tr><td><code>ethrex_db_cf_total_sst_bytes</code></td><td>Total SST bytes including not-yet-compacted (space amplification)</td></tr>
+<tr><td><code>ethrex_db_cf_live_data_bytes</code></td><td>Estimated live (logical) data bytes</td></tr>
+<tr><td><code>ethrex_db_cf_num_keys</code></td><td>Estimated number of keys</td></tr>
+<tr><td><code>ethrex_db_cf_num_files</code></td><td>Live SST file count</td></tr>
+<tr><td><code>ethrex_db_cf_blob_bytes</code></td><td>Live blob-file bytes (used by <code>account_codes</code>)</td></tr>
+<tr><td><code>ethrex_db_cf_pending_compaction_bytes</code></td><td>Estimated pending-compaction bytes (write debt)</td></tr>
+<tr><td><code>ethrex_db_cf_memtable_bytes</code></td><td>Current memtable bytes</td></tr>
+</tbody>
+</table>
+</div>
+<h3 id="database-wide"><a class="header" href="#database-wide">Database-wide</a></h3>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>Metric</th><th>Meaning</th></tr>
+</thead>
+<tbody>
+<tr><td><code>ethrex_db_total_live_sst_bytes</code></td><td>Total live SST bytes across all column families</td></tr>
+<tr><td><code>ethrex_db_block_cache_usage_bytes</code></td><td>Shared block-cache bytes in use</td></tr>
+<tr><td><code>ethrex_db_block_cache_capacity_bytes</code></td><td>Shared block-cache capacity</td></tr>
+<tr><td><code>ethrex_db_block_cache_pinned_bytes</code></td><td>Block-cache bytes pinned (index/filter blocks)</td></tr>
+<tr><td><code>ethrex_db_running_compactions</code></td><td>Currently running compactions</td></tr>
+<tr><td><code>ethrex_db_block_cache_hits_total</code></td><td>Cumulative block-cache hits (requires <code>ETHREX_ROCKSDB_STATISTICS</code>)</td></tr>
+<tr><td><code>ethrex_db_block_cache_misses_total</code></td><td>Cumulative block-cache misses (requires <code>ETHREX_ROCKSDB_STATISTICS</code>)</td></tr>
+<tr><td><code>ethrex_db_backfill_frontier_block</code></td><td>Lowest block with full chain data on disk (the backfill frontier / <code>earliest_block_number</code>)</td></tr>
+</tbody>
+</table>
+</div>
+<h2 id="the-dashboard"><a class="header" href="#the-dashboard">The dashboard</a></h2>
+<p><code>ethrex DB Observability</code> is organized into five rows:</p>
 <ul>
-<li>the transaction hash that generated it in the L2</li>
-<li>the address of the L2 sender</li>
-<li>the hashed data attached to the message</li>
-<li>the unique message ID</li>
+<li><strong>Overview</strong> — total DB size, backfill frontier, blocks still above the merge
+floor, running compactions, and total size over time.</li>
+<li><strong>Per-Column-Family Sizes</strong> — stacked composition over time, current size by
+column family, and a per-CF detail table (size, live data, keys, files,
+pending compaction, blob bytes).</li>
+<li><strong>Growth / Deltas Over Time</strong> — total and per-CF growth rate (30 m derivative)
+plus 1 h / 6 h / 24 h size deltas.</li>
+<li><strong>Historical Chain Backfill</strong> — the frontier descending toward the merge floor,
+and the growth of the column families backfill writes into (<code>bodies</code>,
+<code>receipts_v2</code>, <code>transaction_locations</code>).</li>
+<li><strong>Read / Performance Internals</strong> — block-cache usage vs. capacity, hit ratio
+(needs statistics enabled), pending-compaction debt, SST file counts, memtable
+bytes, and running compactions.</li>
 </ul>
-<h3 id="bridging"><a class="header" href="#bridging">Bridging</a></h3>
-<p>On the L2 side, for the case of asset bridging, a contract burns some assets.
-It then sends a message to the L1 containing the details of this operation:</p>
+<h2 id="how-it-fits-together"><a class="header" href="#how-it-fits-together">How it fits together</a></h2>
+<pre class="mermaid">flowchart LR
+    rocksdb[(RocksDB)] -- "property reads" --&gt; stats["Store::rocksdb_stats()"]
+    frontier["earliest_block_number"] --&gt; collector
+    stats --&gt; collector["metrics collector&lt;br/&gt;(every 15s)"]
+    collector -- "sets gauges" --&gt; registry["ethrex_db_* gauges"]
+    registry --&gt; endpoint["/metrics endpoint"]
+    endpoint --&gt; prometheus[Prometheus] --&gt; grafana[Grafana dashboard]
+</pre>
+
+<p>The collector reads cheap RocksDB properties (per-column-family sizes/keys/files,
+block cache, compaction counters) via <code>Store::rocksdb_stats()</code> and the backfill
+frontier via <code>earliest_block_number</code>, then updates the <code>ethrex_db_*</code> gauges. The
+gauges register into the Prometheus default registry, so the existing metrics API
+exposes them with no further changes.</p>
+<h2 id="references"><a class="header" href="#references">References</a></h2>
 <ul>
-<li>From: L2 token address that was burnt</li>
-<li>To: L1 token address that will be withdrawn</li>
-<li>Destination: L1 address that can claim the deposit</li>
-<li>Amount: how much was burnt</li>
-</ul>
-<p>When the batch is committed on the L1, the <code>OnChainProposer</code> notifies the bridge which saves the message tree root.
-Once the batch containing this transaction is verified, the user can claim their funds on the L1.
-To do this, they compute a merkle proof for the included batch and call the L1 <code>CommonBridge</code> contract.</p>
-<p>This contract then:</p>
-<ul>
-<li>Checks that the batch is verified</li>
-<li>Ensures the withdrawal wasn’t already claimed</li>
-<li>Computes the expected leaf</li>
-<li>Validates that the proof leads from the leaf to the root of the message tree</li>
-<li>Gives the funds to the user</li>
-<li>Marks the withdrawal as claimed</li>
+<li><a href="../../l1/running/monitoring.html">Monitoring and metrics</a> — enabling metrics and the Docker monitoring stack.</li>
+<li><a href="./metrics.html">Metrics</a> and <a href="./dashboards.html">Dashboards</a> — the rest of ethrex’s metrics and Grafana dashboards.</li>
+<li><a href="../../l1/fundamentals/history_backfill.html">Historical chain backfill</a> — the feature the frontier metric tracks.</li>
+<li><a href="../../l1/fundamentals/databases.html">Databases</a> — store schema versioning.</li>
 </ul>
 
                     </main>
 
                     <nav class="nav-wrapper" aria-label="Page navigation">
                         <!-- Mobile navigation buttons -->
-                            <a rel="prev" href="../../l2/fundamentals/deposits.html" class="mobile-nav-chapters previous" title="Previous chapter" aria-label="Previous chapter" aria-keyshortcuts="Left">
+                            <a rel="prev" href="../../developers/l1/dashboards.html" class="mobile-nav-chapters previous" title="Previous chapter" aria-label="Previous chapter" aria-keyshortcuts="Left">
                                 <span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 320 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M41.4 233.4c-12.5 12.5-12.5 32.8 0 45.3l160 160c12.5 12.5 32.8 12.5 45.3 0s12.5-32.8 0-45.3L109.3 256 246.6 118.6c12.5-12.5 12.5-32.8 0-45.3s-32.8-12.5-45.3 0l-160 160z"/></svg></span>
                             </a>
 
-                            <a rel="next prefetch" href="../../l2/fundamentals/contracts.html" class="mobile-nav-chapters next" title="Next chapter" aria-label="Next chapter" aria-keyshortcuts="Right">
+                            <a rel="next prefetch" href="../../developers/l1/profiling.html" class="mobile-nav-chapters next" title="Next chapter" aria-label="Next chapter" aria-keyshortcuts="Right">
                                 <span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 320 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M278.6 233.4c12.5 12.5 12.5 32.8 0 45.3l-160 160c-12.5 12.5-32.8 12.5-45.3 0s-12.5-32.8 0-45.3L210.7 256 73.4 118.6c-12.5-12.5-12.5-32.8 0-45.3s32.8-12.5 45.3 0l160 160z"/></svg></span>
                             </a>
 
@@ -413,11 +298,11 @@ To do this, they compute a merkle proof for the included batch and call the L1 <
             </div>
 
             <nav class="nav-wide-wrapper" aria-label="Page navigation">
-                    <a rel="prev" href="../../l2/fundamentals/deposits.html" class="nav-chapters previous" title="Previous chapter" aria-label="Previous chapter" aria-keyshortcuts="Left">
+                    <a rel="prev" href="../../developers/l1/dashboards.html" class="nav-chapters previous" title="Previous chapter" aria-label="Previous chapter" aria-keyshortcuts="Left">
                         <span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 320 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M41.4 233.4c-12.5 12.5-12.5 32.8 0 45.3l160 160c12.5 12.5 32.8 12.5 45.3 0s12.5-32.8 0-45.3L109.3 256 246.6 118.6c12.5-12.5 12.5-32.8 0-45.3s-32.8-12.5-45.3 0l-160 160z"/></svg></span>
                     </a>
 
-                    <a rel="next prefetch" href="../../l2/fundamentals/contracts.html" class="nav-chapters next" title="Next chapter" aria-label="Next chapter" aria-keyshortcuts="Right">
+                    <a rel="next prefetch" href="../../developers/l1/profiling.html" class="nav-chapters next" title="Next chapter" aria-label="Next chapter" aria-keyshortcuts="Right">
                         <span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 320 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M278.6 233.4c12.5 12.5 12.5 32.8 0 45.3l-160 160c-12.5 12.5-32.8 12.5-45.3 0s-12.5-32.8 0-45.3L210.7 256 73.4 118.6c-12.5-12.5-12.5-32.8 0-45.3s32.8-12.5 45.3 0l160 160z"/></svg></span>
                     </a>
             </nav>
