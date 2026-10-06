@@ -2599,7 +2599,7 @@ impl Blockchain {
         let chain_config = self.storage.get_chain_config();
         // Before the fork, EIP-7805 is not in force here, and every frame
         // transaction omission is justified.
-        if il.is_empty() || !chain_config.is_hegota_activated(header.timestamp) {
+        if il.is_empty() || !chain_config.is_focil_activated(header.timestamp) {
             return Ok(inclusion_list_validator::IlSatisfaction::default());
         }
         let parent_header = self

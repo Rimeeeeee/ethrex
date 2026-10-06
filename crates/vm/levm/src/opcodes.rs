@@ -3,7 +3,7 @@ use crate::{
     opcode_handlers::{
         OpInvalidHandler, OpStopHandler, OpcodeHandler, arithmetic::*, bitwise_comparison::*,
         block::*, dup::*, environment::*, exchange::*, frame_tx::*, keccak::*, logging::*, push::*,
-        stack_memory_storage_flow::*, system::*,
+        stack_memory_storage_flow::*, system::*, tx_trace::*,
     },
     vm::VM,
 };
@@ -180,6 +180,9 @@ pub enum Opcode {
     FRAMEPARAM = 0xB3,
     SIGPARAM = 0xB4,
     SIGDATACOPY = 0xB5,
+    TXTRACE = 0xB7,
+    TXDIFF = 0xB8,
+    EVENTDATACOPY = 0xB9,
     // EIP-8024
     DUPN = 0xE6,
     SWAPN = 0xE7,
@@ -352,6 +355,9 @@ impl From<u8> for Opcode {
             table[0xB3] = Opcode::FRAMEPARAM;
             table[0xB4] = Opcode::SIGPARAM;
             table[0xB5] = Opcode::SIGDATACOPY;
+            table[0xB7] = Opcode::TXTRACE;
+            table[0xB8] = Opcode::TXDIFF;
+            table[0xB9] = Opcode::EVENTDATACOPY;
             table[0x51] = Opcode::MLOAD;
             table[0x52] = Opcode::MSTORE;
             table[0x53] = Opcode::MSTORE8;
@@ -678,6 +684,11 @@ impl<'a> VM<'a> {
         opcode_table[Opcode::SIGPARAM as usize] = OpCodeFn::new::<OpSigParamHandler>();
         opcode_table[Opcode::SIGDATACOPY as usize] = OpCodeFn::new::<OpSigDataCopyHandler>();
 
+        // EIP-7906 transaction-trace opcodes (Hegota)
+        opcode_table[Opcode::TXTRACE as usize] = OpCodeFn::new::<OpTxTraceHandler>();
+        opcode_table[Opcode::EVENTDATACOPY as usize] = OpCodeFn::new::<OpEventDataCopyHandler>();
+        opcode_table[Opcode::TXDIFF as usize] = OpCodeFn::new::<OpTxDiffHandler>();
+
         opcode_table
     }
 }
@@ -693,7 +704,7 @@ mod tests {
     }
 
     /// The frame-transaction opcode surface, as installed at Hegotá.
-    const FRAME_OPCODES: [(usize, &str); 7] = [
+    const FRAME_OPCODES: [(usize, &str); 10] = [
         (0xAA, "APPROVE"),
         (0xB0, "TXPARAM"),
         (0xB1, "FRAMEDATALOAD"),
@@ -701,12 +712,15 @@ mod tests {
         (0xB3, "FRAMEPARAM"),
         (0xB4, "SIGPARAM"),
         (0xB5, "SIGDATACOPY"),
+        (0xB7, "TXTRACE"),
+        (0xB8, "TXDIFF"),
+        (0xB9, "EVENTDATACOPY"),
     ];
 
     /// Bytes adjacent to the frame surface that no EIP in the Hegotá set
     /// assigns. Leaving them unpinned is how an opcode outside the set would
     /// reach a chain unnoticed.
-    const UNASSIGNED: [usize; 3] = [0xB7, 0xB8, 0xB9];
+    const UNASSIGNED: [usize; 1] = [0xB6];
 
     #[test]
     #[allow(

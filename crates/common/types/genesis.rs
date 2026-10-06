@@ -294,6 +294,10 @@ pub struct ChainConfig {
         alias = "bogota_time"
     )]
     pub hegota_time: Option<u64>,
+    /// EIP-7805 Engine API activation, independent of frame transactions.
+    /// When omitted, follows Hegota for compatibility with existing devnets.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub focil_time: Option<u64>,
     pub lstar_time: Option<u64>,
 
     /// EIP-7843 beacon-slot derivation knob (ethrex devnet, new-fork decoupling).
@@ -461,6 +465,12 @@ impl From<Fork> for &str {
 impl ChainConfig {
     pub fn is_hegota_activated(&self, block_timestamp: u64) -> bool {
         self.hegota_time.is_some_and(|time| time <= block_timestamp)
+    }
+
+    pub fn is_focil_activated(&self, block_timestamp: u64) -> bool {
+        self.focil_time
+            .or(self.hegota_time)
+            .is_some_and(|time| time <= block_timestamp)
     }
 
     /// Whether the EIP-7843 beacon-slot derivation knob is active at
@@ -1883,6 +1893,21 @@ mod tests {
         // are activated by block number rather than timestamp.
         assert_eq!(config.get_blob_schedule_for_fork(Fork::BPO2), None);
         assert_eq!(config.get_blob_schedule_for_fork(Fork::London), None);
+    }
+
+    #[test]
+    fn focil_schedule_preserves_hegota_default_and_allows_a_later_activation() {
+        let mut config = ChainConfig {
+            amsterdam_time: Some(0),
+            hegota_time: Some(100),
+            ..Default::default()
+        };
+        assert!(!config.is_focil_activated(99));
+        assert!(config.is_focil_activated(100));
+        config.focil_time = Some(200);
+        assert!(config.is_hegota_activated(100));
+        assert!(!config.is_focil_activated(199));
+        assert!(config.is_focil_activated(200));
     }
 
     #[test]

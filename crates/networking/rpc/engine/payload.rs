@@ -373,12 +373,11 @@ impl NewPayloadV5Request {
 
         let chain_config = context.storage.get_chain_config();
 
-        // Pre-Hegotá guard: V5 cannot accept Hegotá-timestamp payloads. Runs
-        // unconditionally (not feature-gated) so a non-FOCIL build still rejects
-        // when the chain config has hegota_time set.
-        if chain_config.is_hegota_activated(block.header.timestamp) {
+        // V5 cannot carry inclusion lists after FOCIL activation. Frames can
+        // activate earlier when interoperating with a client without FOCIL.
+        if chain_config.is_focil_activated(block.header.timestamp) {
             return Err(RpcErr::UnsupportedFork(
-                "engine_newPayloadV5 cannot accept Hegotá payloads".to_string(),
+                "engine_newPayloadV5 cannot accept FOCIL payloads".to_string(),
             ));
         }
 
@@ -570,9 +569,9 @@ impl RpcHandler for NewPayloadV6Request {
         };
 
         let chain_config = context.storage.get_chain_config();
-        if !chain_config.is_hegota_activated(block.header.timestamp) {
+        if !chain_config.is_focil_activated(block.header.timestamp) {
             return Err(RpcErr::UnsupportedFork(
-                "engine_newPayloadV6 requires Hegotá-active timestamp".to_string(),
+                "engine_newPayloadV6 requires FOCIL-active timestamp".to_string(),
             ));
         }
 

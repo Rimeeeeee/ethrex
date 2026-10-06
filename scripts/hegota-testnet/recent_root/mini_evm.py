@@ -26,6 +26,7 @@ def run(code, calldata, storage, slotnum, caller=1, value=0, static=False):
         elif op == 0x14: a, b = st.pop(), st.pop(); st.append(1 if a == b else 0)
         elif op == 0x15: st.append(1 if st.pop() == 0 else 0)
         elif op == 0x16: a, b = st.pop(), st.pop(); st.append(a & b)
+        elif op == 0x1b: sh, v = st.pop(), st.pop(); st.append((v << sh) & MASK)
         elif op == 0x1c: sh, v = st.pop(), st.pop(); st.append(v >> sh)
         elif op == 0x20:
             off, ln = st.pop(), st.pop(); st.append(int.from_bytes(keccak(bytes(mem[off:off+ln])), "big"))

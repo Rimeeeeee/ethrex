@@ -1,0 +1,122 @@
+{
+  "testedOn": "2026-10-06",
+  "profile": "two execution clients driven by Engine API; no consensus client",
+  "ethrexBase": "536d7953ac61a67c72bc04935843c694ae1a7bd6",
+  "rethCommit": "ce5d5648f31159f8b66c88a7d2056b43f9ef9aff",
+  "revmCommit": "035f51522b90080440c9ed60337c80823c0b3f43",
+  "alloyCommit": "22793fde0bf9d1480698584c14c7d335d32a926d",
+  "genesisHash": "0x807984679b7a7ebd5627c6e04745f392e672164ef090c8d85d3e54991cfcecb6",
+  "recentRootCodeHash": "0xda160390a838ee04013b2ff3abf4decc9aa3cc6c2f59dd90ca176c2b850be4e3",
+  "clientVersions": {
+    "reth": "reth/v2.5.2-ce5d564/x86_64-unknown-linux-gnu",
+    "ethrex": "ethrex/v23.0.0-VERGEN_IDEMPOTENT_OUTPUT-VERGEN_IDEMPOTENT_OUTPUT/x86_64-unknown-linux-gnu/rustc-v1.95.0"
+  },
+  "matchedFields": [
+    "hash",
+    "stateRoot",
+    "receiptsRoot",
+    "transactionsRoot",
+    "gasUsed",
+    "gasLimit",
+    "blockAccessListHash",
+    "slotNumber",
+    "frame receipt status and both gas dimensions",
+    "log contents"
+  ],
+  "negativeChecks": [
+    "both clients reject consumed keyed nonce 77 sequence 0",
+    "both clients reject an unwritten recent root"
+  ],
+  "blocks": [
+    {
+      "label": "empty from reth",
+      "producer": "reth",
+      "hash": "0xcf615f1cb3559e4a1f98a4c743e5f9777e51a369a3f25813e5a0389c19e2439d",
+      "number": "0x1",
+      "slot": "0x1",
+      "stateRoot": "0x59b0ec044b1734e9dbf18121fa4f27a4d1664f98fce7f5aaaaf6758ff7114b08",
+      "receiptsRoot": "0x56e81f171bcc55a6ff8345e692c0f86e5b48e01b996cadc001622fb5e363b421"
+    },
+    {
+      "label": "empty from ethrex",
+      "producer": "ethrex",
+      "hash": "0xbb0159dba8a4c48b896d83d8a127cd80aaa3269dad7f40ef3124431954639121",
+      "number": "0x2",
+      "slot": "0x2",
+      "stateRoot": "0xf525ff16a2c147f2bb77ebbbe4d5920aaff44041adb24f803907f2e3c5c7ed6f",
+      "receiptsRoot": "0x56e81f171bcc55a6ff8345e692c0f86e5b48e01b996cadc001622fb5e363b421"
+    },
+    {
+      "label": "assertion success from reth",
+      "producer": "reth",
+      "hash": "0x0903e489d0cd92636ad9b88bae1ed300b5da6e93d319af16fb6aca060cc203fe",
+      "number": "0x3",
+      "slot": "0x3",
+      "stateRoot": "0x5c9cf028c85b4a6b2d535b479aedda4eaa40a1ec8a80bafbc9977be7a63fb0fc",
+      "receiptsRoot": "0x2f8b70132579f4abe677242a1f8445a2adeb67226973666ec9e94dadbcd1eebd"
+    },
+    {
+      "label": "assertion success from ethrex",
+      "producer": "ethrex",
+      "hash": "0xdf79dac019fe11fdf6a01f41392738d5e880a9d15e8b2fbc07a45ba37160bf94",
+      "number": "0x4",
+      "slot": "0x4",
+      "stateRoot": "0x25bbf4b773bb7344925f6b604ad4f9ce2473dbe1b4401cf9f6d7adab6931c565",
+      "receiptsRoot": "0x01fee176bc9eb2ffb76fbaf99daa9a3bb753a11d060ea9275fd329b6146357fd"
+    },
+    {
+      "label": "assertion rollback from reth",
+      "producer": "reth",
+      "hash": "0x8b69471ceaac51f9dcf6ce7e1a994abc02681b9234453e9a56b69f66a9b14612",
+      "number": "0x5",
+      "slot": "0x5",
+      "stateRoot": "0x10e5e95b81b68ad0c5745c2806546f5ac1f848ae61dee62e86e6f4a2d1f1b434",
+      "receiptsRoot": "0x9756497ac5a2eeaa40701b0ee6fb2f614d931fabec686724b2f3349432f0c313"
+    },
+    {
+      "label": "assertion rollback from ethrex",
+      "producer": "ethrex",
+      "hash": "0x0291b1decb08c7a6e29a0b1b2db8894c95ac175e886904c1620fabff0851bf64",
+      "number": "0x6",
+      "slot": "0x6",
+      "stateRoot": "0x5798ae93372d39e011396ddef855fbc765e710535782b67800fa89b8e37a87ea",
+      "receiptsRoot": "0x9756497ac5a2eeaa40701b0ee6fb2f614d931fabec686724b2f3349432f0c313"
+    },
+    {
+      "label": "keyed nonce and assertions",
+      "producer": "ethrex",
+      "hash": "0xf9eb337796f248b404fa9f479c10b9281ce75f661c8fa3d43f2d06c26afc2ba1",
+      "number": "0x7",
+      "slot": "0x7",
+      "stateRoot": "0xd0df74f5353dd935f311cbdce5a6f111a7b2d595d9ede242ff58af6f161ec70f",
+      "receiptsRoot": "0xe0e34ecb9cd4fb01989b2769eff542877dde9ff1118f8c73dced5e019e6e3a13"
+    },
+    {
+      "label": "recent-root write",
+      "producer": "reth",
+      "hash": "0xf205da39356caa399dc684d4168ebcd037eea7a6d5a717587f27c9eee9e0298c",
+      "number": "0x8",
+      "slot": "0x8",
+      "stateRoot": "0x98ec455ca82cbac1fd4a3e2a08e54f7fc467b2c30052b94795dbc404ac4c1079",
+      "receiptsRoot": "0xc38f58946030a74ddc9b5dca44f411844185d66914ba4395b1dad3ca75d54fb6"
+    },
+    {
+      "label": "canonical recent-root verification with assertions",
+      "producer": "ethrex",
+      "hash": "0x89efc244033c9fe584c795d2744e31ce211f1df77b563d1b11f03f93743179cd",
+      "number": "0x9",
+      "slot": "0x9",
+      "stateRoot": "0xac33a48272887777e9d4885a7e8c19f8a4551485d023e3011e835e91ba75e3e1",
+      "receiptsRoot": "0x6a89196ad03cc2f7b05755d9026c64298cb93a963be471ad8eccd35cf20700a9"
+    },
+    {
+      "label": "recent-root verification admitted by reth",
+      "producer": "reth",
+      "hash": "0xbbd0f2e4dd3653f7554e785bbcdc8d0401501d55c9e00e307fefac4c6683e766",
+      "number": "0xa",
+      "slot": "0xa",
+      "stateRoot": "0x94ae4532756d5db3ddf084b327579328b6fb105b4fb4ad19238455b3347c152c",
+      "receiptsRoot": "0x2026b5135b2bce1ca871af8dfca6455c8ea0d78031427239331927ae29128df7"
+    }
+  ]
+}

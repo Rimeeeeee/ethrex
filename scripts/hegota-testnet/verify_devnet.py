@@ -48,7 +48,7 @@ import urllib.request
 
 CAST = os.path.expanduser("~/.foundry/bin/cast")
 RECENT_ROOT_ADDRESS = "0x0000000000000000000000000000000000008272"
-RECENT_ROOT_CODE_LEN = 345
+RECENT_ROOT_CODE_LEN = 320
 # EIP-8037 STATE_BYTES_PER_NEW_ACCOUNT * CPSB: what a value-bearing frame is charged for
 # funding an address that does not exist yet, drawn from that frame's own `limits.state`.
 NEW_ACCOUNT_STATE_GAS = 120 * 1530

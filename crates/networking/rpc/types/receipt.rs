@@ -37,9 +37,12 @@ pub struct RpcFrameReceipt {
     /// (atomic-batch failure). Serialized as a hex-encoded byte.
     #[serde(with = "serde_utils::u8::hex_str")]
     pub status: u8,
-    /// `gas_used.execution` of the consensus frame receipt.
+    /// Total gas of this frame, matching the pinned Reth/Alloy RPC schema.
     #[serde(with = "serde_utils::u64::hex_str")]
     pub gas_used: u64,
+    /// Execution dimension of the consensus frame receipt.
+    #[serde(with = "serde_utils::u64::hex_str")]
+    pub execution_gas_used: u64,
     /// `gas_used.state` of the consensus frame receipt: the frame's final
     /// state-gas attribution. Omitting it made the receipt look as if state gas
     /// were charged at transaction level, when the consensus encoding attributes
@@ -53,7 +56,8 @@ impl From<FrameReceipt> for RpcFrameReceipt {
     fn from(fr: FrameReceipt) -> Self {
         Self {
             status: fr.status,
-            gas_used: fr.gas_used,
+            gas_used: fr.gas_used.saturating_add(fr.state_gas_used),
+            execution_gas_used: fr.gas_used,
             state_gas_used: fr.state_gas_used,
             logs: fr.logs.into_iter().map(RpcLogInfo::from).collect(),
         }
@@ -284,9 +288,23 @@ mod tests {
     use super::*;
     use ethrex_common::{
         Bytes,
-        types::{FrameTransaction, Log, TxType},
+        types::{Log, TxType},
     };
     use hex_literal::hex;
+
+    #[test]
+    fn frame_receipt_rpc_separates_execution_and_state_gas() {
+        let frame = RpcFrameReceipt::from(FrameReceipt {
+            status: 1,
+            gas_used: 120,
+            state_gas_used: 30,
+            logs: vec![],
+        });
+        let json = serde_json::to_value(frame).unwrap();
+        assert_eq!(json["gasUsed"], "0x96");
+        assert_eq!(json["executionGasUsed"], "0x78");
+        assert_eq!(json["stateGasUsed"], "0x1e");
+    }
 
     #[test]
     fn serialize_receipt() {

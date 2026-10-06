@@ -273,7 +273,7 @@ fn verify_mode_body_frame_is_not_a_candidate() {
 #[test]
 fn undefined_frame_mode_is_not_a_candidate() {
     let mut reserved = body(10_000);
-    reserved.mode = 3;
+    reserved.mode = 4;
     let tx = frame_tx(vec![self_verify(30_000), reserved]);
     assert!(matches!(
         profile2_candidate(&tx),

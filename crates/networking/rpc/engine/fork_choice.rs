@@ -806,13 +806,12 @@ fn validate_attributes_v4(
     head_block: &BlockHeader,
     chain_config: &ethrex_common::types::ChainConfig,
 ) -> Result<(), RpcErr> {
-    // Pre-Hegotá guard: V4 cannot accept Hegotá-timestamp payload attributes.
-    // Runs unconditionally (not feature-gated) so a non-FOCIL build still rejects
-    // when the chain config has hegota_time set. The FCU state update is not
+    // V4 cannot carry inclusion lists after FOCIL activation. Frames may
+    // activate earlier on a mixed-client devnet. The FCU state update is not
     // rolled back; only the payload-build request is rejected.
-    if chain_config.is_hegota_activated(attributes.timestamp) {
+    if chain_config.is_focil_activated(attributes.timestamp) {
         return Err(RpcErr::UnsupportedFork(
-            "engine_forkchoiceUpdatedV4 cannot accept Hegotá payload attributes".to_string(),
+            "engine_forkchoiceUpdatedV4 cannot accept FOCIL payload attributes".to_string(),
         ));
     }
     if !chain_config.is_amsterdam_activated(attributes.timestamp) {
@@ -931,11 +930,11 @@ fn validate_attributes_v5(
     head_block: &BlockHeader,
     chain_config: &ethrex_common::types::ChainConfig,
 ) -> Result<(), RpcErr> {
-    // V5 is the Hegotá-and-later FCU. Reject any pre-Hegotá timestamp with
+    // V5 carries FOCIL inclusion lists. Reject any pre-FOCIL timestamp with
     // -38005, mirroring the spec.
-    if !chain_config.is_hegota_activated(attributes.timestamp) {
+    if !chain_config.is_focil_activated(attributes.timestamp) {
         return Err(RpcErr::UnsupportedFork(
-            "V5 payload attributes used for pre-Hegotá timestamp".to_string(),
+            "V5 payload attributes used for pre-FOCIL timestamp".to_string(),
         ));
     }
     if attributes.withdrawals.is_none() {
@@ -1120,6 +1119,45 @@ mod tests {
             matches!(err, crate::utils::RpcErr::UnsupportedFork(_)),
             "expected UnsupportedFork, got {err:?}"
         );
+    }
+
+    #[test]
+    fn forkchoice_updated_v4_accepts_frames_before_focil() {
+        use super::{validate_attributes_v4, validate_attributes_v5};
+        use crate::types::fork_choice::{PayloadAttributesV4, PayloadAttributesV5};
+
+        let config = ethrex_common::types::ChainConfig {
+            amsterdam_time: Some(0),
+            hegota_time: Some(0),
+            focil_time: Some(u64::MAX),
+            ..Default::default()
+        };
+        let attributes = PayloadAttributesV4 {
+            timestamp: 12,
+            withdrawals: Some(vec![]),
+            parent_beacon_block_root: Some(Default::default()),
+            slot_number: 2,
+            target_gas_limit: 30_000_000,
+            ..Default::default()
+        };
+        let head = BlockHeader {
+            timestamp: 6,
+            ..Default::default()
+        };
+        assert!(config.is_hegota_activated(attributes.timestamp));
+        assert!(!config.is_focil_activated(attributes.timestamp));
+        assert!(validate_attributes_v4(&attributes, &head, &config).is_ok());
+        assert!(matches!(
+            validate_attributes_v5(
+                &PayloadAttributesV5 {
+                    timestamp: 12,
+                    ..Default::default()
+                },
+                &head,
+                &config
+            ),
+            Err(crate::utils::RpcErr::UnsupportedFork(_))
+        ));
     }
 
     #[test]

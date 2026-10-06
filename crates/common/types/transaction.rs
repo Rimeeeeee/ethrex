@@ -1902,8 +1902,7 @@ pub struct FeeTokenTransaction {
 
 /// EIP-8141 Frame Transaction mode.
 ///
-/// Mode 3 is unassigned and mode 4 is reserved for EIP-8288's deferred
-/// DEP_VERIFY; every other value is reserved and makes the transaction invalid.
+/// Mode 3 is EIP-7906 POST_TX; mode 4 and above remain reserved.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Default, RSerialize, RDeserialize, Archive)]
 #[repr(u8)]
 pub enum FrameMode {
@@ -1911,17 +1910,19 @@ pub enum FrameMode {
     Default = 0,
     Verify = 1,
     Sender = 2,
+    /// Read-only assertions over the completed transaction body.
+    PostTx = 3,
 }
 
 impl FrameMode {
     /// Convert from the lower 8 bits of the mode field.
-    /// Returns `None` for reserved values (3 and above).
+    /// Returns `None` for reserved values (4 and above).
     pub fn from_u8(val: u8) -> Option<Self> {
         match val {
             0 => Some(FrameMode::Default),
             1 => Some(FrameMode::Verify),
             2 => Some(FrameMode::Sender),
-            // 3 unassigned, 4 reserved: EIP-8288 DEP_VERIFY (deferred).
+            3 => Some(FrameMode::PostTx),
             _ => None,
         }
     }
@@ -2773,9 +2774,15 @@ impl FrameTransaction {
         // `frame_tx_intrinsic_gas + sum(limits.execution)` against
         // TX_MAX_GAS_LIMIT and leaves the state dimension out of it.
         let mut expiry_frame_count: usize = 0;
+        let post_tx = FrameMode::PostTx as u8;
+        if let Some(first) = self.frames.iter().position(|f| f.mode == post_tx)
+            && self.frames[first..].iter().any(|f| f.mode != post_tx)
+        {
+            return Err("POST_TX frames must form a contiguous trailing suffix".to_string());
+        }
 
         for (i, frame) in self.frames.iter().enumerate() {
-            // `None` means the mode byte is reserved (3 and above).
+            // Reserved modes must never fall back to ordinary EVM execution.
             let Some(frame_mode) = frame.execution_mode() else {
                 return Err(format!("Frame {i}: reserved execution mode {}", frame.mode));
             };
@@ -2785,6 +2792,9 @@ impl FrameTransaction {
                     "Frame {i}: reserved flag bits must be zero (flags={:#04x})",
                     frame.flags
                 ));
+            }
+            if frame_mode == FrameMode::PostTx && frame.is_atomic_batch() {
+                return Err(format!("Frame {i}: atomic batch flag on a POST_TX frame"));
             }
             // Expiry verifier frames (EIP-8141): VERIFY
             // frames targeting EXPIRY_VERIFIER must have flags == 0, value == 0
@@ -5877,7 +5887,7 @@ mod tests {
     #[test]
     fn test_frame_mode_with_flags_rlp_roundtrip() {
         // Test basic modes
-        for mode_val in [0u8, 1, 2] {
+        for mode_val in [0u8, 1, 2, 3] {
             let frame = Frame {
                 mode: mode_val,
                 flags: if mode_val == 1 { 0x03 } else { 0x00 },
