@@ -145,7 +145,3 @@ core.*
 
 __pycache__/
 .lycheecache
-
-# Disposable mixed-client devnet artifacts
-.devnet/
-.devnet-build/
